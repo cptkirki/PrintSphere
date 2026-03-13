@@ -14,7 +14,7 @@ Unterprojekt davon.
 - LVGL `v9.4.0`
 - ESP32-S3 Touch AMOLED 1.75
 - ohne Home Assistant
-- direkter Bambu-LAN-Statusclient im Developer Mode
+- direkter Bambu-LAN-Statusclient im LAN Mode
 
 ## Bereits umgesetzt
 
@@ -57,7 +57,7 @@ Der aktuelle Screen zeigt bereits:
 
 ## Aktuelle Grenzen
 
-- Developer Mode am Drucker wird vorausgesetzt
+- LAN Mode am Drucker wird vorausgesetzt
 - Kamera und MJPEG-Decoding sind bewusst noch nicht enthalten
 - aktive Drucker-Steuerung ist noch nicht umgesetzt
 - MQTT-TLS ist funktional angebunden, aber noch nicht auf ein eigenes
