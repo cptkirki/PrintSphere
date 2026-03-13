@@ -30,16 +30,21 @@ PrintSphere is the native ESP-IDF rebuild and the better successor to
 
 1. The ESP always starts a setup AP with SSID `PrintSphere-Setup`
    and password `printsphere`
-2. Open the portal and enter:
+2. In setup AP mode, the portal only asks for:
    - Wi-Fi SSID
    - Wi-Fi password
+3. Save Wi-Fi and let the ESP reboot
+4. After the ESP joins your home network, reopen the portal on its new IP
+5. Connect Bambu Cloud with:
+   - Bambu email
+   - Bambu password
+   - optional email code or 2FA code if Bambu requests verification
+6. Optionally connect the local printer path for LAN MQTT and camera snapshots with:
    - printer IP or hostname
    - printer serial number
-   - Bambu access code for local LAN status access
-3. Save
-4. The ESP reboots and then tries in parallel to:
-   - join Wi-Fi
-   - connect to the printer locally over MQTT on port `8883`
+   - Bambu access code
+
+Cloud and local printer credentials are applied live from the web portal without another reboot.
 
 ## UI Status
 
