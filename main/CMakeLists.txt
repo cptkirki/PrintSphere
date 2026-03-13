@@ -1,0 +1,41 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "src/application.cpp"
+        "src/bambu_cloud_client.cpp"
+        "src/config_store.cpp"
+        "include/font/dosis_20.c"
+        "include/font/dosis_32.c"
+        "include/font/dosis_40.c"
+        "include/img/bambuicon.c"
+        "include/font/mdi_30.c"
+        "include/font/mdi_40.c"
+        "src/pmu.cpp"
+        "src/p1s_camera_client.cpp"
+        "src/printer_client.cpp"
+        "src/printer_state.cpp"
+        "src/setup_portal.cpp"
+        "src/status_resolver.cpp"
+        "src/ui.cpp"
+        "src/wifi_manager.cpp"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        XPowersLib
+        esp32_s3_touch_amoled_1_75
+        esp_driver_gpio
+        esp_event
+        esp_http_client
+        esp_http_server
+        json
+        mqtt
+        esp_netif
+        espressif__esp_new_jpeg
+        esp-tls
+        esp_wifi
+        libpng
+        lvgl
+        nvs_flash
+)
+
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)

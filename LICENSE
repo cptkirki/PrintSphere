@@ -1,0 +1,76 @@
+Federation Non-Commercial License (FNCL) v1.1
+SPDX short identifier: LicenseRef-FNCL-1.1
+
+Copyright (c) 2026 Christopher Gleiche
+
+Mission (non-binding):
+This project is shared to advance learning, collaboration, and the common good.
+Use it to explore, build, and improve - not to extract profit.
+
+1. Definitions
+1.1 "Software" means this software and associated documentation files.
+1.2 "You" means an individual or legal entity exercising rights under this License.
+1.3 "Share" means making the Software available to any third party, including by
+copying, publishing, distributing, or transmitting it.
+1.4 "Non-Commercial Purpose" means a purpose that is not primarily intended for
+or directed toward commercial advantage or monetary compensation.
+1.5 "Commercial Purpose" includes, without limitation:
+- selling, licensing, renting, or monetizing the Software or derivatives;
+- using the Software to provide a paid product or paid service;
+- bundling the Software into a paid or monetized offering;
+- client work performed for compensation where the Software is used materially;
+- internal use by a for-profit entity in connection with revenue-generating
+  activities.
+The classification depends on the specific use context, not only on the user type.
+
+2. Grant of Rights (Non-Commercial Only)
+Subject to this License, permission is granted, free of charge, to use, copy,
+modify, create derivative works of, and Share the Software, solely for
+Non-Commercial Purposes.
+
+3. Conditions for Sharing
+If You Share the Software, modified or unmodified, You must:
+- include this License text and the copyright notice; and
+- clearly mark that You changed the Software and include a brief description of
+  the changes.
+
+4. Commercial Use Requires Separate License
+Any use of the Software for a Commercial Purpose is prohibited unless You first
+obtain a separate written commercial license from the copyright holder.
+
+5. No Trademark License
+This License does not grant any right to use project names, logos, or other
+branding, except for accurate factual attribution.
+
+6. No Patent License
+No patent rights are granted under this License, whether express or implied.
+
+7. Termination
+7.1 This License is effective until terminated.
+7.2 Your rights under this License terminate automatically if You breach any term.
+7.3 Rights may be reinstated if You cure the breach within 30 days after You
+become aware of it, unless the copyright holder expressly terminates in writing.
+7.4 Upon termination, You must stop all use and Sharing of the Software. Any
+lawful recipients who received the Software from You before termination may keep
+their rights under this License if they remain in compliance.
+
+8. Disclaimer of Warranty
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS
+IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND, WHETHER EXPRESS, IMPLIED,
+STATUTORY, OR OTHERWISE, INCLUDING WITHOUT LIMITATION WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+9. Limitation of Liability
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIMS, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+10. Severability and Waiver
+If any provision of this License is held unenforceable, that provision will be
+enforced to the maximum extent permitted and the remaining provisions will remain
+in full force. Failure to enforce any provision is not a waiver.
+
+11. Commercial Licensing Contact
+Commercial use requires a separate written license from the copyright holder.
+Contact: christopher.gleiche+oss (at) googlemail (dot) com

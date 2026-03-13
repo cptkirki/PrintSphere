@@ -1,0 +1,10 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+__pycache__/
+esphome-Vorlage/
+.vscode/
+release/
+*.pyc
