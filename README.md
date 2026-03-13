@@ -39,10 +39,10 @@ PrintSphere is the native ESP-IDF rebuild and the better successor to
    - Bambu email
    - Bambu password
    - optional email code or 2FA code if Bambu requests verification
-6. Optionally connect the local printer path for LAN MQTT and camera snapshots with:
+6. It is recommended to connect the local printer path for LAN MQTT and camera snapshots with:
    - printer IP or hostname
    - printer serial number
-   - Bambu access code
+   - LAN-Mode access code
 
 Cloud and local printer credentials are applied live from the web portal without another reboot.
 
