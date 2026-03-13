@@ -6,5 +6,7 @@ dependencies.lock
 __pycache__/
 esphome-Vorlage/
 .vscode/
-release/
+release/*
+!release/
+!release/firmware.bin
 *.pyc
