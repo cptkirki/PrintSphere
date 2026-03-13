@@ -23,9 +23,7 @@ PrintSphere is the native ESP-IDF rebuild and the better successor to
 - NVS-based configuration storage
 - `AP+STA` Wi-Fi manager
 - local setup portal on `esp_http_server`
-- first native PrintSphere LVGL screen
 - local Bambu MQTT status client via `device/{serial}/report`
-- custom 16 MB partition table for the larger LVGL/BSP binary
 
 ## Setup Flow
 
@@ -64,36 +62,9 @@ The current screen already shows:
 - camera and MJPEG decoding are not fully finished yet
 - MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
 
-## Build
-
-On the first build, the ESP-IDF Component Manager downloads the required
-dependencies for the official board BSP.
-
-```bash
-idf.py set-target esp32s3
-idf.py build
-```
-
-Example for Windows with a local ESP-IDF installation:
-
-```powershell
-& 'C:/esp/v5.5.2/esp-idf/export.ps1'
-idf.py build
-```
-
-A normal `idf.py build` also generates a merged initial-flash image at
-`release/firmware.bin` plus a versioned copy such as `release/firmware-v1.bin`.
-
-The currently used release version is set in `CMakeLists.txt` via
-`PRINTSPHERE_RELEASE_VERSION`.
-
-If you only want to regenerate the release artifact from an existing build:
-
-```bash
-idf.py release_initial_flash
-```
-
 ## Flash
+
+/release/firmware.bin can be flashed on emtpy devices via known methods
 
 ```bash
 idf.py -p PORT flash
