@@ -2,93 +2,89 @@
 
 Round ESP32-S3 printer companion for Bambu Lab: live status, progress ring, camera snapshots, cloud + LAN sync, and touch setup on a circular display.
 
-## Native ESP-IDF App
+## Native ESP-IDF Project
 
-PrintSphere ist die native ESP-IDF-Neuauflage und der bessere Nachfolger von
-[`big-printsphere.yaml`](../big-printsphere.yaml) und nicht nur ein
-Unterprojekt davon.
+PrintSphere is the native ESP-IDF rebuild and the better successor to
+[`big-printsphere.yaml`](../big-printsphere.yaml), not just a subproject of it.
 
-## Ziel
+## Goals
 
 - ESP-IDF `v5.5.x`
 - LVGL `v9.4.0`
 - ESP32-S3 Touch AMOLED 1.75
-- ohne Home Assistant
-- direkter Bambu-LAN-Statusclient im LAN Mode
+- no Home Assistant required
+- direct Bambu LAN status client in LAN Mode
 
-## Bereits umgesetzt
+## Already Implemented
 
-- offizielles Waveshare-BSP fuer Display, Touch und LVGL
-- AXP2101-PMU-Anbindung ueber `XPowersLib`
-- NVS-basierter Konfigspeicher
-- `AP+STA`-WLAN-Manager
-- lokales Setup-Portal auf `esp_http_server`
-- erster nativer PrintSphere-LVGL-Screen
-- lokaler Bambu-MQTT-Statusclient ueber `device/{serial}/report`
-- eigene 16-MB-Partitionstabelle fuer das groessere LVGL-/BSP-Binary
+- official Waveshare BSP for display, touch, and LVGL
+- AXP2101 PMU integration via `XPowersLib`
+- NVS-based configuration storage
+- `AP+STA` Wi-Fi manager
+- local setup portal on `esp_http_server`
+- first native PrintSphere LVGL screen
+- local Bambu MQTT status client via `device/{serial}/report`
+- custom 16 MB partition table for the larger LVGL/BSP binary
 
-## Setup-Ablauf
+## Setup Flow
 
-1. ESP startet immer einen Setup-AP mit SSID `PrintSphere-Setup`
-   und Passwort `printsphere`
-2. Portal oeffnen und eintragen:
-   - WLAN-SSID
-   - WLAN-Passwort
-   - Drucker-IP oder Hostname
-   - Drucker-Seriennummer
-   - Bambu Access Code fuer lokalen LAN-Statuszugriff
-3. Speichern
-4. ESP startet neu und versucht parallel:
-   - im WLAN einzubuchen
-   - den Drucker lokal per MQTT auf Port `8883` zu erreichen
+1. The ESP always starts a setup AP with SSID `PrintSphere-Setup`
+   and password `printsphere`
+2. Open the portal and enter:
+   - Wi-Fi SSID
+   - Wi-Fi password
+   - printer IP or hostname
+   - printer serial number
+   - Bambu access code for local LAN status access
+3. Save
+4. The ESP reboots and then tries in parallel to:
+   - join Wi-Fi
+   - connect to the printer locally over MQTT on port `8883`
 
-## UI-Status
+## UI Status
 
-Der aktuelle Screen zeigt bereits:
+The current screen already shows:
 
-- Druckfortschritt
-- Lifecycle-Status
-- Jobname
-- Temperaturen
-- Layer
-- Restzeit
-- WLAN-Status
-- Akku-/USB-Status
+- print progress
+- lifecycle status
+- job name
+- temperatures
+- layer information
+- remaining time
+- Wi-Fi status
+- battery and USB status
 
-## Aktuelle Grenzen
+## Current Limitations
 
-- LAN Mode am Drucker wird vorausgesetzt
-- Kamera und MJPEG-Decoding sind bewusst noch nicht enthalten
-- aktive Drucker-Steuerung ist noch nicht umgesetzt
-- MQTT-TLS ist funktional angebunden, aber noch nicht auf ein eigenes
-  Bambu-Zertifikat-Handling gepinnt
+- LAN Mode must be enabled on the printer
+- camera and MJPEG decoding are intentionally not fully finished yet
+- active printer control is not implemented yet
+- MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
 
 ## Build
 
-Beim ersten Build zieht der ESP-IDF Component Manager die benoetigten
-Abhaengigkeiten fuer das offizielle Board-BSP nach.
+On the first build, the ESP-IDF Component Manager downloads the required
+dependencies for the official board BSP.
 
 ```bash
 idf.py set-target esp32s3
 idf.py build
 ```
 
-Unter Windows mit lokalem ESP-IDF-Setup zum Beispiel:
+Example for Windows with a local ESP-IDF installation:
 
 ```powershell
 & 'C:/esp/v5.5.2/esp-idf/export.ps1'
 idf.py build
 ```
 
-Ein normales `idf.py build` erzeugt jetzt zusaetzlich ein gemergtes
-Initial-Flash-Image unter `release/firmware.bin` sowie eine versionierte
-Kopie wie `release/firmware-v1.bin`.
+A normal `idf.py build` also generates a merged initial-flash image at
+`release/firmware.bin` plus a versioned copy such as `release/firmware-v1.bin`.
 
-Die aktuell verwendete Release-Version wird in `CMakeLists.txt` ueber
-`PRINTSPHERE_RELEASE_VERSION` gesetzt.
+The currently used release version is set in `CMakeLists.txt` via
+`PRINTSPHERE_RELEASE_VERSION`.
 
-Wenn nur das Release-Artefakt aus einem bestehenden Build neu geschrieben
-werden soll:
+If you only want to regenerate the release artifact from an existing build:
 
 ```bash
 idf.py release_initial_flash
@@ -100,8 +96,8 @@ idf.py release_initial_flash
 idf.py -p PORT flash
 ```
 
-Das gemergte Initial-Flash-Image kann alternativ direkt bei Offset `0x0`
-geschrieben werden:
+Alternatively, the merged initial-flash image can be written directly at
+offset `0x0`:
 
 ```bash
 python -m esptool --chip esp32s3 --port PORT write_flash 0x0 release/firmware.bin
