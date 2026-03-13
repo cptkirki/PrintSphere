@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
@@ -355,8 +356,13 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
 
     set_frame_snapshot(true, enabled_.load(), true, "Camera image updated",
                        std::move(rgb565_frame), width, height);
+    const size_t free_dma_heap = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    const size_t largest_dma_block = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
     ESP_LOGI(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
              static_cast<unsigned>(height));
+    ESP_LOGI(kTag, "DMA heap after snapshot: free=%u largest=%u",
+             static_cast<unsigned>(free_dma_heap),
+             static_cast<unsigned>(largest_dma_block));
     return true;
   }
 

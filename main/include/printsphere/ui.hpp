@@ -36,6 +36,8 @@ class Ui {
   esp_err_t build_dashboard();
   void apply_ring_visual_locked(const PrinterSnapshot& snapshot);
   void apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh);
+  bool ensure_preview_image_loaded_locked(bool force_reload);
+  void release_preview_image_locked();
   void apply_page_visibility();
   void apply_logo_visibility();
   void handle_ring_timer();

@@ -924,6 +924,39 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
   lv_obj_set_style_text_color(status_label_, text_color, 0);
 }
 
+bool Ui::ensure_preview_image_loaded_locked(bool force_reload) {
+  if (force_reload) {
+    release_preview_image_locked();
+  }
+
+  if (last_preview_raw_ && !last_preview_raw_->empty()) {
+    lv_image_set_src(page2_image_, &preview_image_dsc_);
+    return true;
+  }
+
+  if (!last_preview_blob_ || last_preview_blob_->empty()) {
+    return false;
+  }
+
+  if (!decode_preview_png(last_preview_blob_, &last_preview_raw_, &preview_image_dsc_)) {
+    std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
+    last_preview_raw_.reset();
+    return false;
+  }
+
+  lv_image_set_src(page2_image_, &preview_image_dsc_);
+  return true;
+}
+
+void Ui::release_preview_image_locked() {
+  if (page2_image_ != nullptr) {
+    lv_image_set_src(page2_image_, nullptr);
+  }
+  lv_image_cache_drop(&preview_image_dsc_);
+  last_preview_raw_.reset();
+  std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
+}
+
 void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh) {
   deferred_snapshot_pending_ = false;
 
@@ -981,32 +1014,22 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   const std::string preview_subnote = preview_subnote_text(snapshot);
   const std::string camera_note = camera_note_text(snapshot);
   const std::string camera_subnote = camera_subnote_text(snapshot);
-  bool has_preview_image = last_preview_raw_ && !last_preview_raw_->empty();
+  bool has_preview_image = false;
   if (snapshot.preview_blob && !snapshot.preview_blob->empty()) {
-    if (last_preview_blob_.get() != snapshot.preview_blob.get()) {
-      lv_image_cache_drop(&preview_image_dsc_);
-      last_preview_raw_.reset();
-      if (decode_preview_png(snapshot.preview_blob, &last_preview_raw_, &preview_image_dsc_)) {
-        lv_image_set_src(page2_image_, &preview_image_dsc_);
-        last_preview_blob_ = snapshot.preview_blob;
-      } else {
-        std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
-        last_preview_blob_.reset();
-      }
+    const bool preview_blob_changed = last_preview_blob_.get() != snapshot.preview_blob.get();
+    last_preview_blob_ = snapshot.preview_blob;
+    if (active_page_ == 1) {
+      has_preview_image = ensure_preview_image_loaded_locked(preview_blob_changed);
+    } else if (preview_blob_changed) {
+      release_preview_image_locked();
     }
-    has_preview_image = last_preview_raw_ && !last_preview_raw_->empty();
   } else {
     if (last_preview_blob_ || last_preview_raw_) {
-      lv_image_cache_drop(&preview_image_dsc_);
+      release_preview_image_locked();
     }
     last_preview_blob_.reset();
-    last_preview_raw_.reset();
-    std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
   }
   const bool has_page2_image = has_preview_image;
-  if (has_preview_image) {
-    lv_image_set_src(page2_image_, &preview_image_dsc_);
-  }
   preview_image_visible_ = has_page2_image;
 
   if (preview_text_image_mode_ != has_page2_image) {
@@ -1433,12 +1456,22 @@ void Ui::apply_logo_visibility() {
 
 void Ui::set_active_page(int page) {
   const int clamped_page = std::clamp(page, 0, 2);
+  const int previous_page = active_page_;
   lv_obj_scroll_to_x(pager_, clamped_page * board::kDisplayWidth, LV_ANIM_OFF);
+  if (previous_page == 1 && clamped_page != 1) {
+    release_preview_image_locked();
+    preview_image_visible_ = false;
+  }
   active_page_ = clamped_page;
+  if (active_page_ == 1) {
+    preview_image_visible_ = ensure_preview_image_loaded_locked(false);
+  }
   scrolling_ = false;
   apply_page_visibility();
   if (deferred_snapshot_pending_) {
     apply_snapshot_locked(deferred_snapshot_, true);
+  } else if (previous_page != clamped_page) {
+    apply_snapshot_locked(last_snapshot_, true);
   }
 }
 
