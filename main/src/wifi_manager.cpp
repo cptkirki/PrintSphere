@@ -1,7 +1,9 @@
 #include "printsphere/wifi_manager.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "esp_check.h"
 #include "esp_event.h"
@@ -133,6 +135,54 @@ std::string WifiManager::setup_access_point_password() const {
 
 std::string WifiManager::setup_access_point_ip() const {
   return kSetupApIp;
+}
+
+std::vector<std::string> WifiManager::scan_visible_networks() const {
+  std::vector<std::string> networks;
+  if (!wifi_started_) {
+    return networks;
+  }
+
+  wifi_scan_config_t scan_config = {};
+  scan_config.show_hidden = false;
+
+  const esp_err_t scan_err = esp_wifi_scan_start(&scan_config, true);
+  if (scan_err != ESP_OK) {
+    ESP_LOGW(kTag, "Wi-Fi scan failed: %s", esp_err_to_name(scan_err));
+    return networks;
+  }
+
+  uint16_t ap_count = 0;
+  if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK || ap_count == 0U) {
+    return networks;
+  }
+
+  std::vector<wifi_ap_record_t> records(ap_count);
+  uint16_t fetched = ap_count;
+  const esp_err_t get_err = esp_wifi_scan_get_ap_records(&fetched, records.data());
+  if (get_err != ESP_OK) {
+    ESP_LOGW(kTag, "Failed to read Wi-Fi scan results: %s", esp_err_to_name(get_err));
+    return networks;
+  }
+
+  std::sort(records.begin(), records.begin() + fetched,
+            [](const wifi_ap_record_t& left, const wifi_ap_record_t& right) {
+              return left.rssi > right.rssi;
+            });
+
+  networks.reserve(fetched);
+  for (uint16_t i = 0; i < fetched; ++i) {
+    const std::string ssid(reinterpret_cast<const char*>(records[i].ssid));
+    if (ssid.empty()) {
+      continue;
+    }
+    if (std::find(networks.begin(), networks.end(), ssid) == networks.end()) {
+      networks.push_back(ssid);
+    }
+  }
+
+  ESP_LOGI(kTag, "Wi-Fi scan found %u visible networks", static_cast<unsigned int>(networks.size()));
+  return networks;
 }
 
 void WifiManager::event_handler(void* arg, esp_event_base_t event_base, int32_t event_id,

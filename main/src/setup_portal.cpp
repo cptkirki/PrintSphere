@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cJSON.h"
 #include "esp_check.h"
@@ -269,6 +270,7 @@ void append_cloud_status_fields(std::string* body, const BambuCloudSnapshot& clo
   *body += ",\"cloud_configured\":";
   *body += (cloud.configured ? "true" : "false");
   *body += ",\"cloud_detail\":\"" + json_escape(cloud.detail) + "\"";
+  *body += ",\"cloud_resolved_serial\":\"" + json_escape(cloud.resolved_serial) + "\"";
 }
 
 void append_local_status_fields(std::string* body, const PrinterSnapshot& local, bool local_configured) {
@@ -295,7 +297,7 @@ esp_err_t SetupPortal::start() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size = 8192;
-  config.max_uri_handlers = 10;
+  config.max_uri_handlers = 12;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
 
@@ -321,6 +323,14 @@ esp_err_t SetupPortal::start() {
   health_uri.user_ctx = this;
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &health_uri), kTag,
                       "health handler failed");
+
+  httpd_uri_t wifi_scan_uri = {};
+  wifi_scan_uri.uri = "/api/wifi/scan";
+  wifi_scan_uri.method = HTTP_GET;
+  wifi_scan_uri.handler = &SetupPortal::handle_wifi_scan;
+  wifi_scan_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &wifi_scan_uri), kTag,
+                      "wifi scan handler failed");
 
   httpd_uri_t config_get_uri = {};
   config_get_uri.uri = "/api/config";
@@ -556,6 +566,11 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += json_escape(wifi.password);
   html += "\" autocomplete=\"off\"></div>";
   html += "</div>";
+  html += "<div class=\"grid-2\">";
+  html += "<div class=\"field\"><label for=\"wifi_ssid_select\">Detected Networks</label><select id=\"wifi_ssid_select\"><option value=\"\">Select detected Wi-Fi...</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"wifi-scan-button\">Scan Networks</button>";
+  html += "<div class=\"micro\" id=\"wifi-scan-detail\">Pick a detected SSID or type one manually for hidden networks.</div></div>";
+  html += "</div>";
   html += "<p class=\"micro\">Current network status: <span id=\"wifi-detail\">";
   html += json_escape(wifi_badge_value);
   html += "</span></p>";
@@ -674,6 +689,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const statusEl=document.getElementById('status');";
   html += "const statusDetailEl=document.getElementById('status-detail');";
   html += "const saveButton=document.getElementById('save-button');";
+  html += "const wifiScanButton=document.getElementById('wifi-scan-button');";
+  html += "const wifiSsidSelect=document.getElementById('wifi_ssid_select');";
+  html += "const wifiScanDetail=document.getElementById('wifi-scan-detail');";
   html += "const cloudConnectButton=document.getElementById('cloud-connect-button');";
   html += "const localConnectButton=document.getElementById('local-connect-button');";
   html += "const verifyButton=document.getElementById('verify-button');";
@@ -697,6 +715,24 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
   html += "function valueOf(id){const el=document.getElementById(id);return el?el.value:'';}";
   html += "function trimmedValue(id){return valueOf(id).trim();}";
+  html += "function applyResolvedSerial(body){const serial=((body&&body.cloud_resolved_serial)||'').trim();"
+          "const input=document.getElementById('printer_serial');if(!serial||!input)return;"
+          "const current=input.value.trim();if(!current||current===savedConfig.printer_serial){input.value=serial;savedConfig.printer_serial=serial;}}";
+  html += "function populateWifiNetworks(body){if(!wifiSsidSelect)return;"
+          "const previousValue=wifiSsidSelect.value;const currentSsid=trimmedValue('wifi_ssid');"
+          "const networks=Array.isArray(body&&body.networks)?body.networks:[];"
+          "wifiSsidSelect.innerHTML='<option value=\"\">Select detected Wi-Fi...</option>';"
+          "networks.forEach((ssid)=>{const option=document.createElement('option');option.value=ssid;option.textContent=ssid;wifiSsidSelect.appendChild(option);});"
+          "if(currentSsid&&networks.includes(currentSsid)){wifiSsidSelect.value=currentSsid;}"
+          "else if(previousValue&&networks.includes(previousValue)){wifiSsidSelect.value=previousValue;}}";
+  html += "async function refreshWifiScan(){if(!wifiSsidSelect)return;"
+          "if(wifiScanButton){wifiScanButton.disabled=true;}if(wifiScanDetail){wifiScanDetail.textContent='Scanning nearby Wi-Fi networks...';}"
+          "try{const response=await fetch('/api/wifi/scan',{cache:'no-store'});const body=await response.json().catch(()=>({}));"
+          "if(response.ok){populateWifiNetworks(body);if(wifiScanDetail){const count=Array.isArray(body.networks)?body.networks.length:0;"
+          "wifiScanDetail.textContent=count?('Found '+count+' visible network'+(count===1?'':'s')+'. Hidden SSIDs can still be typed manually.'):'No visible networks found right now. Hidden SSIDs can still be typed manually.';}}"
+          "else if(wifiScanDetail){wifiScanDetail.textContent=body.error||'Wi-Fi scan failed right now.';}}"
+          "catch(error){if(wifiScanDetail){wifiScanDetail.textContent='Wi-Fi scan request failed.';}}"
+          "finally{if(wifiScanButton){wifiScanButton.disabled=false;}}}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
           "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}";
   html += "function updateCloudVerification(body){const note=document.getElementById('cloud-verify-note');"
@@ -720,6 +756,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else if(body.cloud_configured||(trimmedValue('cloud_email')&&valueOf('cloud_password'))){cloudValue='Configured';cloudState='info';}"
           "setBadge('cloud-badge','Cloud',cloudValue,cloudState);"
           "const cloudDetail=document.getElementById('cloud-detail');if(cloudDetail){cloudDetail.textContent=body.cloud_detail||'No cloud response yet';}"
+          "applyResolvedSerial(body);"
           "let localValue='Not configured';let localState='idle';"
           "if(body.local_connected){localValue='Connected';localState='ok';}"
           "else if(body.local_error){localValue='Error';localState='warn';}"
@@ -760,7 +797,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(!cloud_email||!cloud_password){setStatus('Cloud credentials missing','Enter both Bambu email and password first.',5000);return;}"
           "cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
           "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,state_source})});"
-          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);"
+          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
           "if(response.ok){if(body.cloud_connected){setStatus('Cloud connected',body.detail||'Connected to Bambu Cloud.',7000);}"
           "else if(body.cloud_verification_required){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.detail||'Enter the requested code to finish the login.',10000);}"
           "else{setStatus('Cloud login started',body.detail||'Waiting for cloud response...',7000);}}"
@@ -782,14 +819,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(!code){setStatus('Cloud code missing','Please enter the requested code first.',5000);return;}"
           "verifyButton.disabled=true;setStatus('Connecting cloud...','Completing the cloud login now.',8000);"
           "try{const response=await fetch('/api/cloud/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});"
-          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);"
+          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
           "if(response.ok){setStatus('Cloud code accepted',body.detail||'The cloud should connect within a few seconds.',7000);"
           "const codeInput=document.getElementById('cloud_verification_code');if(codeInput){codeInput.value='';}}"
           "else{setStatus(body.error||'Cloud code was rejected',body.detail||'Please check the code and try again.',7000);}}"
           "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{verifyButton.disabled=false;updateHealth();}});}";
+  html += "if(wifiSsidSelect){wifiSsidSelect.addEventListener('change',()=>{if(wifiSsidSelect.value){const wifiInput=document.getElementById('wifi_ssid');if(wifiInput){wifiInput.value=wifiSsidSelect.value;}}});}";
+  html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
-  html += "updateHealth();setInterval(updateHealth,4000);";
+  html += "refreshWifiScan();updateHealth();setInterval(updateHealth,4000);";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -819,6 +858,28 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
   append_cloud_status_fields(&body, cloud);
   append_local_status_fields(&body, local, portal->printer_client_.is_configured());
   body += "}";
+
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_wifi_scan(httpd_req_t* request) {
+  const auto* portal = static_cast<const SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+
+  const std::vector<std::string> networks = portal->wifi_manager_.scan_visible_networks();
+  std::string body = "{\"status\":\"ok\",\"networks\":[";
+  for (size_t i = 0; i < networks.size(); ++i) {
+    if (i > 0U) {
+      body += ",";
+    }
+    body += "\"";
+    body += json_escape(networks[i]);
+    body += "\"";
+  }
+  body += "]}";
 
   send_json(request, body);
   return ESP_OK;
@@ -906,13 +967,13 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid arc color value");
   }
 
-  const bool local_any =
-      !printer.host.empty() || !printer.serial.empty() || !printer.access_code.empty();
+  const bool local_requires_complete_fields =
+      !printer.host.empty() || !printer.access_code.empty();
   const bool cloud_any = !cloud.email.empty() || !cloud.password.empty();
   const bool local_ready = printer.is_ready();
   const bool cloud_ready = cloud.is_configured();
 
-  if (!local_ready && local_any) {
+  if (!local_ready && local_requires_complete_fields) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "local printer fields incomplete");
   }
   if (!cloud_ready && cloud_any) {
@@ -922,7 +983,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
                                "configure Wi-Fi, cloud or local printer access");
   }
-  if (local_ready && !is_valid_printer_host(printer.host)) {
+  if (!printer.host.empty() && !is_valid_printer_host(printer.host)) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
                                "printer host must be full IPv4 or hostname");
   }
