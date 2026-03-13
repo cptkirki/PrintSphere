@@ -46,6 +46,11 @@ class P1sCameraClient {
   void disconnect();
   bool fetch_frame_once(const PrinterConnection& connection);
   void set_snapshot(P1sCameraSnapshot snapshot);
+  void set_status_snapshot(bool configured, bool enabled, bool connected, const char* detail);
+  void set_frame_snapshot(bool configured, bool enabled, bool connected, const char* detail,
+                          std::shared_ptr<std::vector<uint8_t>> frame_blob, uint16_t width,
+                          uint16_t height);
+  bool has_cached_frame() const;
   static bool read_exact(esp_tls_t* tls, void* buffer, size_t length);
   static bool write_all(esp_tls_t* tls, const void* buffer, size_t length);
   static bool decode_frame_rgb565(const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
@@ -62,6 +67,7 @@ class P1sCameraClient {
   std::atomic<bool> enabled_{false};
   std::atomic<bool> refresh_requested_{false};
   std::atomic<bool> reconfigure_requested_{false};
+  bool idle_notified_ = false;
 };
 
 }  // namespace printsphere

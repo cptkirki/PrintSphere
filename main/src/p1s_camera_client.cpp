@@ -25,6 +25,10 @@ constexpr int64_t kAutoRefreshIntervalUs = 2000000;
 constexpr uint16_t kTargetWidth = 400;
 constexpr uint16_t kTargetHeight = 224;
 
+bool has_frame_data(const std::shared_ptr<std::vector<uint8_t>>& frame_blob) {
+  return frame_blob && !frame_blob->empty();
+}
+
 uint32_t little_u32(const uint8_t* data) {
   return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
          (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
@@ -59,6 +63,7 @@ void P1sCameraClient::configure(PrinterConnection connection) {
   if (connection.mqtt_username.empty()) {
     connection.mqtt_username = "bblp";
   }
+  const bool configured = connection.is_ready();
 
   {
     std::lock_guard<std::mutex> lock(config_mutex_);
@@ -67,7 +72,7 @@ void P1sCameraClient::configure(PrinterConnection connection) {
   reconfigure_requested_.store(true);
 
   P1sCameraSnapshot snapshot;
-  snapshot.configured = desired_connection().is_ready();
+  snapshot.configured = configured;
   snapshot.enabled = false;
   snapshot.connected = false;
   snapshot.detail = snapshot.configured ? "Camera snapshot ready" : "Camera not configured";
@@ -105,6 +110,47 @@ void P1sCameraClient::task_entry(void* context) {
 void P1sCameraClient::set_snapshot(P1sCameraSnapshot snapshot) {
   std::lock_guard<std::mutex> lock(mutex_);
   snapshot_ = std::move(snapshot);
+}
+
+void P1sCameraClient::set_status_snapshot(bool configured, bool enabled, bool connected,
+                                          const char* detail) {
+  const std::string next_detail = detail != nullptr ? detail : "";
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (snapshot_.configured == configured && snapshot_.enabled == enabled &&
+      snapshot_.connected == connected && snapshot_.detail == next_detail) {
+    return;
+  }
+  snapshot_.configured = configured;
+  snapshot_.enabled = enabled;
+  snapshot_.connected = connected;
+  snapshot_.detail = next_detail;
+}
+
+void P1sCameraClient::set_frame_snapshot(bool configured, bool enabled, bool connected,
+                                         const char* detail,
+                                         std::shared_ptr<std::vector<uint8_t>> frame_blob,
+                                         uint16_t width, uint16_t height) {
+  const std::string next_detail = detail != nullptr ? detail : "";
+  const void* next_blob = frame_blob.get();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (snapshot_.configured == configured && snapshot_.enabled == enabled &&
+      snapshot_.connected == connected && snapshot_.detail == next_detail &&
+      snapshot_.frame_blob.get() == next_blob && snapshot_.width == width &&
+      snapshot_.height == height) {
+    return;
+  }
+  snapshot_.configured = configured;
+  snapshot_.enabled = enabled;
+  snapshot_.connected = connected;
+  snapshot_.detail = next_detail;
+  snapshot_.frame_blob = std::move(frame_blob);
+  snapshot_.width = width;
+  snapshot_.height = height;
+}
+
+bool P1sCameraClient::has_cached_frame() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return has_frame_data(snapshot_.frame_blob);
 }
 
 bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
@@ -307,15 +353,8 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
       continue;
     }
 
-    P1sCameraSnapshot next = snapshot();
-    next.configured = true;
-    next.enabled = enabled_.load();
-    next.connected = true;
-    next.detail = "Camera image updated";
-    next.frame_blob = std::move(rgb565_frame);
-    next.width = width;
-    next.height = height;
-    set_snapshot(std::move(next));
+    set_frame_snapshot(true, enabled_.load(), true, "Camera image updated",
+                       std::move(rgb565_frame), width, height);
     ESP_LOGI(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
              static_cast<unsigned>(height));
     return true;
@@ -332,75 +371,51 @@ void P1sCameraClient::task_loop() {
     if (reconfigure_requested_.exchange(false)) {
       disconnect();
       refresh_requested_.store(false);
+      idle_notified_ = false;
       last_fetch_us = 0;
     }
 
     const PrinterConnection connection = desired_connection();
     if (!connection.is_ready()) {
-      P1sCameraSnapshot current = snapshot();
-      current.configured = false;
-      current.enabled = false;
-      current.connected = false;
-      current.detail = "Camera not configured";
-      set_snapshot(std::move(current));
+      idle_notified_ = false;
+      set_status_snapshot(false, false, false, "Camera not configured");
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
 
     if (!network_ready_.load()) {
       disconnect();
-      P1sCameraSnapshot current = snapshot();
-      current.configured = true;
-      current.enabled = enabled_.load();
-      current.connected = false;
-      current.detail = "Camera waiting for Wi-Fi";
-      set_snapshot(std::move(current));
+      idle_notified_ = false;
+      set_status_snapshot(true, enabled_.load(), false, "Camera waiting for Wi-Fi");
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
     if (!enabled_.load()) {
       disconnect();
-      P1sCameraSnapshot current = snapshot();
-      current.configured = true;
-      current.enabled = false;
-      current.connected = false;
-      current.detail = current.frame_blob && !current.frame_blob->empty() ? "Tap for new image"
-                                                                          : "Camera off";
-      set_snapshot(std::move(current));
+      if (!idle_notified_) {
+        set_status_snapshot(true, false, false, has_cached_frame() ? "Tap for new image"
+                                                                   : "Camera off");
+        idle_notified_ = true;
+      }
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
+    idle_notified_ = false;
 
     const int64_t now_us = esp_timer_get_time();
     const bool due = last_fetch_us != 0 && (now_us - last_fetch_us) >= kAutoRefreshIntervalUs;
     if (!refresh_requested_.exchange(false) && !due) {
-      P1sCameraSnapshot idle = snapshot();
-      idle.configured = true;
-      idle.enabled = true;
-      idle.connected = tls_ != nullptr;
-      idle.detail = "Tap for new image";
-      set_snapshot(std::move(idle));
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
-    P1sCameraSnapshot fetching = snapshot();
-    fetching.configured = true;
-    fetching.enabled = true;
-    fetching.connected = false;
-    fetching.detail = "Loading camera image";
-    set_snapshot(std::move(fetching));
+    set_status_snapshot(true, true, false, "Loading camera image");
 
     const bool ok = fetch_frame_once(connection);
     last_fetch_us = esp_timer_get_time();
     if (!ok) {
-      P1sCameraSnapshot retry = snapshot();
-      retry.configured = true;
-      retry.enabled = enabled_.load();
-      retry.connected = false;
-      retry.detail = "Camera image failed";
-      set_snapshot(std::move(retry));
+      set_status_snapshot(true, enabled_.load(), false, "Camera image failed");
       vTaskDelay(pdMS_TO_TICKS(1500));
     }
   }
