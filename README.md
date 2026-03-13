@@ -14,6 +14,7 @@ PrintSphere is the native ESP-IDF rebuild and the better successor to
 - ESP32-S3 Touch AMOLED 1.75
 - no Home Assistant required
 - direct Bambu LAN status client in LAN Mode
+- only LAN Mode is not needed on the printer
 
 ## Already Implemented
 
@@ -60,10 +61,7 @@ The current screen already shows:
 - battery and USB status
 
 ## Current Limitations
-
-- LAN Mode must be enabled on the printer
-- camera and MJPEG decoding are intentionally not fully finished yet
-- active printer control is intentionally out of scope and not planned for this project
+- camera and MJPEG decoding are not fully finished yet
 - MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
 
 ## Build
