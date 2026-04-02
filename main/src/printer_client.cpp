@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -24,6 +25,21 @@ constexpr char kStartPush[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\
 
 uint64_t now_ms() {
   return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+}
+
+void log_heap_status(const char* context) {
+  const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+  const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+
+  ESP_LOGI(kTag,
+           "%s heap: internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u",
+           context != nullptr ? context : "heap",
+           static_cast<unsigned int>(internal_free),
+           static_cast<unsigned int>(internal_largest),
+           static_cast<unsigned int>(dma_free),
+           static_cast<unsigned int>(dma_largest));
 }
 
 std::string make_client_id() {
@@ -749,10 +765,20 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     case MQTT_EVENT_CONNECTED: {
       mqtt_connected_ = true;
       received_payload_ = false;
+      subscription_acknowledged_ = false;
+      initial_sync_sent_ = false;
+      delayed_pushall_sent_ = false;
+      first_payload_observed_ = false;
+      initial_sync_tick_ = 0;
       last_message_tick_ = xTaskGetTickCount();
 
-      esp_mqtt_client_subscribe(client_, report_topic_.c_str(), 1);
-      request_initial_sync();
+      const int msg_id = esp_mqtt_client_subscribe(client_, report_topic_.c_str(), 1);
+      if (msg_id < 0) {
+        ESP_LOGW(kTag, "Failed to subscribe to %s", report_topic_.c_str());
+      } else {
+        ESP_LOGI(kTag, "Subscribed request queued for %s (msg_id=%d)", report_topic_.c_str(),
+                 msg_id);
+      }
 
       PrinterSnapshot snapshot = state_.snapshot();
       std::string active_host;
@@ -768,7 +794,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       snapshot.raw_stage.clear();
       snapshot.ui_status.clear();
       snapshot.stage = "connected";
-      snapshot.detail = "Connected to local Bambu MQTT";
+      snapshot.detail = "Connected to local Bambu MQTT, waiting for subscribe ack";
       snapshot.resolved_serial = active_serial;
       snapshot.non_error_stop = false;
       snapshot.show_stop_banner = false;
@@ -778,8 +804,37 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       break;
     }
 
+    case MQTT_EVENT_SUBSCRIBED: {
+      subscription_acknowledged_ = true;
+      initial_sync_sent_ = true;
+      delayed_pushall_sent_ = false;
+      initial_sync_tick_ = xTaskGetTickCount();
+
+      PrinterSnapshot snapshot = state_.snapshot();
+      snapshot.connection = PrinterConnectionState::kOnline;
+      snapshot.lifecycle = PrintLifecycleState::kUnknown;
+      snapshot.raw_status.clear();
+      snapshot.raw_stage.clear();
+      snapshot.ui_status.clear();
+      snapshot.stage = "subscribed";
+      snapshot.detail = "MQTT subscribed, requesting printer sync";
+      snapshot.non_error_stop = false;
+      snapshot.show_stop_banner = false;
+      update_local_source_metadata(&snapshot, true, true);
+      state_.set_snapshot(std::move(snapshot));
+
+      ESP_LOGI(kTag, "MQTT subscribe acknowledged (msg_id=%d), sending get_version + start",
+               event->msg_id);
+      request_initial_sync();
+      break;
+    }
+
     case MQTT_EVENT_DISCONNECTED: {
       mqtt_connected_ = false;
+      subscription_acknowledged_ = false;
+      initial_sync_sent_ = false;
+      delayed_pushall_sent_ = false;
+      initial_sync_tick_ = 0;
       PrinterSnapshot snapshot = state_.snapshot();
       snapshot.connection = PrinterConnectionState::kConnecting;
       snapshot.raw_status.clear();
@@ -816,14 +871,26 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       }
 
       if (!payload.empty() && topic == report_topic_) {
+        const bool first_payload = !first_payload_observed_.exchange(true);
+        if (first_payload) {
+          log_heap_status("Before first MQTT payload");
+        }
         last_message_tick_ = xTaskGetTickCount();
         handle_report_payload(payload.data(), payload.size());
+        if (first_payload) {
+          log_heap_status("After first MQTT payload");
+        }
       }
       break;
     }
 
     case MQTT_EVENT_ERROR: {
       mqtt_connected_ = false;
+      subscription_acknowledged_ = false;
+      initial_sync_sent_ = false;
+      delayed_pushall_sent_ = false;
+      initial_sync_tick_ = 0;
+      log_heap_status("MQTT error");
       PrinterSnapshot snapshot = state_.snapshot();
       snapshot.connection = PrinterConnectionState::kError;
       snapshot.lifecycle = PrintLifecycleState::kError;
@@ -1079,8 +1146,13 @@ void PrinterClient::handle_info_payload(const char* payload, size_t length) {
 void PrinterClient::stop_client() {
   mqtt_connected_ = false;
   received_payload_ = false;
+  subscription_acknowledged_ = false;
+  initial_sync_sent_ = false;
+  delayed_pushall_sent_ = false;
+  first_payload_observed_ = false;
   client_started_ = false;
   last_message_tick_ = 0;
+  initial_sync_tick_ = 0;
 
   {
     std::lock_guard<std::mutex> lock(incoming_mutex_);
@@ -1176,11 +1248,11 @@ void PrinterClient::task_loop() {
       mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
       mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
       mqtt_cfg.credentials.client_id = client_id_.c_str();
-      mqtt_cfg.session.keepalive = 5;
+      mqtt_cfg.session.keepalive = 30;
       mqtt_cfg.session.disable_clean_session = false;
       mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
       mqtt_cfg.network.timeout_ms = 10000;
-      mqtt_cfg.network.reconnect_timeout_ms = 1000;
+      mqtt_cfg.network.reconnect_timeout_ms = 5000;
       {
         std::lock_guard<std::mutex> lock(config_mutex_);
         mqtt_cfg.broker.address.hostname = active_connection_.host.c_str();
@@ -1235,7 +1307,18 @@ void PrinterClient::task_loop() {
       last_message_tick_ = xTaskGetTickCount();
     }
 
-    if (mqtt_connected_ && received_payload_) {
+    if (mqtt_connected_ && subscription_acknowledged_ && initial_sync_sent_ && !received_payload_ &&
+        !delayed_pushall_sent_) {
+      const uint32_t now = xTaskGetTickCount();
+      const uint32_t initial_sync_tick = initial_sync_tick_.load();
+      if (initial_sync_tick != 0 && now - initial_sync_tick > pdMS_TO_TICKS(3000)) {
+        ESP_LOGW(kTag, "No status payload received after subscribe, sending delayed pushall");
+        publish_request(kPushAll);
+        delayed_pushall_sent_ = true;
+      }
+    }
+
+    if (mqtt_connected_ && subscription_acknowledged_ && received_payload_) {
       const uint32_t now = xTaskGetTickCount();
       const uint32_t last = last_message_tick_.load();
       if (now - last > pdMS_TO_TICKS(60000)) {
@@ -1279,7 +1362,7 @@ void PrinterClient::publish_request(const char* payload) {
 
 void PrinterClient::request_initial_sync() {
   publish_request(kGetVersion);
-  publish_request(kPushAll);
+  publish_request(kStartPush);
 }
 
 PrintLifecycleState PrinterClient::lifecycle_from_state(const std::string& gcode_state,

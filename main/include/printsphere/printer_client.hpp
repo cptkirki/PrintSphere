@@ -65,9 +65,14 @@ class PrinterClient {
   std::atomic<bool> client_started_{false};
   std::atomic<bool> mqtt_connected_{false};
   std::atomic<bool> received_payload_{false};
+  std::atomic<bool> subscription_acknowledged_{false};
+  std::atomic<bool> initial_sync_sent_{false};
+  std::atomic<bool> delayed_pushall_sent_{false};
+  std::atomic<bool> first_payload_observed_{false};
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> reconfigure_requested_{false};
   std::atomic<uint32_t> last_message_tick_{0};
+  std::atomic<uint32_t> initial_sync_tick_{0};
 };
 
 }  // namespace printsphere
