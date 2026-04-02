@@ -62,6 +62,13 @@ The current screen already shows:
 - Wi-Fi status
 - battery and USB status
 
+## Web Config
+
+enter ip adress of the device in a local browser
+Arc colors can be customized from web config menu
+<img width="1078" height="686" alt="image" src="https://github.com/user-attachments/assets/9b80b93e-5963-46da-a284-471fd7be27f0" />
+
+
 ## Current Limitations
 - camera and MJPEG decoding are not fully finished yet
 - MQTT TLS is working, but is not yet pinned to dedicated Bambu certificate handling
