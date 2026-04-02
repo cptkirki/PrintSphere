@@ -49,6 +49,8 @@ constexpr TickType_t kCloudPreviewWakePoll = pdMS_TO_TICKS(2000);
 constexpr TickType_t kCloudBindingRefresh = pdMS_TO_TICKS(300000);
 constexpr uint64_t kCloudLiveDataFreshMs = 120000ULL;
 constexpr uint64_t kCloudOptimisticLightMs = 8000ULL;
+constexpr int kCloudPrintErrorTaskCanceled = 0x0300400C;
+constexpr int kCloudPrintErrorPrintingCancelled = 0x0500400E;
 
 struct PreviewDownloadContext {
   std::vector<uint8_t>* buffer = nullptr;
@@ -229,7 +231,12 @@ bool is_recent_optimistic_light_state(uint64_t last_update_ms) {
 }
 
 bool cloud_status_is_non_error_stop(std::string_view status_text, int print_error_code, int hms_count) {
-  if (status_text.empty() || print_error_code != 0 || hms_count > 0) {
+  if (status_text.empty() || hms_count > 0) {
+    return false;
+  }
+
+  if (print_error_code != 0 && print_error_code != kCloudPrintErrorTaskCanceled &&
+      print_error_code != kCloudPrintErrorPrintingCancelled) {
     return false;
   }
 
@@ -277,6 +284,28 @@ bool cloud_rest_failure_looks_stale(std::string_view status_text, std::string_vi
   const bool idle_type =
       normalized_type == "IDLE" || (normalized_stage.empty() && normalized_type == "CLOUD");
   return idle_stage || idle_type;
+}
+
+int normalize_cloud_print_error_code(int print_error_code) {
+  switch (print_error_code) {
+    case kCloudPrintErrorTaskCanceled:
+    case kCloudPrintErrorPrintingCancelled:
+      return 0;
+    default:
+      return print_error_code;
+  }
+}
+
+void log_cloud_state_debug(const char* source, const std::string& status_text,
+                           const std::string& stage_text, const std::string& print_type,
+                           int print_error_code, int hms_count, bool stale_failed_state,
+                           bool preserve_live_state) {
+  ESP_LOGI(kTag,
+           "Cloud %s state: status=%s stage=%s print_type=%s print_error=%d hms=%d stale=%s preserve_live=%s",
+           source, status_text.empty() ? "-" : status_text.c_str(),
+           stage_text.empty() ? "-" : stage_text.c_str(),
+           print_type.empty() ? "-" : print_type.c_str(), print_error_code, hms_count,
+           stale_failed_state ? "yes" : "no", preserve_live_state ? "yes" : "no");
 }
 
 bool split_jwt_payload(const std::string& token, std::string* payload_b64) {
@@ -1356,6 +1385,13 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     initial_sync_tick_ = 0;
 
     BambuCloudSnapshot current = snapshot();
+    const std::string previous_status = current.raw_status;
+    const std::string previous_stage = current.raw_stage;
+    const PrintLifecycleState previous_lifecycle = current.lifecycle;
+    const int previous_print_error = current.print_error_code;
+    const uint16_t previous_hms_count = current.hms_alert_count;
+    const bool previous_non_error_stop = current.non_error_stop;
+    const bool previous_has_error = current.has_error;
     current.configured = true;
     current.connected = true;
     current.capabilities = default_cloud_capabilities();
@@ -1372,6 +1408,8 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     const std::string status_text =
         json_string(print, "gcode_state", extract_status_text(print));
     const std::string stage_text = extract_stage_text(print);
+    const std::string print_type = extract_print_type_text(print);
+    const bool has_status_update = !status_text.empty() || !stage_text.empty();
     const PrintLifecycleState lifecycle = cloud_lifecycle_from_status(status_text);
     if (!status_text.empty()) {
       current.raw_status = status_text;
@@ -1420,14 +1458,31 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     current.chamber_temp_c =
         extract_cloud_chamber_temperature_c(print, current.chamber_temp_c);
 
-    current.print_error_code = extract_cloud_print_error_code(print, current.print_error_code);
+    current.print_error_code =
+        normalize_cloud_print_error_code(extract_cloud_print_error_code(print, current.print_error_code));
     current.hms_alert_count = static_cast<uint16_t>(
         std::max(extract_cloud_hms_count(print, current.hms_alert_count), 0));
-    current.non_error_stop =
-        cloud_status_is_non_error_stop(status_text, current.print_error_code, current.hms_alert_count);
-    current.has_error = (!current.non_error_stop &&
-                         current.lifecycle == PrintLifecycleState::kError) ||
-                        current.print_error_code != 0 || current.hms_alert_count > 0U;
+    if (has_status_update) {
+      current.non_error_stop = cloud_status_is_non_error_stop(status_text, current.print_error_code,
+                                                              current.hms_alert_count);
+      current.has_error = (!current.non_error_stop &&
+                           current.lifecycle == PrintLifecycleState::kError) ||
+                          current.print_error_code != 0 || current.hms_alert_count > 0U;
+    } else {
+      // Cloud push_status often arrives as partial updates. If a packet has no status/stage,
+      // preserve the last known lifecycle/error interpretation instead of re-arming a stale FAIL.
+      current.lifecycle = previous_lifecycle;
+      current.non_error_stop = previous_non_error_stop;
+      current.has_error = previous_has_error;
+    }
+    if (status_text != previous_status || stage_text != previous_stage ||
+        current.print_error_code != previous_print_error ||
+        current.hms_alert_count != previous_hms_count ||
+        current.non_error_stop != previous_non_error_stop ||
+        current.has_error != previous_has_error) {
+      log_cloud_state_debug("mqtt", status_text, stage_text, print_type, current.print_error_code,
+                            static_cast<int>(current.hms_alert_count), false, false);
+    }
     const bool saw_light_report =
         apply_chamber_light_report(print, &current.chamber_light_supported,
                                    &current.chamber_light_state_known, &current.chamber_light_on);
@@ -2071,7 +2126,8 @@ bool BambuCloudClient::fetch_bindings() {
     const float bed_temp_c = extract_cloud_bed_temperature_c(best_device, current.bed_temp_c);
     const float chamber_temp_c =
         extract_cloud_chamber_temperature_c(best_device, current.chamber_temp_c);
-    int print_error_code = extract_cloud_print_error_code(best_device, current.print_error_code);
+    int print_error_code = normalize_cloud_print_error_code(
+        extract_cloud_print_error_code(best_device, current.print_error_code));
     const int hms_count = extract_cloud_hms_count(best_device, current.hms_alert_count);
     std::string effective_status = print_status;
     std::string effective_stage = current_stage;
@@ -2095,6 +2151,10 @@ bool BambuCloudClient::fetch_bindings() {
         cloud_status_is_non_error_stop(effective_status, print_error_code, hms_count);
     const std::string error_detail =
         stale_failed_state ? std::string{} : format_error_detail(print_error_code, hms_count);
+    if (!print_status.empty() || print_error_code != 0 || hms_count > 0 || stale_failed_state) {
+      log_cloud_state_debug("bind", effective_status, stage, print_type, print_error_code, hms_count,
+                            stale_failed_state, preserve_live_state);
+    }
 
     current.connected = true;
     if (current.detail.empty() || current.detail == "Restored Bambu Cloud session" ||
@@ -2231,6 +2291,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
   std::string selected_title;
   std::string selected_status;
   std::string selected_stage;
+  std::string selected_print_type;
   float selected_progress = 0.0f;
   float selected_nozzle_temp_c = 0.0f;
   float selected_bed_temp_c = 0.0f;
@@ -2243,6 +2304,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
   int selected_hms_count = 0;
   PrintLifecycleState selected_lifecycle = PrintLifecycleState::kUnknown;
   bool selected_has_error = false;
+  bool selected_stale_failed_state = false;
   const std::string expected_serial = !resolved_serial_.empty() ? resolved_serial_ : requested_serial_;
   const cJSON* selected_item = nullptr;
   int best_priority = -1;
@@ -2322,7 +2384,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     selected_title = extract_title(selected_item);
     selected_status = extract_status_text(selected_item);
     selected_stage = extract_stage_text(selected_item);
-    const std::string selected_print_type = extract_print_type_text(selected_item);
+    selected_print_type = extract_print_type_text(selected_item);
     selected_progress = extract_progress(selected_item);
     const NozzleTemperatureBundle nozzle_temps =
         extract_cloud_nozzle_temperature_bundle(selected_item, 0.0f, 0.0f);
@@ -2333,9 +2395,10 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     selected_remaining_seconds = extract_remaining_seconds(selected_item);
     selected_current_layer = extract_current_layer(selected_item);
     selected_total_layers = extract_total_layers(selected_item);
-    selected_print_error_code = extract_cloud_print_error_code(selected_item, 0);
+    selected_print_error_code =
+        normalize_cloud_print_error_code(extract_cloud_print_error_code(selected_item, 0));
     selected_hms_count = extract_cloud_hms_count(selected_item, 0);
-    const bool selected_stale_failed_state = cloud_rest_failure_looks_stale(
+    selected_stale_failed_state = cloud_rest_failure_looks_stale(
         selected_status, selected_stage, selected_print_type, selected_hms_count);
     if (selected_stale_failed_state) {
       selected_status = "IDLE";
@@ -2371,6 +2434,15 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
   }
   current.capabilities = default_cloud_capabilities();
   current.last_update_ms = now_ms();
+  if (!selected_status.empty() || selected_print_error_code != 0 || selected_hms_count > 0 ||
+      selected_stale_failed_state) {
+    const std::string selected_stage_for_log =
+        !selected_stage.empty() ? selected_stage
+                                : cloud_stage_label_for(selected_status, selected_lifecycle);
+    log_cloud_state_debug("tasks", selected_status, selected_stage_for_log, selected_print_type,
+                          selected_print_error_code, selected_hms_count,
+                          selected_stale_failed_state, preserve_live_state);
+  }
   const bool selected_has_state = !selected_status.empty() ||
                                   selected_lifecycle != PrintLifecycleState::kUnknown ||
                                   selected_progress > 0.0f || selected_remaining_seconds > 0U ||
