@@ -905,8 +905,9 @@ float extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
       return packed_temp_current_value(packed, fallback);
     }
 
-    const float direct = json_number_local(source, "bed_temper",
-                                           json_number_local(source, "bed_temp", -1000.0f));
+    const float direct = normalize_temperature_candidate(
+        json_number_local(source, "bed_temper",
+                          json_number_local(source, "bed_temp", -1000.0f)));
     if (direct > -999.0f) {
       return direct;
     }
@@ -918,7 +919,7 @@ float extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
                                          "bedTemperature", "hotbed_temper", "hotbed_temp",
                                          "hotbed_temperature", "hotbedTemperature"},
                                         &value)
-             ? value
+             ? normalize_temperature_candidate(value)
              : fallback;
 }
 
@@ -951,9 +952,9 @@ float extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
       }
     }
 
-    const float direct =
+    const float direct = normalize_temperature_candidate(
         json_number_local(source, "chamber_temper",
-                          json_number_local(source, "chamber_temp", -1000.0f));
+                          json_number_local(source, "chamber_temp", -1000.0f)));
     if (direct > -999.0f) {
       return direct;
     }
@@ -965,7 +966,7 @@ float extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
                                          "chamber_temperature", "chamberTemperature",
                                          "ctc_temperature", "ctcTemperature"},
                                         &value)
-             ? value
+             ? normalize_temperature_candidate(value)
              : fallback;
 }
 
