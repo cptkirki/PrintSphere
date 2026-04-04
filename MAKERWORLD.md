@@ -1,23 +1,174 @@
 # PrintSphere: MakerWorld Guide
 
-PrintSphere is a standalone status display for Bambu Lab printers based on the `Waveshare ESP32-S3 AMOLED 1.75`. This guide is for users who print the case from MakerWorld and want to get the hardware running with the current feature set.
+PrintSphere is a standalone round status display for Bambu Lab printers based on the `Waveshare ESP32-S3 AMOLED 1.75`. This page is meant for MakerWorld users who want a quick overview of the project, the required hardware, the assembly steps, and the most important setup notes.
 
-## What You Need
+## What PrintSphere Can Do
 
-- `Waveshare ESP32-S3 AMOLED 1.75`
-- the matching printed case from the MakerWorld project
-- a USB-C cable and 5 V power source
-- a 2.4 GHz Wi-Fi network
-- a Bambu Cloud account
-- optional local printer access in addition to the cloud setup (model dependant):
-  - printer IP or hostname
-  - printer serial number
-  - access code
+PrintSphere can act as a small desktop companion display for supported Bambu printers.
+
+Depending on printer model, source mode, and current code support, it can show:
+
+- print progress
+- printer lifecycle / current state
+- remaining time
+- temperatures
+- layer information
+- Wi-Fi and battery state
+- cloud cover image and project title
+- local camera snapshots
+- printer error details and HMS information
+
+It also supports:
+
+- Bambu Cloud login from the built-in Web Config
+- email-code / 2FA handling during cloud login
+- hybrid cloud + local routing
+- local MQTT path for supported models
+- chamber light toggle on supported printers
+- live arc-color customization from Web Config
+- touch PIN unlock for protected Web Config access
+
+## Hardware Overview
+
+The project is built around the `Waveshare ESP32-S3 1.75 inch AMOLED Round Display` and a custom printed housing.
+
+The printed housing is designed to combine:
+
+- the display board
+- a LiPo battery
+- a Qi charging coil
+- a small slide switch
+- a magnetic base / ring element
+
+## Parts List
+
+The printed parts are part of the MakerWorld project.
+
+Additional hardware:
+
+- `ESP32-S3 1.75inch AMOLED Round Display x 1`
+  - `https://www.waveshare.com/esp32-s3-touch-amoled-1.75.htm?sku=31261`
+- `Lithium Polymer battery 3.7 V 2000 mAh 103454 x 1`
+  - size: `10 mm x 34 mm x 54 mm`
+- `Qi standard wireless charging coil x 1`
+  - example source: `aliexpress.com/item/1005006741966938.html`
+- `JST MX1.25 mm soft silicone cable x 2`
+  - one for the battery
+  - one to replace the cable on the wireless charger
+- `Mini slide switch SS12D00G x 1`
+  - knob length: `3 mm`
+- `M2.5x25 mm screw x 1`
+- `M2.5 nut x 1`
+- `Magnetic circle ring plate sheet x 1`
+  - example source: `aliexpress.com/item/1005006966440001.html`
+
+## Before Assembly
+
+- Print the case parts from the MakerWorld project.
+- Make sure the battery dimensions fit your print and do not force the housing.
+- Double-check LiPo polarity before connecting anything.
+- Double-check the polarity and output of the Qi charging module before soldering or plugging it into the display.
+- If you replace the charging cable with a JST cable, verify the pin order yourself before first power-on.
+
+## Assembly Guide
+
+The exact printed-part names and some orientation details still need to be filled in. The structure below is intended as the assembly flow for the MakerWorld page.
+
+### 1. Print Preparation
+
+- Print all case parts from the MakerWorld project.
+- Clean the support material and test-fit all electronics before final assembly.
+- `[Add exact printed-part names here]`
+
+### 2. Prepare The Display Board
+
+- Unpack the `Waveshare ESP32-S3 AMOLED 1.75` board.
+- Check where the USB-C port, battery connector, and mounting points sit inside the case.
+- `[Add note about board orientation in the case here]`
+
+### 3. Prepare The Slide Switch
+
+- Install the `SS12D00G` slide switch into the matching slot in the printed housing.
+- Make sure the switch can move freely after insertion.
+- `[Add exact switch orientation here]`
+- `[Add note about whether the switch is glued, press-fit, or retained by the shell here]`
+
+### 4. Prepare The Qi Charging Coil
+
+- If needed, remove the original cable from the Qi charging coil.
+- Solder the replacement `JST MX1.25 mm` soft silicone cable to the charging board / coil assembly.
+- Route the cable so it does not sit under pressure once the case is closed.
+- `[Add exact solder points and polarity here]`
+- `[Add note about coil orientation in the housing here]`
+
+### 5. Prepare The Battery Cable
+
+- Use the second `JST MX1.25 mm` cable if your battery does not already match the required connector.
+- Verify battery polarity with a multimeter before plugging it into the board.
+- Never guess LiPo polarity.
+- `[Add note here if a pre-crimped battery with correct plug is preferred]`
+
+### 6. Install The Magnetic Ring
+
+- Place the `magnetic circle ring plate sheet` into the intended recess of the printed base or rear shell.
+- Ensure it sits flat and does not interfere with the charging coil.
+- `[Add exact part location here]`
+- `[Add note whether adhesive backing is enough or glue is recommended]`
+
+### 7. Install The Qi Coil
+
+- Place the Qi charging coil into its dedicated pocket in the printed part.
+- Align it as centrally as possible for reliable charging.
+- Route the cable through the intended channel.
+- `[Add exact facing direction here]`
+- `[Add note about spacer foam / tape if required]`
+
+### 8. Install The Battery
+
+- Place the `103454 2000 mAh` battery into the battery compartment.
+- Make sure the battery is not bent, pinched, or compressed by the shell.
+- Route the cable so it does not cross the screw channel or get trapped at the shell edge.
+- `[Add whether tape or foam pad is recommended here]`
+
+### 9. Install The Display Board
+
+- Place the display board into the front shell / main housing.
+- Check that the screen sits cleanly in the visible opening.
+- Connect the battery.
+- Connect the wireless charging lead if your design version uses it directly on the board.
+- `[Add exact connector positions here]`
+- `[Add photo or note for cable routing here]`
+
+### 10. Final Cable Check
+
+- Before closing the housing, confirm:
+  - the switch moves freely
+  - no cable is trapped under the board
+  - the battery is not under pressure
+  - the Qi coil cable is not crossing the screw path
+  - all connectors are fully seated
+
+### 11. Close The Housing
+
+- Join the housing parts carefully.
+- Insert the `M2.5x25 mm` screw.
+- Secure it with the `M2.5` nut.
+- Tighten only enough to hold the assembly safely.
+- Do not overtighten and crush the printed part.
+- `[Add exact screw direction here]`
+
+### 12. First Power Test
+
+- Turn the slide switch on.
+- Connect USB-C once for the first test if needed.
+- Check whether the board powers up normally.
+- Check whether wireless charging reacts as expected.
+- `[Add expected LED / screen behavior here]`
 
 ## Flashing The Firmware
 
-1. Download latest [`release/firmware.bin`](release/firmware.bin) version.
-2. Connect the display to your computer via USB.
+1. Download the latest [`release/firmware.bin`](release/firmware.bin).
+2. Connect the display to your computer with USB.
 3. Flash the firmware with one of these tools:
    - `https://web.esphome.io/`
    - `https://www.espboards.dev/tools/program/`
@@ -25,147 +176,71 @@ PrintSphere is a standalone status display for Bambu Lab printers based on the `
 4. On `web.esphome.io`:
    - connect the device
    - choose the COM port
-   - do not use "Prepare for first use"
+   - do not use `Prepare for first use`
    - install `firmware.bin` directly
 5. On `espboards.dev` or `esptool-js`:
    - write `firmware.bin` to address `0x0`
 
-The bootloader is already included in the file.
+The bootloader is already included in the merged image.
 
-## First Start
+## Quick Setup Summary
 
-1. After flashing, PrintSphere starts a Wi-Fi access point:
+1. After flashing, PrintSphere starts a setup AP:
    - SSID: `PrintSphere-Setup`
    - password: `printsphere`
-2. Connect to that Wi-Fi network.
-3. Open `http://192.168.4.1` in your browser.
-4. Enter your home Wi-Fi credentials and save them.
-5. The device reboots and connects to your home network.
-6. Open the device IP in your local network.
+2. Connect to that Wi-Fi and open `http://192.168.4.1`.
+3. Save your home Wi-Fi credentials.
+4. After reboot, open the new device IP in your home network.
+5. Hold the display for about one second to show the Web Config PIN.
+6. Enter the PIN in the browser.
+7. In Web Config, connect Bambu Cloud:
+   - email
+   - password
+   - region
+8. If Bambu requests an email code or 2FA code, enter it there.
+9. Optionally add the local printer path:
+   - printer IP / hostname
+   - printer serial number
+   - access code
 
-## Unlocking Web Config
+## Recommended Setup Notes
 
-The full Web Config is protected after the initial Wi-Fi setup.
+- For most users, start with `Hybrid`.
+- A working Bambu Cloud login is currently the main real-world setup path.
+- On some printers, cloud data may already be enough for progress, temperatures, remaining time, and layer information.
+- If cloud data looks incomplete on your model, adding the local MQTT path may still improve the result.
+- The printer serial number may be resolved automatically from the cloud path, but entering it manually can still help while testing.
 
-1. Touch and hold the display for about one second.
-2. A six-digit PIN appears on the screen.
-3. Enter that PIN in the browser.
-4. The PIN stays valid for about 2 minutes.
-5. The unlocked browser session stays active for about 10 minutes.
-
-## Setup In Web Config
-
-### 1. Wi-Fi
-
-This stores the home network. If your Wi-Fi changes later, update it here again.
-
-### 2. Bambu Cloud
-
-At the moment, the practical end-user setup path expects Bambu Cloud.
-
-Enter:
-
-- Bambu email
-- Bambu password
-- cloud region
-
-Then press `Connect Cloud`.
-
-Notes:
-
-- If Bambu requests an email code or 2FA code, you can enter it directly in Web Config.
-- The printer serial number is often filled in automatically after a successful cloud connection.
-- The cloud path now also appears to provide progress, remaining time, layer information, and temperatures on many models.
-- That broader cloud behavior still needs more real-world validation on newer printer families.
-
-### 3. Connection Mode
-
-Available modes:
-
-- `Hybrid`:
-  Current default recommendation. PrintSphere tries to combine cloud and local data, picks the better active path, and still uses the local camera when available.
-- `Cloud only`:
-  Good starting point for many newer models. The local MQTT path and local camera page are disabled.
-- `Local only`:
-  Mainly technical or experimental right now. The current real-world setup still assumes a working cloud login first, and the cloud cover page is not used in this mode.
-
-Important:
-
-- Changing the connection mode restarts the device.
-
-### 4. Local Printer Access
-
-Local printer access is optional on top of the cloud setup.
-
-Enter:
-
-- printer IP or hostname
-- printer serial number
-- access code
-
-This may still help with:
-
-- local fallback data in `Hybrid`
-- local MQTT status on supported models
-- the local camera page
-
-Current guidance from the code:
-
-- `P1`, `A1`, and `X1` families are the strongest candidates for adding the local path.
-- `P2S` does not currently support local status in the code.
-- `H2` local status may require Developer Mode.
-- On many newer models, cloud may already be enough for everyday use.
-- If cloud data still looks incomplete on your printer, adding the local path could still help.
-
-### 5. Arc Colors
-
-You can customize the ring colors directly in Web Config.
-
-- changes should preview live immediately
-- saving them does not require a reboot
-
-## What You See On The Device
-
-- Main page:
-  can show progress ring, lifecycle, temperatures, layers, remaining time, battery, and Wi-Fi state
-- Page 2:
-  can show cloud cover preview and title
-- Page 3:
-  can show local camera snapshots when that path is working
-
-Extra interactions:
-
-- long-press the display to request a Web Config PIN
-- tap the camera page to request a refresh of the current image
-- the camera page also tries to auto-refresh while it is open
-- tap the center logo to request a chamber light toggle on supported models
-
-## Model Guidance
-
-Use these as practical starting points based on the current code and limited real-world testing:
+## Model Notes
 
 - `P1`, `A1`, and often `X1` family:
-  start with `Hybrid` and usually also configure the local printer path
+  - best current candidates for `Hybrid`
 - `P2` and `H2` family:
-  start cloud-first
+  - often best to start cloud-first
+- `P2S` local status is not supported in the current code
+- `H2` local status may require Developer Mode
 
 Camera notes:
 
 - local JPEG camera support currently fits best for `A1`, `A1 Mini`, `P1P`, and `P1S`
-- `X1`, `P2`, and `H2` families use an RTSP-style camera path in code, but that path is not fully finished yet
+- `X1`, `P2`, and `H2` families use an RTSP-style path in code, but that path is not considered finished for this hardware
 
 ## Troubleshooting
 
 - If Web Config is locked, hold the display again to request a new PIN.
-- If the device does not join your home Wi-Fi, reconnect to `PrintSphere-Setup` and check the Wi-Fi credentials.
-- If Bambu asks for a verification code during login, enter it directly in Web Config.
-- If cloud data already shows temperatures and layers on your printer, local setup may simply be unnecessary.
-- If cloud data still looks incomplete on your printer, adding the local printer path could improve the result.
-- If the camera page matters to you, the best-supported local camera path is currently on `A1` and `P1` family printers.
+- If the device does not join your home Wi-Fi, reconnect to `PrintSphere-Setup` and recheck the credentials.
+- If Bambu asks for a code during login, enter it directly in Web Config.
+- If cloud setup appears to work but printer data is still incomplete, add the local printer path and test `Hybrid`.
+- If the camera page matters to you, the strongest current local camera support is on `A1` and `P1` family printers.
 
-## Current Notes
+## Notes For Future Expansion
 
-- Camera and MJPEG/RTSP work are not fully finished yet.
-- Cloud support has been expanded and should now cover temperatures and layer information on many models, but this is not yet fully validated across all newer printers.
-- Most hands-on testing so far has been on `P1S` and `P1P`.
-- [`release/firmware.bin`](release/firmware.bin) is the ready-to-use initial flash image for end users.
+Suggested placeholders to fill later:
+
+- exact printed-part names
+- switch orientation
+- Qi charger wiring
+- battery polarity / connector photos
+- cable routing photos
+- screw direction
+- first-boot expected screen photo
