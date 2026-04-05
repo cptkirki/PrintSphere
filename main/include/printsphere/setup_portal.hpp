@@ -54,10 +54,12 @@ class SetupPortal {
   static esp_err_t handle_arc_commit(httpd_req_t* request);
   static esp_err_t handle_arc_update(httpd_req_t* request, bool persist);
   static esp_err_t handle_source_mode_post(httpd_req_t* request);
+  static esp_err_t handle_display_rotation_post(httpd_req_t* request);
   static esp_err_t handle_cloud_connect(httpd_req_t* request);
   static esp_err_t handle_cloud_verify(httpd_req_t* request);
   static esp_err_t handle_local_connect(httpd_req_t* request);
   static void reboot_task(void* context);
+  bool is_provisioning_complete() const;
   bool is_lock_required() const;
   bool is_request_authorized(httpd_req_t* request);
   esp_err_t send_locked_response(httpd_req_t* request);

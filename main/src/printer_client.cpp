@@ -679,6 +679,7 @@ void PrinterClient::configure(PrinterConnection connection) {
     desired_connection_ = std::move(connection);
   }
   reconfigure_requested_.store(true);
+  wake_task();
 }
 
 bool PrinterClient::is_configured() const {

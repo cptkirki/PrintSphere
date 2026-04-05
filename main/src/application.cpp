@@ -100,9 +100,10 @@ void Application::run() {
            static_cast<unsigned int>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
            static_cast<unsigned int>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
   ui_.set_arc_color_scheme(config_store_.load_arc_color_scheme());
+  ui_.set_display_rotation(config_store_.load_display_rotation());
   ESP_ERROR_CHECK(ui_.initialize());
   if (!initialize_error_lookup_storage()) {
-    ESP_LOGW(kTag, "Storage-backed error lookup unavailable; falling back to generic error text");
+    ESP_LOGW(kTag, "Embedded error lookup unavailable; falling back to generic error text");
   }
 
   const BambuCloudCredentials cloud_credentials = config_store_.load_cloud_credentials();

@@ -95,6 +95,33 @@ CloudRegion parse_cloud_region(const std::string& value) {
   return CloudRegion::kEU;
 }
 
+const char* to_string(DisplayRotation rotation) {
+  switch (rotation) {
+    case DisplayRotation::k90:
+      return "90";
+    case DisplayRotation::k180:
+      return "180";
+    case DisplayRotation::k270:
+      return "270";
+    case DisplayRotation::k0:
+    default:
+      return "0";
+  }
+}
+
+DisplayRotation parse_display_rotation(const std::string& value) {
+  if (value == "90") {
+    return DisplayRotation::k90;
+  }
+  if (value == "180") {
+    return DisplayRotation::k180;
+  }
+  if (value == "270") {
+    return DisplayRotation::k270;
+  }
+  return DisplayRotation::k0;
+}
+
 esp_err_t ConfigStore::initialize() {
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -138,6 +165,10 @@ SourceMode ConfigStore::load_source_mode() const {
   return parse_source_mode(value);
 }
 
+DisplayRotation ConfigStore::load_display_rotation() const {
+  return parse_display_rotation(load_string("display_rot"));
+}
+
 PrinterConnection ConfigStore::load_printer_config() const {
   PrinterConnection connection;
   connection.host = load_string("prn_host");
@@ -155,7 +186,7 @@ PrinterConnection ConfigStore::load_printer_config() const {
   if (connection.is_ready()) {
     ESP_LOGI(kTag, "Loaded stored printer config for host %s", connection.host.c_str());
   } else {
-    ESP_LOGI(kTag, "Printer config incomplete; staying in setup mode");
+    ESP_LOGD(kTag, "Stored local printer config incomplete; local path remains optional until configured");
   }
 
   return connection;
@@ -211,6 +242,10 @@ esp_err_t ConfigStore::clear_cloud_access_token() const {
 esp_err_t ConfigStore::save_source_mode(SourceMode mode) const {
   ESP_RETURN_ON_ERROR(save_string("source_mode", to_string(mode)), kTag, "save source mode failed");
   return save_string("state_source", "");
+}
+
+esp_err_t ConfigStore::save_display_rotation(DisplayRotation rotation) const {
+  return save_string("display_rot", to_string(rotation));
 }
 
 esp_err_t ConfigStore::save_printer_config(const PrinterConnection& connection) const {

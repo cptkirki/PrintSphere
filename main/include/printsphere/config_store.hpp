@@ -19,10 +19,19 @@ enum class CloudRegion : uint8_t {
   kCN,
 };
 
+enum class DisplayRotation : uint8_t {
+  k0,
+  k90,
+  k180,
+  k270,
+};
+
 const char* to_string(SourceMode mode);
 SourceMode parse_source_mode(const std::string& value);
 const char* to_string(CloudRegion region);
 CloudRegion parse_cloud_region(const std::string& value);
+const char* to_string(DisplayRotation rotation);
+DisplayRotation parse_display_rotation(const std::string& value);
 
 struct WifiCredentials {
   std::string ssid;
@@ -78,6 +87,7 @@ class ConfigStore {
   BambuCloudCredentials load_cloud_credentials() const;
   std::string load_cloud_access_token() const;
   SourceMode load_source_mode() const;
+  DisplayRotation load_display_rotation() const;
   PrinterConnection load_printer_config() const;
   ArcColorScheme load_arc_color_scheme() const;
 
@@ -86,6 +96,7 @@ class ConfigStore {
   esp_err_t save_cloud_access_token(const std::string& token) const;
   esp_err_t clear_cloud_access_token() const;
   esp_err_t save_source_mode(SourceMode mode) const;
+  esp_err_t save_display_rotation(DisplayRotation rotation) const;
   esp_err_t save_printer_config(const PrinterConnection& connection) const;
   esp_err_t save_arc_color_scheme(const ArcColorScheme& colors) const;
 

@@ -27,9 +27,8 @@ set(RELEASE_INITIAL_FLASH_IMAGE "${RELEASE_INITIAL_FLASH_DIR}/firmware.bin")
 set(RELEASE_INITIAL_FLASH_VERSIONED_IMAGE
     "${RELEASE_INITIAL_FLASH_DIR}/firmware-${PRINTSPHERE_RELEASE_VERSION}.bin")
 set(RELEASE_INITIAL_FLASH_PACKAGER "${CMAKE_SOURCE_DIR}/tools/package_initial_flash.py")
-set(HMS_LOOKUP_STORAGE_DIR "${CMAKE_SOURCE_DIR}/main/include/error_lookup")
-
-spiffs_create_partition_image(storage "${HMS_LOOKUP_STORAGE_DIR}" FLASH_IN_PROJECT)
+# Error lookup TSV is embedded directly into the app binary via EMBED_TXTFILES
+# in main/CMakeLists.txt — no SPIFFS partition needed.
 
 add_custom_target(
     release_initial_flash

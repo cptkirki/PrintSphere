@@ -26,6 +26,7 @@ idf_component_register(
         "include/certs/bambu.cert"
         "include/certs/bambu_p2s_250626.cert"
         "include/certs/bambu_h2c_251122.cert"
+        "include/error_lookup/error_lookup.tsv"
     REQUIRES
         XPowersLib
         esp32_s3_touch_amoled_1_75

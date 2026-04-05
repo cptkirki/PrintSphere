@@ -22,6 +22,7 @@ enum class ScreenPowerMode : uint8_t {
 
 class Ui {
  public:
+  void set_display_rotation(DisplayRotation rotation);
   esp_err_t initialize();
   void set_arc_color_scheme(const ArcColorScheme& colors);
   void apply_snapshot(const PrinterSnapshot& snapshot);
@@ -171,6 +172,7 @@ class Ui {
   std::atomic<bool> portal_unlock_requested_{false};
   PrinterSnapshot deferred_snapshot_{};
   PrinterSnapshot last_snapshot_{};
+  DisplayRotation display_rotation_ = DisplayRotation::k0;
 };
 
 }  // namespace printsphere

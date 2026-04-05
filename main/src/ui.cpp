@@ -45,6 +45,8 @@ constexpr int kPage3NoteWithImageY = 150;
 constexpr int kPage3SubnoteWithImageY = 182;
 constexpr int kAuxTempRowY = 28;
 constexpr int kSwipeThresholdPx = 24;
+constexpr int kRotatedVisualOffsetX = -6;
+constexpr int kRotatedVisualOffsetY = 12;
 constexpr int kManualMinBrightnessPercent = 4;
 constexpr uint32_t kRingAnimationTickMs = 220U;
 constexpr uint8_t kRingPulseDepthPercent = 35U;
@@ -98,6 +100,50 @@ class LvglLockGuard {
   bool locked_ = false;
 };
 
+bsp_display_rotation_t bsp_rotation_for(DisplayRotation rotation) {
+  switch (rotation) {
+    case DisplayRotation::k90:
+      return BSP_DISPLAY_ROTATE_90;
+    case DisplayRotation::k180:
+      return BSP_DISPLAY_ROTATE_180;
+    case DisplayRotation::k270:
+      return BSP_DISPLAY_ROTATE_270;
+    case DisplayRotation::k0:
+    default:
+      return BSP_DISPLAY_ROTATE_0;
+  }
+}
+
+void apply_touch_rotation_flags(DisplayRotation rotation, bsp_display_cfg_t* cfg) {
+  if (cfg == nullptr) {
+    return;
+  }
+
+  switch (rotation) {
+    case DisplayRotation::k90:
+      cfg->touch_flags.swap_xy = 1;
+      cfg->touch_flags.mirror_x = 0;
+      cfg->touch_flags.mirror_y = 1;
+      break;
+    case DisplayRotation::k180:
+      cfg->touch_flags.swap_xy = 0;
+      cfg->touch_flags.mirror_x = 0;
+      cfg->touch_flags.mirror_y = 0;
+      break;
+    case DisplayRotation::k270:
+      cfg->touch_flags.swap_xy = 1;
+      cfg->touch_flags.mirror_x = 1;
+      cfg->touch_flags.mirror_y = 0;
+      break;
+    case DisplayRotation::k0:
+    default:
+      cfg->touch_flags.swap_xy = 0;
+      cfg->touch_flags.mirror_x = 1;
+      cfg->touch_flags.mirror_y = 1;
+      break;
+  }
+}
+
 void make_transparent(lv_obj_t* obj) {
   lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_opa(obj, LV_OPA_TRANSP, 0);
@@ -144,6 +190,39 @@ void enable_touch_bubble(lv_obj_t* obj) {
   }
   lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
   lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
+}
+
+int display_rotation_visual_offset_x(DisplayRotation rotation) {
+  switch (rotation) {
+    case DisplayRotation::k90:
+    case DisplayRotation::k270:
+      return kRotatedVisualOffsetX;
+    case DisplayRotation::k0:
+    case DisplayRotation::k180:
+    default:
+      return 0;
+  }
+}
+
+int display_rotation_visual_offset_y(DisplayRotation rotation) {
+  switch (rotation) {
+    case DisplayRotation::k90:
+    case DisplayRotation::k270:
+      return kRotatedVisualOffsetY;
+    case DisplayRotation::k0:
+    case DisplayRotation::k180:
+    default:
+      return 0;
+  }
+}
+
+void apply_display_rotation_visual_offset(lv_obj_t* obj, DisplayRotation rotation) {
+  if (obj == nullptr) {
+    return;
+  }
+
+  lv_obj_set_style_translate_x(obj, display_rotation_visual_offset_x(rotation), 0);
+  lv_obj_set_style_translate_y(obj, display_rotation_visual_offset_y(rotation), 0);
 }
 
 void set_label_text_if_changed(lv_obj_t* label, const char* text) {
@@ -868,6 +947,13 @@ bool should_show_logo(const PrinterSnapshot& snapshot) {
 
 }  // namespace
 
+void Ui::set_display_rotation(DisplayRotation rotation) {
+  if (initialized_) {
+    return;
+  }
+  display_rotation_ = rotation;
+}
+
 esp_err_t Ui::initialize() {
   if (initialized_) {
     return ESP_OK;
@@ -875,11 +961,26 @@ esp_err_t Ui::initialize() {
 
   portal_hint_boot_ms_ = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
 
-  display_ = bsp_display_start();
+  bsp_display_cfg_t display_cfg = {
+      .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+      .rotation = ESP_LV_ADAPTER_ROTATE_0,
+      .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+      .touch_flags = {
+          .swap_xy = 0,
+          .mirror_x = 1,
+          .mirror_y = 1,
+      },
+  };
+  apply_touch_rotation_flags(display_rotation_, &display_cfg);
+
+  display_ = bsp_display_start_with_config(&display_cfg);
   if (display_ == nullptr) {
     ESP_LOGE(kTag, "bsp_display_start failed");
     return ESP_FAIL;
   }
+
+  ESP_RETURN_ON_ERROR(bsp_display_rotation_set(bsp_rotation_for(display_rotation_)), kTag,
+                      "apply display rotation failed");
 
   user_brightness_percent_ = -1;
   applied_brightness_percent_ = -1;
@@ -890,7 +991,8 @@ esp_err_t Ui::initialize() {
   ring_anim_timer_ = lv_timer_create(&Ui::ring_timer_cb, kRingAnimationTickMs, this);
 
   initialized_ = true;
-  ESP_LOGI(kTag, "UI ready with YAML-style pager layout");
+  ESP_LOGI(kTag, "UI ready with YAML-style pager layout (rotation=%s)",
+           to_string(display_rotation_));
   return ESP_OK;
 }
 
@@ -1101,6 +1203,11 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   const std::string detail = detail_text(snapshot);
   detail_visible_ = !detail.empty();
   if (detail_visible_) {
+    const lv_label_long_mode_t desired_mode =
+        snapshot.has_error ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_WRAP;
+    if (lv_label_get_long_mode(detail_label_) != desired_mode) {
+      lv_label_set_long_mode(detail_label_, desired_mode);
+    }
     set_label_text_if_changed(detail_label_, detail);
   }
 
@@ -1320,6 +1427,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_size(pager_, board::kDisplayWidth, board::kDisplayHeight);
   lv_obj_center(pager_);
   make_transparent(pager_);
+  apply_display_rotation_visual_offset(pager_, display_rotation_);
   lv_obj_set_style_pad_column(pager_, 0, 0);
   lv_obj_set_style_pad_row(pager_, 0, 0);
   enable_touch_bubble(pager_);
@@ -1348,6 +1456,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_size(fixed_overlay_, board::kDisplayWidth, board::kDisplayHeight);
   lv_obj_center(fixed_overlay_);
   make_transparent(fixed_overlay_);
+  apply_display_rotation_visual_offset(fixed_overlay_, display_rotation_);
   lv_obj_clear_flag(fixed_overlay_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_clear_flag(fixed_overlay_, LV_OBJ_FLAG_SCROLLABLE);
   enable_touch_bubble(fixed_overlay_);
@@ -1376,6 +1485,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(progress_label_, dosis40, 0);
   lv_obj_set_style_text_color(progress_label_, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(progress_label_, LV_ALIGN_CENTER, 0, -178);
+  apply_display_rotation_visual_offset(progress_label_, display_rotation_);
   lv_obj_move_foreground(progress_label_);
 
   battery_icon_label_ = lv_label_create(lv_layer_top());
@@ -1383,6 +1493,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(battery_icon_label_, mdi30, 0);
   lv_obj_set_style_text_color(battery_icon_label_, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(battery_icon_label_, LV_ALIGN_CENTER, -20, -140);
+  apply_display_rotation_visual_offset(battery_icon_label_, display_rotation_);
   lv_obj_move_foreground(battery_icon_label_);
 
   battery_pct_label_ = lv_label_create(lv_layer_top());
@@ -1390,6 +1501,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(battery_pct_label_, dosis20, 0);
   lv_obj_set_style_text_color(battery_pct_label_, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(battery_pct_label_, LV_ALIGN_CENTER, 20, -140);
+  apply_display_rotation_visual_offset(battery_pct_label_, display_rotation_);
   lv_obj_move_foreground(battery_pct_label_);
 
   badge_slot_ = lv_obj_create(page1_);
@@ -1546,6 +1658,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_pad_ver(brightness_overlay_, 10, 0);
   lv_obj_set_style_radius(brightness_overlay_, 16, 0);
   lv_obj_align(brightness_overlay_, LV_ALIGN_CENTER, 0, 0);
+  apply_display_rotation_visual_offset(brightness_overlay_, display_rotation_);
   lv_obj_add_flag(brightness_overlay_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(brightness_overlay_);
 
@@ -1564,6 +1677,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_flex_align(portal_overlay_card_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_center(portal_overlay_card_);
+  apply_display_rotation_visual_offset(portal_overlay_card_, display_rotation_);
   lv_obj_clear_flag(portal_overlay_card_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(portal_overlay_card_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(portal_overlay_card_, LV_OBJ_FLAG_HIDDEN);
@@ -1677,7 +1791,7 @@ void Ui::apply_page_visibility() {
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
   set_hidden(status_label_, !show_page1);
-  set_hidden(detail_label_, !show_page1 || !detail_visible_);
+  set_hidden(detail_label_, !show_page1 || !detail_visible_ || show_portal_hint);
   set_hidden(layer_label_, !show_page1);
   set_hidden(nozzle_prefix_label_, !show_page1);
   set_hidden(nozzle_value_label_, !show_page1);
@@ -1984,6 +2098,9 @@ void Ui::update_portal_access_visuals_locked() {
   set_hidden(portal_hint_label_, !show_hint);
   if (show_hint) {
     set_label_text_if_changed(portal_hint_label_, portal_hint_text_);
+    set_hidden(detail_label_, true);
+  } else if (detail_label_ != nullptr && show_page1 && detail_visible_) {
+    set_hidden(detail_label_, false);
   }
 
   const bool show_overlay = portal_overlay_card_ != nullptr && portal_pin_active_;

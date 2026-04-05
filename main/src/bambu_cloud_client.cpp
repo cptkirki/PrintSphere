@@ -84,6 +84,37 @@ const char* cloud_mqtt_host(CloudRegion region) {
   }
 }
 
+CloudSetupStage setup_stage_for_session_state(bool configured, bool connected,
+                                              bool verification_required, bool tfa_required,
+                                              bool session_ready,
+                                              const std::string& detail) {
+  if (!configured) {
+    return CloudSetupStage::kIdle;
+  }
+  if (verification_required) {
+    return tfa_required ? CloudSetupStage::kTfaRequired
+                        : CloudSetupStage::kEmailCodeRequired;
+  }
+  if (connected) {
+    return CloudSetupStage::kConnected;
+  }
+  const std::string normalized = normalize_bambu_status_token(detail);
+  if (normalized == "LOGGING IN TO BAMBU CLOUD") {
+    return CloudSetupStage::kLoggingIn;
+  }
+  if (normalized.find("FAILED") != std::string::npos ||
+      normalized.find("REJECTED") != std::string::npos ||
+      normalized.find("INCORRECT") != std::string::npos ||
+      normalized.find("EXPIRED") != std::string::npos ||
+      normalized.find("TOKEN EXPIRED") != std::string::npos) {
+    return CloudSetupStage::kFailed;
+  }
+  if (session_ready) {
+    return CloudSetupStage::kBindingPrinter;
+  }
+  return CloudSetupStage::kIdle;
+}
+
 std::string cloud_api_url(CloudRegion region, const char* path) {
   return std::string(cloud_api_base(region)) + (path != nullptr ? path : "");
 }
@@ -793,6 +824,173 @@ struct TemperatureSample {
   bool present = false;
 };
 
+bool extract_live_status_text(const cJSON* item, std::string* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  const char* keys[] = {"gcode_state", "status", "task_status", "taskStatus",
+                        "print_status", "printStatus", "state"};
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+    for (const char* key : keys) {
+      const std::string candidate = json_string_local(source, key, {});
+      if (!candidate.empty()) {
+        *value = candidate;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool extract_live_stage_text(const cJSON* item, std::string* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  const char* keys[] = {"current_stage", "currentStage", "stage_name", "stageName", "stage"};
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+    for (const char* key : keys) {
+      const std::string candidate = json_string_local(source, key, {});
+      if (!candidate.empty()) {
+        *value = candidate;
+        return true;
+      }
+    }
+
+    const cJSON* stage = child_object_local(source, "stage");
+    const std::string stage_name =
+        json_string_local(stage, "name", json_string_local(stage, "stage", {}));
+    if (!stage_name.empty()) {
+      *value = stage_name;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool extract_live_progress_percent(const cJSON* item, float* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  const char* keys[] = {"progress", "percent", "mc_percent", "task_progress", "taskProgress",
+                        "print_progress", "printPercent", "download_progress",
+                        "downloadProgress", "model_download_progress",
+                        "modelDownloadProgress"};
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+    for (const char* key : keys) {
+      const float candidate = json_number_local(source, key, -1.0f);
+      if (candidate < 0.0f) {
+        continue;
+      }
+      *value = candidate <= 1.0f ? candidate * 100.0f : candidate;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool extract_live_remaining_seconds(const cJSON* item, uint32_t* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    const int minutes = json_int_local(source, "mc_remaining_time",
+                                       json_int_local(source, "remaining_minutes",
+                                                      json_int_local(source, "remainingMinutes", -1)));
+    if (minutes >= 0) {
+      *value = static_cast<uint32_t>(minutes) * 60U;
+      return true;
+    }
+
+    const int seconds = json_int_local(
+        source, "remaining_seconds",
+        json_int_local(source, "remainingSeconds",
+                       json_int_local(source, "remaining_time",
+                                      json_int_local(source, "remainingTime",
+                                                     json_int_local(source, "mc_left_time", -1)))));
+    if (seconds >= 0) {
+      *value = static_cast<uint32_t>(seconds);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool extract_live_current_layer(const cJSON* item, uint16_t* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    const int layer = json_int_local(
+        source, "layer_num",
+        json_int_local(source, "current_layer",
+                       json_int_local(source, "currentLayer",
+                                      json_int_local(source, "layer", -1))));
+    if (layer >= 0) {
+      *value = static_cast<uint16_t>(layer);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool extract_live_total_layers(const cJSON* item, uint16_t* value) {
+  if (item == nullptr || value == nullptr) {
+    return false;
+  }
+
+  const cJSON* item_print = child_object_local(item, "print");
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    const int total = json_int_local(
+        source, "total_layer_num",
+        json_int_local(source, "total_layers",
+                       json_int_local(source, "totalLayers",
+                                      json_int_local(source, "layer_count",
+                                                     json_int_local(source, "layerCount", -1)))));
+    if (total >= 0) {
+      *value = static_cast<uint16_t>(total);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 int extract_active_nozzle_index(const cJSON* device) {
   const cJSON* extruder = child_object_local(device, "extruder");
   return std::max(json_int_local(extruder, "state", 0) >> 4, 0);
@@ -851,15 +1049,9 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
                                                                 float active_fallback,
                                                                 float secondary_fallback) {
   NozzleTemperatureBundle bundle{active_fallback, secondary_fallback};
-  const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
-                                   ? child_object_local(item, "print_history_info")
-                                   : child_object_local(item, "printHistoryInfo");
-  const cJSON* subtask = print_history != nullptr ? child_object_local(print_history, "subtask") : nullptr;
   const cJSON* item_print = child_object_local(item, "print");
-  const cJSON* history_print = print_history != nullptr ? child_object_local(print_history, "print") : nullptr;
-  const cJSON* subtask_print = subtask != nullptr ? child_object_local(subtask, "print") : nullptr;
 
-  for (const cJSON* source : {item, print_history, subtask, item_print, history_print, subtask_print}) {
+  for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
     }
@@ -887,25 +1079,37 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
   }
 
   if (bundle.active <= 0.0f) {
-    if (find_number_for_keys_recursive(item,
-                                       {"nozzle_temper", "nozzle_temp", "nozzle_temperature",
-                                        "nozzleTemperature", "hotend_temp", "hotend_temperature",
-                                        "hotendTemperature"},
-                                       &bundle.active)) {
-      bundle.active = normalize_temperature_candidate(bundle.active);
+    const float direct = normalize_temperature_candidate(
+        json_number_local(item, "nozzle_temper",
+                          json_number_local(item, "nozzle_temp",
+                                            json_number_local(item, "nozzle_temperature",
+                                                              json_number_local(item, "nozzleTemperature",
+                                                                                json_number_local(item, "hotend_temp",
+                                                                                                  json_number_local(item, "hotend_temperature",
+                                                                                                                    json_number_local(item, "hotendTemperature",
+                                                                                                                                      -1000.0f))))))));
+    if (direct > -999.0f) {
+      bundle.active = direct;
       bundle.active_present = true;
     }
   }
   if (bundle.secondary <= 0.0f) {
-    if (find_number_for_keys_recursive(item,
-                                       {"secondary_nozzle_temper", "secondary_nozzle_temp",
-                                        "secondary_nozzle_temperature", "secondaryNozzleTemperature",
-                                        "right_nozzle_temper", "right_nozzle_temp",
-                                        "right_nozzle_temperature", "rightNozzleTemperature",
-                                        "second_nozzle_temper", "second_nozzle_temp",
-                                        "tool1_nozzle_temper", "tool1_nozzle_temp"},
-                                       &bundle.secondary)) {
-      bundle.secondary = normalize_temperature_candidate(bundle.secondary);
+    const float direct = normalize_temperature_candidate(
+        json_number_local(item, "secondary_nozzle_temper",
+                          json_number_local(item, "secondary_nozzle_temp",
+                                            json_number_local(item, "secondary_nozzle_temperature",
+                                                              json_number_local(item, "secondaryNozzleTemperature",
+                                                                                json_number_local(item, "right_nozzle_temper",
+                                                                                                  json_number_local(item, "right_nozzle_temp",
+                                                                                                                    json_number_local(item, "right_nozzle_temperature",
+                                                                                                                                      json_number_local(item, "rightNozzleTemperature",
+                                                                                                                                                        json_number_local(item, "second_nozzle_temper",
+                                                                                                                                                                          json_number_local(item, "second_nozzle_temp",
+                                                                                                                                                                                            json_number_local(item, "tool1_nozzle_temper",
+                                                                                                                                                                                                              json_number_local(item, "tool1_nozzle_temp",
+                                                                                                                                                                                                                                -1000.0f)))))))))))));
+    if (direct > -999.0f) {
+      bundle.secondary = direct;
       bundle.secondary_present = true;
     }
   }
@@ -915,15 +1119,9 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
 
 TemperatureSample extract_cloud_bed_temperature_c(const cJSON* item, float fallback) {
   TemperatureSample sample{fallback, false};
-  const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
-                                   ? child_object_local(item, "print_history_info")
-                                   : child_object_local(item, "printHistoryInfo");
-  const cJSON* subtask = print_history != nullptr ? child_object_local(print_history, "subtask") : nullptr;
   const cJSON* item_print = child_object_local(item, "print");
-  const cJSON* history_print = print_history != nullptr ? child_object_local(print_history, "print") : nullptr;
-  const cJSON* subtask_print = subtask != nullptr ? child_object_local(subtask, "print") : nullptr;
 
-  for (const cJSON* source : {item, print_history, subtask, item_print, history_print, subtask_print}) {
+  for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
     }
@@ -955,29 +1153,28 @@ TemperatureSample extract_cloud_bed_temperature_c(const cJSON* item, float fallb
     }
   }
 
-  float value = fallback;
-  if (find_number_for_keys_recursive(item,
-                                     {"bed_temper", "bed_temp", "bed_temperature",
-                                      "bedTemperature", "hotbed_temper", "hotbed_temp",
-                                      "hotbed_temperature", "hotbedTemperature"},
-                                     &value)) {
-    sample.value = normalize_temperature_candidate(value);
-    sample.present = true;
+  if (const cJSON* device = child_object_local(item, "device"); device != nullptr) {
+    const float direct = normalize_temperature_candidate(
+        json_number_local(device, "bed_temper",
+                          json_number_local(device, "bed_temperature",
+                                            json_number_local(device, "hotbed_temper",
+                                                              json_number_local(device, "hotbed_temp",
+                                                                                json_number_local(device, "hotbed_temperature",
+                                                                                                  json_number_local(device, "hotbedTemperature",
+                                                                                                                    -1000.0f)))))));
+    if (direct > -999.0f) {
+      sample.value = direct;
+      sample.present = true;
+    }
   }
   return sample;
 }
 
 TemperatureSample extract_cloud_chamber_temperature_c(const cJSON* item, float fallback) {
   TemperatureSample sample{fallback, false};
-  const cJSON* print_history = child_object_local(item, "print_history_info") != nullptr
-                                   ? child_object_local(item, "print_history_info")
-                                   : child_object_local(item, "printHistoryInfo");
-  const cJSON* subtask = print_history != nullptr ? child_object_local(print_history, "subtask") : nullptr;
   const cJSON* item_print = child_object_local(item, "print");
-  const cJSON* history_print = print_history != nullptr ? child_object_local(print_history, "print") : nullptr;
-  const cJSON* subtask_print = subtask != nullptr ? child_object_local(subtask, "print") : nullptr;
 
-  for (const cJSON* source : {item, print_history, subtask, item_print, history_print, subtask_print}) {
+  for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
     }
@@ -1011,26 +1208,91 @@ TemperatureSample extract_cloud_chamber_temperature_c(const cJSON* item, float f
     }
   }
 
-  float value = fallback;
-  if (find_number_for_keys_recursive(item,
-                                     {"chamber_temper", "chamber_temp",
-                                      "chamber_temperature", "chamberTemperature",
-                                      "ctc_temperature", "ctcTemperature"},
-                                     &value)) {
-    sample.value = normalize_temperature_candidate(value);
-    sample.present = true;
+  if (const cJSON* device = child_object_local(item, "device"); device != nullptr) {
+    const float direct = normalize_temperature_candidate(
+        json_number_local(device, "chamber_temper",
+                          json_number_local(device, "chamber_temp",
+                                            json_number_local(device, "chamber_temperature",
+                                                              json_number_local(device, "chamberTemperature",
+                                                                                json_number_local(device, "ctc_temperature",
+                                                                                                  json_number_local(device, "ctcTemperature",
+                                                                                                                    -1000.0f)))))));
+    if (direct > -999.0f) {
+      sample.value = direct;
+      sample.present = true;
+    }
   }
   return sample;
 }
 
 int extract_cloud_print_error_code(const cJSON* item, int fallback) {
-  int value = fallback;
-  return find_int_for_keys_recursive(item,
-                                     {"print_error", "printError", "print_error_code",
-                                      "printErrorCode", "error_code", "errorCode"},
-                                     &value)
-             ? value
-             : fallback;
+  const cJSON* item_print = child_object_local(item, "print");
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    const int value =
+        json_int_local(source, "print_error",
+                       json_int_local(source, "printError",
+                                      json_int_local(source, "print_error_code",
+                                                     json_int_local(source, "printErrorCode",
+                                                                    json_int_local(source, "error_code",
+                                                                                   json_int_local(source, "errorCode",
+                                                                                                  fallback))))));
+    if (value != fallback) {
+      return value;
+    }
+  }
+
+  return fallback;
+}
+
+int extract_live_hms_count(const cJSON* item, int fallback) {
+  const cJSON* item_print = child_object_local(item, "print");
+  for (const cJSON* source : {item, item_print}) {
+    if (source == nullptr) {
+      continue;
+    }
+
+    const cJSON* direct_arrays[] = {
+        cJSON_GetObjectItemCaseSensitive(source, "hms"),
+        cJSON_GetObjectItemCaseSensitive(source, "hms_list"),
+        cJSON_GetObjectItemCaseSensitive(source, "hmsList"),
+        cJSON_GetObjectItemCaseSensitive(source, "hms_errors"),
+        cJSON_GetObjectItemCaseSensitive(source, "hmsErrors"),
+        cJSON_GetObjectItemCaseSensitive(source, "hms_alerts"),
+        cJSON_GetObjectItemCaseSensitive(source, "hmsAlerts"),
+    };
+    for (const cJSON* array : direct_arrays) {
+      if (array != nullptr) {
+        return count_hms_entries(array);
+      }
+    }
+
+    const int direct_count = json_int_local(
+        source, "hms_count",
+        json_int_local(source, "hmsCount",
+                       json_int_local(source, "hms_alert_count",
+                                      json_int_local(source, "hmsAlertCount", -1))));
+    if (direct_count >= 0) {
+      return direct_count;
+    }
+
+    const cJSON* device = child_object_local(source, "device");
+    if (device != nullptr) {
+      const int device_count = json_int_local(
+          device, "hms_count",
+          json_int_local(device, "hmsCount",
+                         json_int_local(device, "hms_alert_count",
+                                        json_int_local(device, "hmsAlertCount", -1))));
+      if (device_count >= 0) {
+        return device_count;
+      }
+    }
+  }
+
+  return fallback;
 }
 
 int extract_cloud_hms_count(const cJSON* item, int fallback) {
@@ -1068,6 +1330,30 @@ PrinterModel detect_cloud_model(const cJSON* item, PrinterModel fallback) {
 
 }  // namespace
 
+const char* to_string(CloudSetupStage stage) {
+  switch (stage) {
+    case CloudSetupStage::kLoggingIn:
+      return "logging_in";
+    case CloudSetupStage::kEmailCodeRequired:
+      return "email_code_required";
+    case CloudSetupStage::kTfaRequired:
+      return "tfa_required";
+    case CloudSetupStage::kCodeSubmitted:
+      return "code_submitted";
+    case CloudSetupStage::kBindingPrinter:
+      return "binding_printer";
+    case CloudSetupStage::kConnectingMqtt:
+      return "connecting_mqtt";
+    case CloudSetupStage::kConnected:
+      return "connected";
+    case CloudSetupStage::kFailed:
+      return "failed";
+    case CloudSetupStage::kIdle:
+    default:
+      return "idle";
+  }
+}
+
 void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string printer_serial) {
   stop_mqtt_client();
   credentials_ = std::move(credentials);
@@ -1090,13 +1376,17 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
   BambuCloudSnapshot snapshot;
   snapshot.configured = credentials_.can_password_login() || !access_token_.empty();
   snapshot.connected = false;
+  snapshot.session_connected = !access_token_.empty();
   if (!snapshot.configured) {
     snapshot.detail = credentials_.has_identity() ? "Bambu Cloud password required in setup portal"
                                                   : "Cloud login not configured";
+    snapshot.setup_stage = CloudSetupStage::kIdle;
   } else if (!access_token_.empty()) {
     snapshot.detail = "Restored Bambu Cloud session";
+    snapshot.setup_stage = CloudSetupStage::kBindingPrinter;
   } else {
     snapshot.detail = "Waiting for Wi-Fi for Bambu Cloud";
+    snapshot.setup_stage = CloudSetupStage::kIdle;
   }
   snapshot.capabilities = merge_capabilities(cloud_live_capabilities(), cloud_rest_capabilities());
   snapshot.resolved_serial = requested_serial_;
@@ -1106,6 +1396,7 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
   CloudLiveRuntimeState runtime{};
   runtime.configured = initial_snapshot.configured;
   runtime.connected = false;
+  runtime.setup_stage = CloudSetupStage::kIdle;
   runtime.model = initial_snapshot.model;
   runtime.capabilities = cloud_live_capabilities();
   copy_text(&runtime.detail, initial_snapshot.detail);
@@ -1119,6 +1410,9 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
   CloudRestRuntimeState rest{};
   rest.configured = initial_snapshot.configured;
   rest.session_ready = false;
+  rest.verification_required = false;
+  rest.tfa_required = false;
+  rest.setup_stage = initial_snapshot.setup_stage;
   rest.model = initial_snapshot.model;
   rest.capabilities = cloud_rest_capabilities();
   copy_text(&rest.detail, initial_snapshot.detail);
@@ -1131,8 +1425,24 @@ void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string 
 }
 
 void BambuCloudClient::submit_verification_code(std::string code) {
-  std::lock_guard<std::mutex> lock(auth_mutex_);
-  pending_verification_code_ = std::move(code);
+  {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
+    pending_verification_code_ = std::move(code);
+  }
+  CloudRestRuntimeState rest = rest_runtime_copy();
+  rest.configured = true;
+  rest.session_ready = false;
+  rest.verification_required = false;
+  rest.tfa_required = false;
+  rest.setup_stage = CloudSetupStage::kCodeSubmitted;
+  rest.last_update_ms = now_ms();
+  copy_text(&rest.detail, auth_mode() == AuthMode::kTfaCode ? "Submitting Bambu Cloud 2FA code"
+                                                            : "Submitting Bambu Cloud email code");
+  store_rest_runtime(std::move(rest), false);
+  publish_combined_snapshot();
+  if (task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_) {
+    xTaskNotifyGive(task_handle_);
+  }
 }
 
 void BambuCloudClient::set_fetch_paused(bool paused) {
@@ -1164,6 +1474,11 @@ BambuCloudSnapshot BambuCloudClient::snapshot() const {
   return snapshot_;
 }
 
+BambuCloudSnapshot BambuCloudClient::refreshed_snapshot() {
+  publish_combined_snapshot();
+  return snapshot();
+}
+
 BambuCloudClient::CloudLiveRuntimeState BambuCloudClient::live_runtime_copy() const {
   std::lock_guard<std::mutex> lock(live_runtime_mutex_);
   return live_runtime_;
@@ -1175,7 +1490,10 @@ void BambuCloudClient::store_live_runtime(CloudLiveRuntimeState runtime, bool no
     live_runtime_ = std::move(runtime);
   }
   live_runtime_dirty_ = true;
-  if (notify_task && task_handle_ != nullptr) {
+  const bool cross_task =
+      notify_task && task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_;
+  if (cross_task) {
+    publish_combined_snapshot();
     xTaskNotifyGive(task_handle_);
   }
 }
@@ -1191,9 +1509,80 @@ void BambuCloudClient::store_rest_runtime(CloudRestRuntimeState runtime, bool no
     rest_runtime_ = std::move(runtime);
   }
   rest_runtime_dirty_ = true;
-  if (notify_task && task_handle_ != nullptr) {
+  const bool cross_task =
+      notify_task && task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_;
+  if (cross_task) {
+    publish_combined_snapshot();
+  }
+  if (cross_task) {
     xTaskNotifyGive(task_handle_);
   }
+}
+
+void BambuCloudClient::apply_cloud_session_state(bool configured, bool connected,
+                                                 bool verification_required, bool tfa_required,
+                                                 const std::string& detail, bool session_ready,
+                                                 bool clear_live_state) {
+  const uint64_t update_ms = now_ms();
+  const std::string serial = !resolved_serial_.empty() ? resolved_serial_ : requested_serial_;
+
+  CloudRestRuntimeState rest = rest_runtime_copy();
+  rest.configured = configured;
+  rest.session_ready = session_ready;
+  rest.verification_required = verification_required;
+  rest.tfa_required = tfa_required;
+  rest.setup_stage =
+      setup_stage_for_session_state(configured, connected, verification_required, tfa_required,
+                                    session_ready, detail);
+  rest.last_update_ms = update_ms;
+  rest.capabilities = cloud_rest_capabilities();
+  copy_text(&rest.detail, detail);
+  if (!serial.empty()) {
+    copy_text(&rest.resolved_serial, serial);
+  }
+  store_rest_runtime(std::move(rest), false);
+
+  CloudLiveRuntimeState live = live_runtime_copy();
+  live.configured = configured;
+  live.connected = connected;
+  live.setup_stage = connected ? CloudSetupStage::kConnected : CloudSetupStage::kIdle;
+  live.last_update_ms = update_ms;
+  live.capabilities = cloud_live_capabilities();
+  if (!serial.empty()) {
+    copy_text(&live.resolved_serial, serial);
+  }
+  if (clear_live_state) {
+    live.live_data_last_update_ms = 0;
+    live.lifecycle = PrintLifecycleState::kUnknown;
+    live.progress_percent = 0.0f;
+    live.nozzle_temp_c = 0.0f;
+    live.nozzle_temp_last_update_ms = 0;
+    live.bed_temp_c = 0.0f;
+    live.bed_temp_last_update_ms = 0;
+    live.chamber_temp_c = 0.0f;
+    live.chamber_temp_last_update_ms = 0;
+    live.secondary_nozzle_temp_c = 0.0f;
+    live.secondary_nozzle_temp_last_update_ms = 0;
+    live.non_error_stop = false;
+    live.remaining_seconds = 0;
+    live.current_layer = 0;
+    live.total_layers = 0;
+    live.print_error_code = 0;
+    live.hms_alert_count = 0;
+    live.has_error = false;
+    live.chamber_light_pending = false;
+    live.chamber_light_pending_since_ms = 0;
+    copy_text(&live.raw_status, "");
+    copy_text(&live.raw_stage, "");
+    copy_text(&live.stage, "");
+  }
+  copy_text(&live.detail, detail);
+  store_live_runtime(std::move(live), false);
+  publish_combined_snapshot();
+}
+
+void BambuCloudClient::apply_cloud_token_expired_state() {
+  apply_cloud_session_state(true, false, false, false, "Bambu Cloud token expired", false, true);
 }
 
 void BambuCloudClient::publish_combined_snapshot() {
@@ -1208,6 +1597,12 @@ void BambuCloudClient::publish_combined_snapshot() {
 
   current.configured = rest.configured || live.configured;
   current.connected = live.connected;
+  current.session_connected =
+      (rest.configured && rest.session_ready && !rest.verification_required && !rest.tfa_required) ||
+      current.connected || mqtt_connected_.load() || mqtt_subscription_acknowledged_.load();
+  current.verification_required = rest.verification_required;
+  current.tfa_required = rest.tfa_required;
+  current.setup_stage = rest.setup_stage;
   if (rest.last_update_ms != 0) {
     current.last_update_ms = rest.last_update_ms;
   }
@@ -1231,6 +1626,9 @@ void BambuCloudClient::publish_combined_snapshot() {
 
   if (live_has_recent_state && live.last_update_ms != 0) {
     current.last_update_ms = live.last_update_ms;
+  }
+  if (live_has_recent_state && live.setup_stage != CloudSetupStage::kIdle) {
+    current.setup_stage = live.setup_stage;
   }
   if (live_has_recent_state && has_text(live.detail)) {
     current.detail = text_string(live.detail);
@@ -1288,6 +1686,19 @@ void BambuCloudClient::publish_combined_snapshot() {
   }
   current.chamber_light_pending = live.chamber_light_pending;
   current.chamber_light_pending_since_ms = live.chamber_light_pending_since_ms;
+  if (current.verification_required) {
+    current.setup_stage =
+        current.tfa_required ? CloudSetupStage::kTfaRequired
+                             : CloudSetupStage::kEmailCodeRequired;
+  } else if (mqtt_subscription_acknowledged_.load()) {
+    current.setup_stage = CloudSetupStage::kConnected;
+  } else if (mqtt_connected_.load()) {
+    current.setup_stage = CloudSetupStage::kConnectingMqtt;
+  } else if (current.connected) {
+    current.setup_stage = CloudSetupStage::kConnectingMqtt;
+  } else if (rest.session_ready) {
+    current.setup_stage = CloudSetupStage::kBindingPrinter;
+  }
   set_snapshot(std::move(current));
 }
 
@@ -1389,19 +1800,43 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       runtime.configured = true;
       runtime.connected = true;
       runtime.capabilities = cloud_live_capabilities();
+      runtime.setup_stage = CloudSetupStage::kConnectingMqtt;
+      runtime.last_update_ms = now_ms();
+      copy_text(&runtime.stage, "connected");
+      copy_text(&runtime.detail, "Connected to Bambu Cloud MQTT, waiting for subscribe ack");
+      const std::string serial = !resolved_serial_.empty() ? resolved_serial_ : requested_serial_;
+      if (!serial.empty()) {
+        copy_text(&runtime.resolved_serial, serial);
+      }
       store_live_runtime(std::move(runtime), true);
       break;
     }
 
-    case MQTT_EVENT_SUBSCRIBED:
+    case MQTT_EVENT_SUBSCRIBED: {
       mqtt_subscription_acknowledged_ = true;
       initial_sync_sent_ = true;
       delayed_start_sent_ = false;
       initial_sync_tick_ = xTaskGetTickCount();
+      {
+        CloudLiveRuntimeState runtime = live_runtime_copy();
+        runtime.configured = true;
+        runtime.connected = true;
+        runtime.capabilities = cloud_live_capabilities();
+        runtime.setup_stage = CloudSetupStage::kConnectingMqtt;
+        runtime.last_update_ms = now_ms();
+        copy_text(&runtime.stage, "subscribed");
+        copy_text(&runtime.detail, "Cloud MQTT subscribed, requesting printer sync");
+        const std::string serial = !resolved_serial_.empty() ? resolved_serial_ : requested_serial_;
+        if (!serial.empty()) {
+          copy_text(&runtime.resolved_serial, serial);
+        }
+        store_live_runtime(std::move(runtime), true);
+      }
       ESP_LOGI(kTag, "Cloud MQTT subscribe acknowledged (msg_id=%d), requesting sync",
                event->msg_id);
       request_initial_sync();
       break;
+    }
 
     case MQTT_EVENT_DISCONNECTED:
       mqtt_connected_ = false;
@@ -1414,6 +1849,7 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         CloudLiveRuntimeState runtime = live_runtime_copy();
         runtime.configured = credentials_.can_password_login() || !access_token_.empty();
         runtime.connected = false;
+        runtime.setup_stage = CloudSetupStage::kIdle;
         store_live_runtime(std::move(runtime), true);
       }
       ESP_LOGW(kTag, "Cloud MQTT disconnected");
@@ -1456,6 +1892,7 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         CloudLiveRuntimeState runtime = live_runtime_copy();
         runtime.configured = credentials_.can_password_login() || !access_token_.empty();
         runtime.connected = false;
+        runtime.setup_stage = CloudSetupStage::kFailed;
         store_live_runtime(std::move(runtime), true);
       }
       ESP_LOGW(kTag, "Cloud MQTT transport error");
@@ -1512,6 +1949,7 @@ bool BambuCloudClient::ensure_cloud_mqtt_identity() {
       token_expiry_us_ = 0;
       mqtt_username_.clear();
       stop_mqtt_client();
+      apply_cloud_token_expired_state();
       return false;
     }
     if (status_code >= 200 && status_code < 300) {
@@ -1645,6 +2083,7 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     runtime.configured = true;
     runtime.connected = true;
     runtime.capabilities = cloud_live_capabilities();
+    runtime.setup_stage = CloudSetupStage::kConnected;
     runtime.last_update_ms = now_ms();
     runtime.live_data_last_update_ms = runtime.last_update_ms;
     runtime.model = detect_cloud_model(print, runtime.model);
@@ -1658,9 +2097,10 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.resolved_serial, resolved_serial);
     }
 
-    const std::string status_text =
-        json_string(print, "gcode_state", extract_status_text(print));
-    const std::string stage_text = extract_stage_text(print);
+    std::string status_text;
+    extract_live_status_text(print, &status_text);
+    std::string stage_text;
+    extract_live_stage_text(print, &stage_text);
     const bool has_status_update = !status_text.empty() || !stage_text.empty();
     const PrintLifecycleState lifecycle = cloud_lifecycle_from_status(status_text);
     if (!status_text.empty()) {
@@ -1674,29 +2114,44 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.stage, stage_text);
     }
 
-    float progress = extract_progress(print);
-    if (lifecycle == PrintLifecycleState::kFinished && progress < 100.0f) {
+    const bool active_lifecycle =
+        lifecycle == PrintLifecycleState::kPreparing || lifecycle == PrintLifecycleState::kPrinting;
+    const bool lifecycle_reset =
+        has_status_update && active_lifecycle && lifecycle != previous_lifecycle;
+    if (lifecycle_reset) {
+      runtime.progress_percent = 0.0f;
+      runtime.remaining_seconds = 0;
+      runtime.current_layer = 0;
+      runtime.total_layers = 0;
+    }
+
+    float progress = 0.0f;
+    const bool has_progress = extract_live_progress_percent(print, &progress);
+    if (lifecycle == PrintLifecycleState::kFinished && (!has_progress || progress < 100.0f)) {
       progress = 100.0f;
     }
-    if (progress > 0.0f || lifecycle == PrintLifecycleState::kFinished ||
+    if (has_progress || lifecycle == PrintLifecycleState::kFinished ||
         lifecycle == PrintLifecycleState::kIdle || lifecycle == PrintLifecycleState::kError) {
       runtime.progress_percent = progress;
     }
 
-    const uint32_t remaining_seconds = extract_remaining_seconds(print);
-    if (remaining_seconds > 0U || lifecycle == PrintLifecycleState::kFinished ||
+    uint32_t remaining_seconds = 0U;
+    const bool has_remaining_seconds = extract_live_remaining_seconds(print, &remaining_seconds);
+    if (has_remaining_seconds || lifecycle == PrintLifecycleState::kFinished ||
         lifecycle == PrintLifecycleState::kIdle || lifecycle == PrintLifecycleState::kError) {
       runtime.remaining_seconds = remaining_seconds;
     }
 
-    const uint16_t current_layer = extract_current_layer(print);
-    if (current_layer > 0U || lifecycle == PrintLifecycleState::kFinished ||
+    uint16_t current_layer = 0U;
+    const bool has_current_layer = extract_live_current_layer(print, &current_layer);
+    if (has_current_layer || lifecycle == PrintLifecycleState::kFinished ||
         lifecycle == PrintLifecycleState::kIdle || lifecycle == PrintLifecycleState::kError) {
       runtime.current_layer = current_layer;
     }
 
-    const uint16_t total_layers = extract_total_layers(print);
-    if (total_layers > 0U || lifecycle == PrintLifecycleState::kFinished ||
+    uint16_t total_layers = 0U;
+    const bool has_total_layers = extract_live_total_layers(print, &total_layers);
+    if (has_total_layers || lifecycle == PrintLifecycleState::kFinished ||
         lifecycle == PrintLifecycleState::kIdle || lifecycle == PrintLifecycleState::kError) {
       runtime.total_layers = total_layers;
     }
@@ -1728,7 +2183,28 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     runtime.print_error_code =
         normalize_cloud_print_error_code(extract_cloud_print_error_code(print, runtime.print_error_code));
     runtime.hms_alert_count = static_cast<uint16_t>(
-        std::max(extract_cloud_hms_count(print, runtime.hms_alert_count), 0));
+        std::max(extract_live_hms_count(print, runtime.hms_alert_count), 0));
+
+    // When a healthy (non-error) status update arrives, clear stale error indicators that
+    // were carried over from previous payloads via the fallback mechanism.  Cloud MQTT sends
+    // partial updates—if a fragment omits hms/print_error the extract helpers return the
+    // previous value, which can stick forever.  A definitive healthy status proves those
+    // stale values no longer apply.
+    const bool healthy_status =
+        has_status_update &&
+        lifecycle != PrintLifecycleState::kError &&
+        lifecycle != PrintLifecycleState::kUnknown;
+    if (healthy_status) {
+      const int explicit_error = extract_cloud_print_error_code(print, -1);
+      if (explicit_error == -1 && runtime.print_error_code != 0) {
+        runtime.print_error_code = 0;
+      }
+      const int explicit_hms = extract_live_hms_count(print, -1);
+      if (explicit_hms == -1 && runtime.hms_alert_count > 0) {
+        runtime.hms_alert_count = 0;
+      }
+    }
+
     if (has_status_update) {
       runtime.non_error_stop = cloud_status_is_non_error_stop(status_text, runtime.print_error_code,
                                                               runtime.hms_alert_count);
@@ -1771,6 +2247,7 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     runtime.configured = true;
     runtime.connected = true;
     runtime.capabilities = cloud_live_capabilities();
+    runtime.setup_stage = CloudSetupStage::kConnected;
     runtime.last_update_ms = now_ms();
     runtime.model = detect_cloud_model(info, runtime.model);
     runtime.chamber_light_supported =
@@ -1826,25 +2303,19 @@ void BambuCloudClient::task_loop() {
 
     if (access_token_.empty() && !credentials_.can_password_login()) {
       stop_mqtt_client();
-      BambuCloudSnapshot waiting = snapshot();
-      waiting.configured = false;
-      waiting.connected = false;
-      waiting.verification_required = false;
-      waiting.tfa_required = false;
-      waiting.detail = credentials_.has_identity() ? "Bambu Cloud password required in setup portal"
-                                                   : "Cloud login not configured";
-      set_snapshot(std::move(waiting));
+      apply_cloud_session_state(
+          false, false, false, false,
+          credentials_.has_identity() ? "Bambu Cloud password required in setup portal"
+                                      : "Cloud login not configured",
+          false, true);
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       continue;
     }
 
     while (!network_ready_.load()) {
       stop_mqtt_client();
-      BambuCloudSnapshot waiting = snapshot();
-      waiting.configured = true;
-      waiting.connected = false;
-      waiting.detail = "Waiting for Wi-Fi for Bambu Cloud";
-      set_snapshot(std::move(waiting));
+      apply_cloud_session_state(true, false, false, false,
+                                "Waiting for Wi-Fi for Bambu Cloud", false, true);
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
     }
 
@@ -1853,22 +2324,14 @@ void BambuCloudClient::task_loop() {
       stop_mqtt_client();
       mqtt_username_.clear();
       if (waiting_for_user_code()) {
-        BambuCloudSnapshot waiting = snapshot();
-        waiting.configured = true;
-        waiting.connected = false;
-        waiting.verification_required = true;
-        waiting.tfa_required = auth_mode() == AuthMode::kTfaCode;
-        waiting.detail = waiting.tfa_required ? "Bambu Cloud requires 2FA code"
-                                              : "Bambu Cloud email code required";
-        set_snapshot(std::move(waiting));
+        apply_cloud_session_state(true, false, true, auth_mode() == AuthMode::kTfaCode,
+                                  auth_mode() == AuthMode::kTfaCode
+                                      ? "Bambu Cloud requires 2FA code"
+                                      : "Bambu Cloud email code required",
+                                  false, true);
       } else {
-        BambuCloudSnapshot logging_in = snapshot();
-        logging_in.configured = true;
-        logging_in.connected = false;
-        logging_in.verification_required = false;
-        logging_in.tfa_required = false;
-        logging_in.detail = "Logging in to Bambu Cloud";
-        set_snapshot(std::move(logging_in));
+        apply_cloud_session_state(true, false, false, false,
+                                  "Logging in to Bambu Cloud", false, true);
       }
 
       if (!login()) {
@@ -1948,6 +2411,9 @@ void BambuCloudClient::task_loop() {
       if (bindings_due) {
         bindings_ok = fetch_bindings();
         last_binding_fetch_tick = now_tick;
+        if (bindings_ok && live_mqtt_enabled && ensure_cloud_mqtt_identity()) {
+          ensure_mqtt_client_started();
+        }
       }
       if (preview_fetch_enabled && preview_due && !waiting_for_live_payload) {
         preview_ok = fetch_latest_preview(true);
@@ -1974,6 +2440,13 @@ void BambuCloudClient::task_loop() {
     TickType_t next_delay = fetch_paused ? pdMS_TO_TICKS(1000)
                                          : (current_active_print ? kCloudStatusPollActive
                                                                  : status_poll_interval);
+    if (!fetch_paused && live_mqtt_enabled && !mqtt_connected_.load() &&
+        mqtt_subscription_acknowledged_.load() == false &&
+        !access_token_.empty() && !mqtt_username_.empty() &&
+        (!resolved_serial_.empty() || !requested_serial_.empty()) &&
+        next_delay > pdMS_TO_TICKS(1000)) {
+      next_delay = pdMS_TO_TICKS(1000);
+    }
     if (waiting_for_live_payload && next_delay > pdMS_TO_TICKS(1000)) {
       next_delay = pdMS_TO_TICKS(1000);
     }
@@ -2027,19 +2500,15 @@ bool BambuCloudClient::authenticate_with_password() {
   std::string response_body;
   if (!perform_json_request(cloud_api_url(credentials_.region, kLoginPath), "POST", request_body,
                             {}, &status_code, &response_body)) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.detail = "Bambu Cloud login request failed";
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, false, false,
+                              "Bambu Cloud login request failed", false, true);
     return false;
   }
 
   cJSON* root = cJSON_Parse(response_body.c_str());
   if (root == nullptr) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.detail = "Bambu Cloud login returned invalid JSON";
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, false, false,
+                              "Bambu Cloud login returned invalid JSON", false, true);
     return false;
   }
 
@@ -2054,39 +2523,32 @@ bool BambuCloudClient::authenticate_with_password() {
 
   if (login_type == "verifyCode") {
     set_auth_mode(AuthMode::kEmailCode);
-    BambuCloudSnapshot verification = snapshot();
-    verification.connected = false;
-    verification.verification_required = true;
-    verification.tfa_required = false;
-    verification.detail = "Bambu Cloud sent email code; enter it in setup portal";
-    set_snapshot(std::move(verification));
+    const bool code_requested = request_email_verification_code();
+    if (!code_requested) {
+      ESP_LOGW(kTag, "Bambu Cloud requested email-code login but sending the code failed");
+    }
+    apply_cloud_session_state(true, false, true, false,
+                              code_requested
+                                  ? "Bambu Cloud sent email code; enter it in setup portal"
+                                  : "Bambu Cloud email code required; request a fresh code in setup portal",
+                              false, true);
     cJSON_Delete(root);
     return false;
   }
 
   if (login_type == "tfa") {
     set_auth_mode(AuthMode::kTfaCode, json_string(root, "tfaKey", json_string(data, "tfaKey", {})));
-    BambuCloudSnapshot verification = snapshot();
-    verification.connected = false;
-    verification.verification_required = true;
-    verification.tfa_required = true;
-    verification.detail = "Bambu Cloud requires 2FA code";
-    set_snapshot(std::move(verification));
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud requires 2FA code", false, true);
     cJSON_Delete(root);
     return false;
   }
 
   if (status_code < 200 || status_code >= 300 || token.empty()) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.verification_required = false;
-    failed.tfa_required = false;
-    if (!api_error.empty()) {
-      failed.detail = "Bambu Cloud login failed: " + api_error;
-    } else {
-      failed.detail = "Bambu Cloud login rejected";
-    }
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, false, false,
+                              !api_error.empty() ? "Bambu Cloud login failed: " + api_error
+                                                 : "Bambu Cloud login rejected",
+                              false, true);
     cJSON_Delete(root);
     return false;
   }
@@ -2106,13 +2568,8 @@ bool BambuCloudClient::authenticate_with_password() {
   }
   clear_auth_state();
 
-  BambuCloudSnapshot success = snapshot();
-  success.configured = true;
-  success.connected = true;
-  success.detail = "Connected to Bambu Cloud";
-  success.verification_required = false;
-  success.tfa_required = false;
-  set_snapshot(std::move(success));
+  apply_cloud_session_state(true, false, false, false,
+                            "Bambu Cloud session ready", true, true);
   ESP_LOGI(kTag, "Bambu Cloud login successful");
 
   cJSON_Delete(root);
@@ -2140,23 +2597,15 @@ bool BambuCloudClient::authenticate_with_email_code(const std::string& code) {
   std::string response_body;
   if (!perform_json_request(cloud_api_url(credentials_.region, kLoginPath), "POST", request_body,
                             {}, &status_code, &response_body)) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.verification_required = true;
-    failed.tfa_required = false;
-    failed.detail = "Bambu Cloud email-code login failed";
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, true, false,
+                              "Bambu Cloud email-code login failed", false, true);
     return false;
   }
 
   cJSON* root = cJSON_Parse(response_body.c_str());
   if (root == nullptr) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.verification_required = true;
-    failed.tfa_required = false;
-    failed.detail = "Bambu Cloud email-code response invalid";
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, true, false,
+                              "Bambu Cloud email-code response invalid", false, true);
     return false;
   }
 
@@ -2184,34 +2633,26 @@ bool BambuCloudClient::authenticate_with_email_code(const std::string& code) {
     }
     clear_auth_state();
 
-    BambuCloudSnapshot success = snapshot();
-    success.configured = true;
-    success.connected = true;
-    success.detail = "Connected to Bambu Cloud";
-    success.verification_required = false;
-    success.tfa_required = false;
-    set_snapshot(std::move(success));
+    apply_cloud_session_state(true, false, false, false,
+                              "Bambu Cloud session ready", true, true);
     ESP_LOGI(kTag, "Bambu Cloud login successful with email code");
     cJSON_Delete(root);
     return true;
   }
 
   const int error_code = json_int(root, "code", json_int(data, "code", -1));
-  BambuCloudSnapshot failed = snapshot();
-  failed.connected = false;
-  failed.verification_required = true;
-  failed.tfa_required = false;
+  std::string failed_detail;
   if (status_code == 400 && error_code == 1) {
     clear_pending_code();
     request_email_verification_code();
-    failed.detail = "Bambu Cloud email code expired; new code requested";
+    failed_detail = "Bambu Cloud email code expired; new code requested";
   } else if (status_code == 400 && error_code == 2) {
     clear_pending_code();
-    failed.detail = "Bambu Cloud email code incorrect";
+    failed_detail = "Bambu Cloud email code incorrect";
   } else {
-    failed.detail = "Bambu Cloud email-code login rejected";
+    failed_detail = "Bambu Cloud email-code login rejected";
   }
-  set_snapshot(std::move(failed));
+  apply_cloud_session_state(true, false, true, false, failed_detail, false, true);
   cJSON_Delete(root);
   return false;
 }
@@ -2244,23 +2685,17 @@ bool BambuCloudClient::authenticate_with_tfa_code(const std::string& code) {
   std::string response_body;
   if (!perform_json_request(cloud_site_url(credentials_.region, kTfaLoginPath), "POST",
                             request_body, {}, &status_code, &response_body)) {
-    BambuCloudSnapshot failed = snapshot();
-    failed.connected = false;
-    failed.verification_required = true;
-    failed.tfa_required = true;
-    failed.detail = "Bambu Cloud 2FA login failed";
-    set_snapshot(std::move(failed));
+    apply_cloud_session_state(true, false, true, true,
+                              "Bambu Cloud 2FA login failed", false, true);
     return false;
   }
 
-  BambuCloudSnapshot failed = snapshot();
-  failed.connected = false;
-  failed.verification_required = true;
-  failed.tfa_required = true;
-  failed.detail = (status_code >= 200 && status_code < 300)
-                      ? "Bambu Cloud 2FA returned token cookie, not yet handled on ESP"
-                      : "Bambu Cloud 2FA rejected";
-  set_snapshot(std::move(failed));
+  apply_cloud_session_state(
+      true, false, true, true,
+      (status_code >= 200 && status_code < 300)
+          ? "Bambu Cloud 2FA returned token cookie, not yet handled on ESP"
+          : "Bambu Cloud 2FA rejected",
+      false, true);
   return false;
 }
 
@@ -2286,7 +2721,17 @@ bool BambuCloudClient::request_email_verification_code() {
   const bool success = perform_json_request(
       cloud_api_url(credentials_.region, kEmailCodePath), "POST", request_body, {}, &status_code,
       &response_body);
-  return success && status_code >= 200 && status_code < 300;
+  if (!success) {
+    ESP_LOGW(kTag, "Bambu Cloud email-code request failed");
+    return false;
+  }
+  if (status_code < 200 || status_code >= 300) {
+    ESP_LOGW(kTag, "Bambu Cloud email-code request rejected: status=%d body=%s", status_code,
+             response_body.c_str());
+    return false;
+  }
+  ESP_LOGI(kTag, "Bambu Cloud email code requested successfully");
+  return true;
 }
 
 bool BambuCloudClient::fetch_bindings() {
@@ -2302,10 +2747,7 @@ bool BambuCloudClient::fetch_bindings() {
     token_expiry_us_ = 0;
     mqtt_username_.clear();
     stop_mqtt_client();
-    BambuCloudSnapshot expired = snapshot();
-    expired.connected = false;
-    expired.detail = "Bambu Cloud token expired";
-    set_snapshot(std::move(expired));
+    apply_cloud_token_expired_state();
     return false;
   }
   if (status_code < 200 || status_code >= 300) {
@@ -2323,7 +2765,7 @@ bool BambuCloudClient::fetch_bindings() {
     devices = child_array(data, "devices");
   }
 
-  std::string best_serial = requested_serial_;
+  std::string best_serial;
   const cJSON* best_device = nullptr;
   if (cJSON_IsArray(devices)) {
     const int count = cJSON_GetArraySize(devices);
@@ -2338,13 +2780,14 @@ bool BambuCloudClient::fetch_bindings() {
         best_device = item;
         break;
       }
-      if (best_serial.empty()) {
+      if (best_device == nullptr) {
         best_serial = candidate;
-        best_device = item;
-      } else if (best_device == nullptr) {
         best_device = item;
       }
     }
+  }
+  if (best_serial.empty()) {
+    best_serial = requested_serial_;
   }
 
   CloudRestRuntimeState current = rest_runtime_copy();
@@ -2352,13 +2795,22 @@ bool BambuCloudClient::fetch_bindings() {
   current.capabilities = cloud_rest_capabilities();
   current.last_update_ms = now_ms();
   current.session_ready = true;
-  if (!has_text(current.detail) || text_string(current.detail) == "Restored Bambu Cloud session") {
+  current.verification_required = false;
+  current.tfa_required = false;
+  current.setup_stage = CloudSetupStage::kBindingPrinter;
+  const std::string existing_detail =
+      has_text(current.detail) ? text_string(current.detail) : std::string{};
+  if (!has_text(current.detail) || existing_detail == "Restored Bambu Cloud session" ||
+      existing_detail == "Logging in to Bambu Cloud" ||
+      existing_detail == "Waiting for Wi-Fi for Bambu Cloud" ||
+      existing_detail == "Connected to Bambu Cloud") {
     copy_text(&current.detail, "Bambu Cloud session ready");
   }
   if (!best_serial.empty()) {
     const bool serial_changed = best_serial != resolved_serial_;
     resolved_serial_ = best_serial;
     copy_text(&current.resolved_serial, best_serial);
+    current.setup_stage = CloudSetupStage::kConnectingMqtt;
     if (serial_changed) {
       stop_mqtt_client();
       ESP_LOGI(kTag, "Cloud device binding resolved serial=%s", best_serial.c_str());
@@ -2370,7 +2822,10 @@ bool BambuCloudClient::fetch_bindings() {
     current.chamber_light_supported =
         printer_model_has_chamber_light(current.model);
     const bool printer_online = json_bool(best_device, "online", true);
-    if (!has_text(current.detail) || text_string(current.detail) == "Restored Bambu Cloud session" ||
+    if (!has_text(current.detail) || existing_detail == "Restored Bambu Cloud session" ||
+        existing_detail == "Logging in to Bambu Cloud" ||
+        existing_detail == "Waiting for Wi-Fi for Bambu Cloud" ||
+        existing_detail == "Connected to Bambu Cloud" ||
         text_string(current.detail) == "Bambu Cloud session ready" ||
         text_string(current.detail) == "Bambu Cloud session ready, no cover image yet") {
       copy_text(&current.detail,
@@ -2379,6 +2834,7 @@ bool BambuCloudClient::fetch_bindings() {
   }
 
   store_rest_runtime(std::move(current), true);
+  publish_combined_snapshot();
 
   cJSON_Delete(root);
   return true;
@@ -2399,10 +2855,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     token_expiry_us_ = 0;
     mqtt_username_.clear();
     stop_mqtt_client();
-    BambuCloudSnapshot expired = snapshot();
-    expired.connected = false;
-    expired.detail = "Bambu Cloud token expired";
-    set_snapshot(std::move(expired));
+    apply_cloud_token_expired_state();
     return false;
   }
 

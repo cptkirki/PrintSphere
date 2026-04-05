@@ -5,22 +5,16 @@
 #include <mutex>
 #include <string_view>
 
-#include "bsp/esp32_s3_touch_amoled_1_75.h"
-#include "esp_err.h"
 #include "esp_log.h"
+
+extern const char error_lookup_tsv_start[] asm("_binary_error_lookup_tsv_start");
+extern const char error_lookup_tsv_end[] asm("_binary_error_lookup_tsv_end");
 
 namespace printsphere {
 
 namespace {
 
 constexpr char kTag[] = "printsphere.lookup";
-constexpr char kLookupPath[] = BSP_SPIFFS_MOUNT_POINT "/error_lookup.tsv";
-
-enum class StorageState : uint8_t {
-  kUnknown,
-  kReady,
-  kUnavailable,
-};
 
 struct LookupCacheEntry {
   bool valid = false;
@@ -39,7 +33,6 @@ struct ParsedLookupLine {
 };
 
 std::mutex g_lookup_mutex;
-StorageState g_storage_state = StorageState::kUnknown;
 LookupCacheEntry g_cache{};
 
 char lookup_domain_marker(ErrorLookupDomain domain) {
@@ -90,70 +83,30 @@ std::string format_generic_print_error_detail(int print_error_code, int hms_coun
 }
 
 bool ensure_storage_ready_locked() {
-  if (g_storage_state == StorageState::kReady) {
-    return true;
-  }
-  if (g_storage_state == StorageState::kUnavailable) {
-    return false;
-  }
-
-  const esp_err_t mount_result = bsp_spiffs_mount();
-  if (mount_result != ESP_OK && mount_result != ESP_ERR_INVALID_STATE) {
-    ESP_LOGW(kTag, "SPIFFS mount failed: %s", esp_err_to_name(mount_result));
-    g_storage_state = StorageState::kUnavailable;
-    return false;
-  }
-
-  FILE* file = std::fopen(kLookupPath, "rb");
-  if (file == nullptr) {
-    ESP_LOGW(kTag, "Lookup file missing at %s", kLookupPath);
-    g_storage_state = StorageState::kUnavailable;
-    return false;
-  }
-  std::fclose(file);
-  g_storage_state = StorageState::kReady;
-  return true;
+  return &error_lookup_tsv_end[0] > &error_lookup_tsv_start[0];
 }
 
-ParsedLookupLine parse_lookup_line(char* line) {
+ParsedLookupLine parse_lookup_line(std::string_view line) {
   ParsedLookupLine parsed{};
-  if (line == nullptr) {
+  if (line.empty() || line[0] == '#') {
     return parsed;
   }
 
-  size_t len = std::strlen(line);
-  while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-    line[--len] = '\0';
-  }
-  if (len == 0 || line[0] == '#') {
-    return parsed;
-  }
+  const auto tab1 = line.find('\t');
+  if (tab1 == std::string_view::npos) return parsed;
+  const auto tab2 = line.find('\t', tab1 + 1);
+  if (tab2 == std::string_view::npos) return parsed;
+  const auto tab3 = line.find('\t', tab2 + 1);
+  if (tab3 == std::string_view::npos) return parsed;
 
-  char* tab1 = std::strchr(line, '\t');
-  if (tab1 == nullptr) {
-    return parsed;
-  }
-  char* tab2 = std::strchr(tab1 + 1, '\t');
-  if (tab2 == nullptr) {
-    return parsed;
-  }
-  char* tab3 = std::strchr(tab2 + 1, '\t');
-  if (tab3 == nullptr) {
-    return parsed;
-  }
-
-  *tab1 = '\0';
-  *tab2 = '\0';
-  *tab3 = '\0';
-  if (line[0] == '\0' || tab1[1] == '\0' || tab3[1] == '\0') {
-    return parsed;
-  }
+  std::string_view domain_field = line.substr(0, tab1);
+  if (domain_field.empty()) return parsed;
 
   parsed.valid = true;
-  parsed.domain = line[0];
-  parsed.code = tab1 + 1;
-  parsed.models = tab2 + 1;
-  parsed.message = tab3 + 1;
+  parsed.domain = domain_field[0];
+  parsed.code = line.substr(tab1 + 1, tab2 - tab1 - 1);
+  parsed.models = line.substr(tab2 + 1, tab3 - tab2 - 1);
+  parsed.message = line.substr(tab3 + 1);
   return parsed;
 }
 
@@ -183,12 +136,6 @@ std::string lookup_error_text_uncached(ErrorLookupDomain domain, uint64_t code, 
     return {};
   }
 
-  FILE* file = std::fopen(kLookupPath, "rb");
-  if (file == nullptr) {
-    return {};
-  }
-  std::setvbuf(file, nullptr, _IONBF, 0);
-
   const char target_domain = lookup_domain_marker(domain);
   const std::string target_code = format_lookup_code(domain, code);
   const std::string_view model_token = to_string(model);
@@ -196,9 +143,22 @@ std::string lookup_error_text_uncached(ErrorLookupDomain domain, uint64_t code, 
   std::string default_message;
   std::string matched_message;
   std::string fallback_message;
-  char line[1024];
 
-  while (std::fgets(line, sizeof(line), file) != nullptr) {
+  const char* cursor = error_lookup_tsv_start;
+  const char* const end = error_lookup_tsv_end;
+
+  while (cursor < end) {
+    const char* line_end = static_cast<const char*>(std::memchr(cursor, '\n', end - cursor));
+    if (line_end == nullptr) {
+      line_end = end;
+    }
+    std::string_view line(cursor, line_end - cursor);
+    cursor = line_end + 1;
+
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+      line.remove_suffix(1);
+    }
+
     ParsedLookupLine entry = parse_lookup_line(line);
     if (!entry.valid) {
       continue;
@@ -233,7 +193,6 @@ std::string lookup_error_text_uncached(ErrorLookupDomain domain, uint64_t code, 
     }
   }
 
-  std::fclose(file);
   if (!matched_message.empty()) {
     return matched_message;
   }
@@ -247,7 +206,12 @@ std::string lookup_error_text_uncached(ErrorLookupDomain domain, uint64_t code, 
 
 bool initialize_error_lookup_storage() {
   std::lock_guard<std::mutex> lock(g_lookup_mutex);
-  return ensure_storage_ready_locked();
+  const bool ready = ensure_storage_ready_locked();
+  if (ready) {
+    ESP_LOGI(kTag, "Embedded error lookup ready (%u bytes)",
+             static_cast<unsigned int>(error_lookup_tsv_end - error_lookup_tsv_start));
+  }
+  return ready;
 }
 
 std::string lookup_error_text(ErrorLookupDomain domain, uint64_t code, PrinterModel model) {

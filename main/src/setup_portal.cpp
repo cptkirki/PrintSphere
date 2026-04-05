@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "printsphere/bambu_status.hpp"
 #include "printsphere/ui.hpp"
 
 namespace printsphere {
@@ -393,6 +394,15 @@ SourceMode parse_source_mode_field(const cJSON* root) {
   return parse_source_mode(value);
 }
 
+DisplayRotation parse_display_rotation_field(const cJSON* root) {
+  if (root == nullptr) {
+    return DisplayRotation::k0;
+  }
+
+  const std::string value = trim_copy(read_string_field(root, "display_rotation"));
+  return parse_display_rotation(value);
+}
+
 std::string source_mode_badge_value(SourceMode mode) {
   switch (mode) {
     case SourceMode::kCloudOnly:
@@ -405,21 +415,240 @@ std::string source_mode_badge_value(SourceMode mode) {
   }
 }
 
+std::string display_rotation_badge_value(DisplayRotation rotation) {
+  return std::string(to_string(rotation)) + " deg";
+}
+
+bool cloud_detail_is_transitional(const std::string& detail) {
+  const std::string normalized = normalize_bambu_status_token(detail);
+  return normalized == "LOGGING IN TO BAMBU CLOUD" ||
+         normalized == "WAITING FOR WI-FI FOR BAMBU CLOUD" ||
+         normalized == "RESTORED BAMBU CLOUD SESSION";
+}
+
+bool cloud_stage_is_user_visible_progress(CloudSetupStage stage) {
+  switch (stage) {
+    case CloudSetupStage::kEmailCodeRequired:
+    case CloudSetupStage::kTfaRequired:
+    case CloudSetupStage::kBindingPrinter:
+    case CloudSetupStage::kConnectingMqtt:
+    case CloudSetupStage::kConnected:
+    case CloudSetupStage::kFailed:
+      return true;
+    case CloudSetupStage::kIdle:
+    case CloudSetupStage::kLoggingIn:
+    case CloudSetupStage::kCodeSubmitted:
+    default:
+      return false;
+  }
+}
+
+bool cloud_portal_ready(const BambuCloudSnapshot& snapshot);
+
+struct CloudPortalPresentation {
+  BambuCloudSnapshot snapshot{};
+  bool ready = false;
+  std::string badge_value = "Not configured";
+  const char* badge_class = "idle";
+  std::string status_line = "Step 2: Connect Bambu Cloud";
+  std::string status_detail = "No cloud response yet";
+};
+
+bool cloud_connect_result_ready(const BambuCloudSnapshot& before,
+                                const BambuCloudSnapshot& current) {
+  if (!cloud_portal_ready(before) && cloud_portal_ready(current)) {
+    return true;
+  }
+  if ((!before.verification_required && current.verification_required) ||
+      (!before.tfa_required && current.tfa_required)) {
+    return true;
+  }
+  if (cloud_stage_is_user_visible_progress(current.setup_stage) &&
+      current.setup_stage != before.setup_stage) {
+    return true;
+  }
+
+  if (current.configured != before.configured ||
+      current.resolved_serial != before.resolved_serial) {
+    return true;
+  }
+
+  if (current.detail == before.detail) {
+    return false;
+  }
+
+  return !cloud_detail_is_transitional(current.detail);
+}
+
+bool cloud_verify_result_ready(const BambuCloudSnapshot& before,
+                               const BambuCloudSnapshot& current) {
+  if (!cloud_portal_ready(before) && cloud_portal_ready(current)) {
+    return true;
+  }
+  if ((!before.verification_required && current.verification_required) ||
+      (!before.tfa_required && current.tfa_required)) {
+    return true;
+  }
+  if (cloud_stage_is_user_visible_progress(current.setup_stage) &&
+      current.setup_stage != before.setup_stage) {
+    return true;
+  }
+  if (current.resolved_serial != before.resolved_serial) {
+    return true;
+  }
+  if (current.detail == before.detail) {
+    return false;
+  }
+  if (current.setup_stage == CloudSetupStage::kFailed) {
+    return true;
+  }
+  return !cloud_detail_is_transitional(current.detail) &&
+         current.setup_stage != CloudSetupStage::kCodeSubmitted &&
+         current.setup_stage != CloudSetupStage::kLoggingIn;
+}
+
+bool cloud_portal_ready(const BambuCloudSnapshot& snapshot) {
+  if (!snapshot.configured || snapshot.verification_required || snapshot.tfa_required) {
+    return false;
+  }
+  if (snapshot.session_connected || snapshot.connected) {
+    return true;
+  }
+  switch (snapshot.setup_stage) {
+    case CloudSetupStage::kBindingPrinter:
+    case CloudSetupStage::kConnectingMqtt:
+    case CloudSetupStage::kConnected:
+      return true;
+    case CloudSetupStage::kIdle:
+    case CloudSetupStage::kLoggingIn:
+    case CloudSetupStage::kEmailCodeRequired:
+    case CloudSetupStage::kTfaRequired:
+    case CloudSetupStage::kCodeSubmitted:
+    case CloudSetupStage::kFailed:
+    default:
+      return false;
+  }
+}
+
+BambuCloudSnapshot portal_cloud_view(BambuCloudSnapshot snapshot) {
+  if (!cloud_portal_ready(snapshot)) {
+    return snapshot;
+  }
+
+  snapshot.connected = true;
+  snapshot.setup_stage = CloudSetupStage::kConnected;
+  if (cloud_detail_is_transitional(snapshot.detail) || snapshot.detail.empty()) {
+    snapshot.detail = "Bambu Cloud session is ready.";
+  }
+  return snapshot;
+}
+
+CloudPortalPresentation cloud_portal_presentation(const BambuCloudSnapshot& cloud) {
+  CloudPortalPresentation presentation;
+  presentation.ready = cloud_portal_ready(cloud);
+  presentation.snapshot = portal_cloud_view(cloud);
+  presentation.status_detail =
+      presentation.snapshot.detail.empty() ? "No cloud response yet" : presentation.snapshot.detail;
+
+  if (presentation.ready) {
+    presentation.badge_value = "Connected";
+    presentation.badge_class = "ok";
+    presentation.status_line = "Cloud connected";
+    return presentation;
+  }
+
+  if (presentation.snapshot.verification_required) {
+    presentation.badge_value = "Code required";
+    presentation.badge_class = "warn";
+    presentation.status_line =
+        presentation.snapshot.tfa_required ? "2FA required" : "Email code required";
+    return presentation;
+  }
+
+  switch (presentation.snapshot.setup_stage) {
+    case CloudSetupStage::kLoggingIn:
+      presentation.badge_value = "Logging in";
+      presentation.badge_class = "info";
+      presentation.status_line = "Logging in";
+      break;
+    case CloudSetupStage::kCodeSubmitted:
+      presentation.badge_value = "Verifying code";
+      presentation.badge_class = "info";
+      presentation.status_line = "Verifying code";
+      break;
+    case CloudSetupStage::kBindingPrinter:
+      presentation.badge_value = "Binding printer";
+      presentation.badge_class = "info";
+      presentation.status_line = "Binding printer";
+      break;
+    case CloudSetupStage::kConnectingMqtt:
+      presentation.badge_value = "Connecting MQTT";
+      presentation.badge_class = "info";
+      presentation.status_line = "Connecting Cloud MQTT";
+      break;
+    case CloudSetupStage::kFailed:
+      presentation.badge_value = "Login failed";
+      presentation.badge_class = "warn";
+      presentation.status_line = "Cloud login failed";
+      break;
+    case CloudSetupStage::kConnected:
+      presentation.badge_value = "Connected";
+      presentation.badge_class = "ok";
+      presentation.status_line = "Cloud connected";
+      break;
+    case CloudSetupStage::kIdle:
+    case CloudSetupStage::kEmailCodeRequired:
+    case CloudSetupStage::kTfaRequired:
+    default:
+      break;
+  }
+
+  if (presentation.snapshot.configured && presentation.badge_value == "Not configured") {
+    presentation.badge_value = "Configured";
+    presentation.badge_class = "info";
+  }
+
+  return presentation;
+}
+
+bool cloud_login_still_pending(const BambuCloudSnapshot& snapshot) {
+  if (!snapshot.configured || cloud_portal_ready(snapshot) || snapshot.verification_required ||
+      snapshot.tfa_required) {
+    return false;
+  }
+
+  return snapshot.setup_stage != CloudSetupStage::kFailed;
+}
+
 void append_cloud_status_fields(std::string* body, const BambuCloudSnapshot& cloud) {
   if (body == nullptr) {
     return;
   }
 
+  const CloudPortalPresentation portal = cloud_portal_presentation(cloud);
   *body += ",\"cloud_connected\":";
+  *body += (portal.ready ? "true" : "false");
+  *body += ",\"cloud_live_connected\":";
   *body += (cloud.connected ? "true" : "false");
+  *body += ",\"cloud_session_connected\":";
+  *body += (cloud.session_connected ? "true" : "false");
   *body += ",\"cloud_verification_required\":";
-  *body += (cloud.verification_required ? "true" : "false");
+  *body += (portal.snapshot.verification_required ? "true" : "false");
   *body += ",\"cloud_tfa_required\":";
-  *body += (cloud.tfa_required ? "true" : "false");
+  *body += (portal.snapshot.tfa_required ? "true" : "false");
   *body += ",\"cloud_configured\":";
-  *body += (cloud.configured ? "true" : "false");
-  *body += ",\"cloud_detail\":\"" + json_escape(cloud.detail) + "\"";
-  *body += ",\"cloud_resolved_serial\":\"" + json_escape(cloud.resolved_serial) + "\"";
+  *body += (portal.snapshot.configured ? "true" : "false");
+  *body += ",\"cloud_portal_ready\":";
+  *body += (portal.ready ? "true" : "false");
+  *body += ",\"cloud_setup_stage\":\"";
+  *body += json_escape(to_string(portal.snapshot.setup_stage));
+  *body += "\"";
+  *body += ",\"cloud_detail\":\"" + json_escape(portal.snapshot.detail) + "\"";
+  *body += ",\"cloud_resolved_serial\":\"" + json_escape(portal.snapshot.resolved_serial) + "\"";
+  *body += ",\"cloud_badge_value\":\"" + json_escape(portal.badge_value) + "\"";
+  *body += ",\"cloud_badge_state\":\"" + json_escape(portal.badge_class) + "\"";
+  *body += ",\"cloud_status_line\":\"" + json_escape(portal.status_line) + "\"";
+  *body += ",\"cloud_status_detail\":\"" + json_escape(portal.status_detail) + "\"";
 }
 
 void append_local_status_fields(std::string* body, const PrinterSnapshot& local, bool local_configured) {
@@ -463,8 +692,22 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
   if (!lock_required) {
     if (wifi_manager_.is_setup_access_point_active()) {
       snapshot.detail = "Web Config is open while the setup access point is active.";
-    } else {
+    } else if (!wifi_manager_.is_station_connected()) {
       snapshot.detail = "Web Config is open while PrintSphere is waiting for Wi-Fi credentials.";
+    } else {
+      switch (config_store_.load_source_mode()) {
+        case SourceMode::kCloudOnly:
+          snapshot.detail = "Web Config is open until Bambu Cloud is connected.";
+          break;
+        case SourceMode::kLocalOnly:
+          snapshot.detail = "Web Config is open until the local printer path is connected.";
+          break;
+        case SourceMode::kHybrid:
+        default:
+          snapshot.detail =
+              "Web Config is open until either Bambu Cloud or the local printer path is connected.";
+          break;
+      }
     }
   } else if (snapshot.pin_active) {
     snapshot.detail =
@@ -482,6 +725,28 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
   }
 
   return snapshot;
+}
+
+bool SetupPortal::is_provisioning_complete() const {
+  if (wifi_manager_.is_setup_access_point_active() || !wifi_manager_.is_station_connected()) {
+    return false;
+  }
+
+  const SourceMode source_mode = config_store_.load_source_mode();
+  const PrinterSnapshot local = printer_client_.snapshot();
+  const BambuCloudSnapshot cloud = cloud_client_.snapshot();
+  const bool local_connected = local.connection == PrinterConnectionState::kOnline;
+  const bool cloud_connected = cloud_portal_ready(cloud);
+
+  switch (source_mode) {
+    case SourceMode::kCloudOnly:
+      return cloud_connected;
+    case SourceMode::kLocalOnly:
+      return local_connected;
+    case SourceMode::kHybrid:
+    default:
+      return cloud_connected || local_connected;
+  }
 }
 
 void SetupPortal::prune_access_state_locked(uint64_t current_ms) {
@@ -517,8 +782,7 @@ bool SetupPortal::is_lock_required() const {
     return false;
   }
 
-  const PrinterSnapshot local = printer_client_.snapshot();
-  return local.connection != PrinterConnectionState::kWaitingForCredentials;
+  return is_provisioning_complete();
 }
 
 bool SetupPortal::is_request_authorized(httpd_req_t* request) {
@@ -592,7 +856,8 @@ esp_err_t SetupPortal::start() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size = 8192;
-  config.max_uri_handlers = 13;
+  // Leave some headroom for portal endpoints so feature additions do not silently exhaust slots.
+  config.max_uri_handlers = 20;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
 
@@ -675,6 +940,14 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &source_mode_uri), kTag,
                       "source mode handler failed");
 
+  httpd_uri_t display_rotation_uri = {};
+  display_rotation_uri.uri = "/api/display-rotation";
+  display_rotation_uri.method = HTTP_POST;
+  display_rotation_uri.handler = &SetupPortal::handle_display_rotation_post;
+  display_rotation_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &display_rotation_uri), kTag,
+                      "display rotation handler failed");
+
   httpd_uri_t cloud_connect_uri = {};
   cloud_connect_uri.uri = "/api/cloud/connect";
   cloud_connect_uri.method = HTTP_POST;
@@ -715,10 +988,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
+  const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
-  const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
+  const CloudPortalPresentation cloud_portal =
+      cloud_portal_presentation(portal->cloud_client_.refreshed_snapshot());
+  const BambuCloudSnapshot& cloud_snapshot = cloud_portal.snapshot;
   const PrinterSnapshot local_snapshot = portal->printer_client_.snapshot();
+  const std::string effective_printer_serial =
+      !printer.serial.empty() ? printer.serial : cloud_snapshot.resolved_serial;
   const bool wifi_connected = portal->wifi_manager_.is_station_connected();
   const bool setup_ap_active = portal->wifi_manager_.is_setup_access_point_active();
   const bool wifi_configured = wifi.is_configured();
@@ -739,18 +1017,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       wifi_connected ? ("Connected - " + wifi_ip) : "Not connected";
   const char* wifi_badge_class = wifi_connected ? "ok" : "warn";
 
-  std::string cloud_badge_value = "Not configured";
-  const char* cloud_badge_class = "idle";
-  if (cloud_snapshot.connected) {
-    cloud_badge_value = "Connected";
-    cloud_badge_class = "ok";
-  } else if (cloud_snapshot.verification_required) {
-    cloud_badge_value = "Code required";
-    cloud_badge_class = "warn";
-  } else if (cloud_snapshot.configured) {
-    cloud_badge_value = "Configured";
-    cloud_badge_class = "info";
-  }
+  const std::string cloud_badge_value = cloud_portal.badge_value;
+  const char* cloud_badge_class = cloud_portal.badge_class;
 
   const std::string source_badge_value = source_mode_badge_value(source_mode);
   std::string local_badge_value = "Not configured";
@@ -766,10 +1034,20 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     local_badge_class = "info";
   }
   const std::string initial_status_line =
-      show_connection_steps ? "Step 2: Connect Bambu Cloud" : "Step 1: Save Wi-Fi";
+      show_connection_steps
+          ? (cloud_portal.ready || cloud_snapshot.verification_required ||
+                     cloud_snapshot.setup_stage == CloudSetupStage::kLoggingIn ||
+                     cloud_snapshot.setup_stage == CloudSetupStage::kCodeSubmitted
+                 ? cloud_portal.status_line
+                 : "Step 2: Connect Bambu Cloud")
+          : "Step 1: Save Wi-Fi";
   const std::string initial_status_detail =
       show_connection_steps
-          ? ("ESP on home network: " + wifi_ip)
+          ? (cloud_portal.ready || cloud_snapshot.verification_required ||
+                     cloud_snapshot.setup_stage == CloudSetupStage::kLoggingIn ||
+                     cloud_snapshot.setup_stage == CloudSetupStage::kCodeSubmitted
+                 ? cloud_portal.status_detail
+                 : ("ESP on home network: " + wifi_ip))
           : (!wifi_configured
                  ? "Enter your home Wi-Fi, save it and let the ESP reboot."
                  : "Update Wi-Fi if needed, save, then reopen the portal on the ESP home-network IP.");
@@ -902,6 +1180,36 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "</span></p>";
   html += "</section>";
 
+  html += "<section class=\"section\">";
+  html += "<div class=\"section-head\"><h2>Screen Rotation</h2><p>Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.</p></div>";
+  html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
+  html += "<option value=\"0\"";
+  if (display_rotation == DisplayRotation::k0) {
+    html += " selected";
+  }
+  html += ">0 deg (default)</option>";
+  html += "<option value=\"90\"";
+  if (display_rotation == DisplayRotation::k90) {
+    html += " selected";
+  }
+  html += ">90 deg</option>";
+  html += "<option value=\"180\"";
+  if (display_rotation == DisplayRotation::k180) {
+    html += " selected";
+  }
+  html += ">180 deg</option>";
+  html += "<option value=\"270\"";
+  if (display_rotation == DisplayRotation::k270) {
+    html += " selected";
+  }
+  html += ">270 deg</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
+  html += "<p class=\"micro\">Current orientation: ";
+  html += json_escape(display_rotation_badge_value(display_rotation));
+  html += "</p>";
+  html += "</section>";
+
   if (show_connection_steps) {
     html += "<section class=\"section\">";
     html += "<div class=\"section-head\"><h2>Connection Mode</h2><p>This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.</p></div>";
@@ -985,7 +1293,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(printer.host);
     html += "\" autocomplete=\"off\"></div>";
     html += "<div class=\"field\"><label for=\"printer_serial\">Printer Serial Number</label><input id=\"printer_serial\" value=\"";
-    html += json_escape(printer.serial);
+    html += json_escape(effective_printer_serial);
     html += "\" autocomplete=\"off\"></div>";
     html += "</div>";
     html += "<div class=\"field\"><label for=\"printer_access_code\">Access Code</label><input id=\"printer_access_code\" type=\"password\" value=\"\" placeholder=\"";
@@ -1047,6 +1355,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const wifiScanButton=document.getElementById('wifi-scan-button');";
   html += "const wifiSsidSelect=document.getElementById('wifi_ssid_select');";
   html += "const wifiScanDetail=document.getElementById('wifi-scan-detail');";
+  html += "const displayRotationSelect=document.getElementById('display_rotation');";
+  html += "const displayRotationApplyButton=document.getElementById('display-rotation-apply-button');";
+  html += "const displayRotationApplyHint=document.getElementById('display-rotation-apply-hint');";
   html += "const sourceModeSelect=document.getElementById('source_mode');";
   html += "const sourceModeApplyButton=document.getElementById('source-mode-apply-button');";
   html += "const sourceModeApplyHint=document.getElementById('source-mode-apply-hint');";
@@ -1057,6 +1368,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "let statusLockUntil=0;";
   html += "let arcPreviewTimer=null;";
   html += "let healthTimer=null;";
+  html += "let cloudFollowupTimer=null;";
+  html += "let cloudFollowupUntil=0;";
+  html += "let cloudFollowupDetail='';";
+  html += "let localFollowupTimer=null;";
+  html += "let localFollowupUntil=0;";
+  html += "let localFollowupDetail='';";
+  html += "let cloudSuccessReloadScheduled=false;";
   html += "let healthInFlight=false;";
   html += "let wifiScanInFlight=false;";
   html += "const savedConfig={cloud_email:\"";
@@ -1065,10 +1383,12 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += json_escape(to_string(cloud.region));
   html += "\",source_mode:\"";
   html += to_string(source_mode);
+  html += "\",display_rotation:\"";
+  html += to_string(display_rotation);
   html += "\",printer_host:\"";
   html += json_escape(printer.host);
   html += "\",printer_serial:\"";
-  html += json_escape(printer.serial);
+  html += json_escape(effective_printer_serial);
   html += "\",wifi_password_saved:";
   html += wifi_password_saved ? "true" : "false";
   html += ",cloud_password_saved:";
@@ -1080,9 +1400,23 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
   html += "function valueOf(id){const el=document.getElementById(id);return el?el.value:'';}";
   html += "function trimmedValue(id){return valueOf(id).trim();}";
+  html += "function stopCloudFollowup(){if(cloudFollowupTimer){clearTimeout(cloudFollowupTimer);cloudFollowupTimer=null;}cloudFollowupUntil=0;cloudFollowupDetail='';}";
+  html += "function stopLocalFollowup(){if(localFollowupTimer){clearTimeout(localFollowupTimer);localFollowupTimer=null;}localFollowupUntil=0;localFollowupDetail='';}";
+  html += "function schedulePortalReload(delayMs){setTimeout(()=>window.location.reload(),delayMs||250);}";
+  html += "function cloudResolvedSerial(body){return ((body&&body.cloud_resolved_serial)||'').trim();}";
+  html += "function cloudSetupStage(body){return ((body&&body.cloud_setup_stage)||'idle');}";
+  html += "function cloudPortalReady(body){return !!(body&&body.cloud_portal_ready);}";
+  html += "function cloudStageIsCodeRequired(stage){return stage==='email_code_required'||stage==='tfa_required';}";
+  html += "function cloudStageIsBusy(stage){return stage==='logging_in'||stage==='code_submitted'||stage==='binding_printer'||stage==='connecting_mqtt';}";
+  html += "function cloudSessionLooksReady(body){const stage=cloudSetupStage(body);return !!(body&&body.cloud_connected)||stage==='connected';}";
+  html += "function cloudProvisioningReady(body){const stage=cloudSetupStage(body);return cloudPortalReady(body)||stage==='binding_printer'||stage==='connecting_mqtt'||stage==='connected';}";
+  html += "function cloudStageStatusLabel(stage){if(stage==='binding_printer')return 'Binding printer';if(stage==='connecting_mqtt')return 'Connecting Cloud MQTT';if(stage==='code_submitted')return 'Verifying code';if(stage==='logging_in')return 'Logging in';return 'Finishing login';}";
+  html += "function cloudDetailLooksTransitional(detail){const text=(detail||'').trim();return text==='Logging in to Bambu Cloud'||text==='Waiting for Wi-Fi for Bambu Cloud'||text==='Restored Bambu Cloud session';}";
+  html += "function localSerialInputReady(){const input=document.getElementById('printer_serial');return !!(input&&input.value.trim());}";
   html += "function applyResolvedSerial(body){const serial=((body&&body.cloud_resolved_serial)||'').trim();"
           "const input=document.getElementById('printer_serial');if(!serial||!input)return;"
-          "const current=input.value.trim();if(!current||current===savedConfig.printer_serial){input.value=serial;savedConfig.printer_serial=serial;}}";
+          "const current=input.value.trim();const saved=(savedConfig.printer_serial||'').trim();"
+          "if(!current||current===saved||current===serial){input.value=serial;savedConfig.printer_serial=serial;}}";
   html += "function populateWifiNetworks(body){if(!wifiSsidSelect)return;"
           "const previousValue=wifiSsidSelect.value;const currentSsid=trimmedValue('wifi_ssid');"
           "const networks=Array.isArray(body&&body.networks)?body.networks:[];"
@@ -1100,7 +1434,92 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "catch(error){if(wifiScanDetail){wifiScanDetail.textContent='Wi-Fi scan request failed.';}}"
           "finally{wifiScanInFlight=false;if(wifiScanButton){wifiScanButton.disabled=false;}}}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
-          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}";
+          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}"; 
+  html += "function renderCloudStatus(body){"
+          "var cv='Not configured',cs='idle';"
+          "if(body&&body.cloud_badge_value){cv=body.cloud_badge_value;cs=body.cloud_badge_state||'ok';}"
+          "else{var st=cloudSetupStage(body);"
+          "if(body&&(body.cloud_connected||body.cloud_portal_ready||st==='connected')){cv='Connected';cs='ok';}"
+          "else if(cloudStageIsCodeRequired(st)){cv='Code required';cs='warn';}"
+          "else if(st==='logging_in'){cv='Logging in';cs='info';}"
+          "else if(st==='code_submitted'){cv='Verifying code';cs='info';}"
+          "else if(st==='binding_printer'){cv='Binding printer';cs='info';}"
+          "else if(st==='connecting_mqtt'){cv='Connecting MQTT';cs='info';}"
+          "else if(st==='failed'){cv='Login failed';cs='warn';}"
+          "else if(Date.now()<cloudFollowupUntil){cv='Finishing login';cs='info';}"
+          "else if((body&&body.cloud_configured)||(!!trimmedValue('cloud_email')&&(!!savedConfig.cloud_password_saved||!!valueOf('cloud_password')))){cv='Configured';cs='info';}}"
+          "setBadge('cloud-badge','Cloud',cv,cs);"
+          "var cd=document.getElementById('cloud-detail');"
+          "if(cd){"
+          "var dt=body&&(body.cloud_status_detail||body.cloud_detail||body.detail);"
+          "if(dt){cd.textContent=dt;}"
+          "else if(Date.now()<cloudFollowupUntil&&cloudFollowupDetail){cd.textContent=cloudFollowupDetail;}"
+          "else if(cv==='Configured'){cd.textContent='Cloud credentials are saved on the ESP.';}"
+          "else{cd.textContent='No cloud response yet';}}"
+          "if(body){updateCloudVerification(body);applyResolvedSerial(body);}"
+          "var sr=cloudSessionLooksReady(body),xr=!!cloudResolvedSerial(body)||localSerialInputReady(),st2=cloudSetupStage(body);"
+          "if(body&&(cloudStageIsCodeRequired(st2)||st2==='failed'||(sr&&xr))){stopCloudFollowup();}}";
+  html += "function applyHealthBody(body){if(!body)return null;"
+          "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
+          "const wifiValue=body.wifi_connected?('Connected - '+(body.wifi_ip||'')):'Not connected';"
+          "setBadge('wifi-badge','Wi-Fi',wifiValue,body.wifi_connected?'ok':'warn');"
+          "var wd=document.getElementById('wifi-detail');if(wd){wd.textContent=wifiValue;}"
+          "renderCloudStatus(body);"
+          "const sourceMode=body.source_mode||savedConfig.source_mode||'hybrid';"
+          "const sourceValue=sourceMode==='local_only'?'Local only':(sourceMode==='cloud_only'?'Cloud only':'Hybrid (recommended)');"
+          "setBadge('source-badge','Source',sourceValue,'info');"
+          "renderLocalStatus(body);"
+          "if(Date.now()>statusLockUntil){"
+          "if(body.wifi_connected){if(body.cloud_status_line){setStatus(body.cloud_status_line,body.cloud_status_detail||body.cloud_detail||body.detail||'',0);}"
+          "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Step 2: Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
+          "else{setStatus('Step 1: Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
+          "return body;}";
+  html += "async function forceHealthRefresh(){try{const response=await fetch('/api/health',{cache:'no-store'});"
+          "if(!response.ok)return null;const body=await response.json();if(body.portal_locked){window.location.reload();return null;}"
+          "return applyHealthBody(body);}catch(error){return null;}}";
+  html += "function startCloudFollowup(detail,timeoutMs){"
+          "cloudFollowupDetail=detail||'Completing the cloud login and device binding now.';"
+          "cloudFollowupUntil=Date.now()+(timeoutMs||12000);"
+          "renderCloudStatus({cloud_connected:false,cloud_verification_required:false,cloud_configured:true,cloud_setup_stage:'logging_in',cloud_detail:cloudFollowupDetail});"
+          "if(cloudFollowupTimer){clearTimeout(cloudFollowupTimer);cloudFollowupTimer=null;}"
+          "const poll=async()=>{"
+          "const body=await forceHealthRefresh();"
+          "const stage=cloudSetupStage(body);"
+          "const serialReady=!!cloudResolvedSerial(body)||localSerialInputReady();"
+          "if(body&&cloudProvisioningReady(body)){const detail=(cloudDetailLooksTransitional(body.cloud_detail||body.detail)?'Bambu Cloud session is ready.':(body.cloud_detail||body.detail||'Bambu Cloud session is ready.'));setStatus('Cloud connected',detail,5000);stopCloudFollowup();if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(serialReady?350:600);}return;}"
+          "if(body&&stage==='binding_printer'){setStatus('Cloud connected',body.cloud_detail||body.detail||'Resolving your printer from the Bambu Cloud account now.',4000);}"
+          "if(body&&stage==='connecting_mqtt'){setStatus('Cloud connected',body.cloud_detail||body.detail||'Connecting the live cloud monitor now.',4000);}"
+          "if(body&&cloudStageIsCodeRequired(stage)){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.cloud_detail||'Enter the requested code to finish the login.',10000);stopCloudFollowup();return;}"
+          "if(body&&stage==='failed'){setStatus('Cloud login failed',body.cloud_detail||body.detail||'The Bambu Cloud login did not complete.',8000);stopCloudFollowup();return;}"
+          "if(Date.now()>=cloudFollowupUntil){if(body&&cloudSessionLooksReady(body)&&!serialReady){cloudFollowupUntil=Date.now()+5000;cloudFollowupTimer=setTimeout(poll,350);return;}if(body&&cloudStageIsBusy(stage)){setStatus('Cloud login still running',body.cloud_detail||body.detail||'The cloud login is still progressing in the background.',6000);}stopCloudFollowup();return;}"
+          "cloudFollowupTimer=setTimeout(poll,350);};"
+          "cloudFollowupTimer=setTimeout(poll,350);}";
+  html += "function renderLocalStatus(body){"
+          "let localValue='Not configured';let localState='idle';"
+          "if(body&&body.local_connected){localValue='Connected';localState='ok';}"
+          "else if(body&&body.local_error){localValue='Error';localState='warn';}"
+          "else if(Date.now()<localFollowupUntil){localValue='Connecting';localState='info';}"
+          "else if(body&&body.local_configured){localValue='Configured';localState='info';}"
+          "setBadge('local-badge','Local Path',localValue,localState);"
+          "const localDetail=document.getElementById('local-detail');"
+          "if(localDetail){"
+          "if(body&&body.local_detail){localDetail.textContent=body.local_detail;}"
+          "else if(Date.now()<localFollowupUntil&&localFollowupDetail){localDetail.textContent=localFollowupDetail;}"
+          "else{localDetail.textContent='No local response yet';}}"
+          "if(body&&(body.local_connected||body.local_error)){stopLocalFollowup();}}";
+  html += "function startLocalFollowup(detail,timeoutMs){"
+          "localFollowupDetail=detail||'Saving printer credentials and connecting to local MQTT now.';"
+          "localFollowupUntil=Date.now()+(timeoutMs||12000);"
+          "renderLocalStatus({local_connected:false,local_error:false,local_configured:true,local_detail:localFollowupDetail});"
+          "if(localFollowupTimer){clearTimeout(localFollowupTimer);localFollowupTimer=null;}"
+          "const poll=async()=>{"
+          "let body=await updateHealth();"
+          "if(!body){body=await forceHealthRefresh();}"
+          "if(body&&body.local_connected){setStatus('Local path connected',body.local_detail||'Connected to local Bambu MQTT.',5000);stopLocalFollowup();return;}"
+          "if(body&&body.local_error){setStatus('Local path error',body.local_detail||'The local MQTT path returned an error.',8000);stopLocalFollowup();return;}"
+          "if(Date.now()>=localFollowupUntil){await forceHealthRefresh();stopLocalFollowup();return;}"
+          "localFollowupTimer=setTimeout(poll,600);};"
+          "localFollowupTimer=setTimeout(poll,600);}";
   html += "function updateSourceModeControls(){"
           "if(!sourceModeSelect||!sourceModeApplyButton||!sourceModeApplyHint)return;"
           "const selected=valueOf('source_mode')||'hybrid';"
@@ -1108,49 +1527,38 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "sourceModeApplyButton.classList.toggle('hidden',!changed);"
           "sourceModeApplyHint.classList.toggle('hidden',!changed);"
           "if(!changed){sourceModeApplyButton.disabled=false;}}";
+  html += "function updateDisplayRotationControls(){"
+          "if(!displayRotationSelect||!displayRotationApplyButton||!displayRotationApplyHint)return;"
+          "const selected=valueOf('display_rotation')||'0';"
+          "const changed=selected!==(savedConfig.display_rotation||'0');"
+          "displayRotationApplyButton.classList.toggle('hidden',!changed);"
+          "displayRotationApplyHint.classList.toggle('hidden',!changed);"
+          "if(!changed){displayRotationApplyButton.disabled=false;}}";
   html += "function updateCloudVerification(body){const note=document.getElementById('cloud-verify-note');"
           "const label=document.getElementById('cloud-verification-label');"
           "const input=document.getElementById('cloud_verification_code');"
           "if(!note||!label||!input)return;"
-          "const tfa=!!body.cloud_tfa_required;"
-          "const required=!!body.cloud_verification_required;"
+          "const stage=cloudSetupStage(body);"
+          "const tfa=stage==='tfa_required'||!!body.cloud_tfa_required;"
+          "const required=cloudStageIsCodeRequired(stage);"
           "label.textContent=tfa?'2FA Code':'Email Code';"
           "input.placeholder=tfa?'Only needed if Bambu requests a 2FA code':'Only needed if Bambu requests an email code';"
           "note.textContent=tfa?'Bambu is currently waiting for a 2FA code.':'Bambu is currently waiting for an email code. The cloud login completes after that step.';"
           "note.classList.toggle('hidden',!required);}";
-  html += "async function updateHealth(){if(healthInFlight)return;healthInFlight=true;try{const response=await fetch('/api/health',{cache:'no-store'});"
-          "if(!response.ok)return;const body=await response.json();if(body.portal_locked){window.location.reload();return;}"
-          "const wifiValue=body.wifi_connected?('Connected - '+(body.wifi_ip||'')):'Not connected';"
-          "setBadge('wifi-badge','Wi-Fi',wifiValue,body.wifi_connected?'ok':'warn');"
-          "document.getElementById('wifi-detail').textContent=wifiValue;"
-          "let cloudValue='Not configured';let cloudState='idle';"
-          "if(body.cloud_connected){cloudValue='Connected';cloudState='ok';}"
-          "else if(body.cloud_verification_required){cloudValue='Code required';cloudState='warn';}"
-          "else if(body.cloud_configured||(trimmedValue('cloud_email')&&valueOf('cloud_password'))){cloudValue='Configured';cloudState='info';}"
-          "setBadge('cloud-badge','Cloud',cloudValue,cloudState);"
-          "const cloudDetail=document.getElementById('cloud-detail');if(cloudDetail){cloudDetail.textContent=body.cloud_detail||'No cloud response yet';}"
-          "applyResolvedSerial(body);"
-          "const sourceMode=body.source_mode||savedConfig.source_mode||'hybrid';"
-          "const sourceValue=sourceMode==='local_only'?'Local only':(sourceMode==='cloud_only'?'Cloud only':'Hybrid (recommended)');"
-          "setBadge('source-badge','Source',sourceValue,'info');"
-          "let localValue='Not configured';let localState='idle';"
-          "if(body.local_connected){localValue='Connected';localState='ok';}"
-          "else if(body.local_error){localValue='Error';localState='warn';}"
-          "else if(body.local_configured){localValue='Configured';localState='info';}"
-          "setBadge('local-badge','Local Path',localValue,localState);"
-          "const localDetail=document.getElementById('local-detail');if(localDetail){localDetail.textContent=body.local_detail||'No local response yet';}"
-          "updateCloudVerification(body);"
-          "if(Date.now()>statusLockUntil){"
-          "if(body.wifi_connected){setStatus(trimmedValue('cloud_email')||body.cloud_connected||body.cloud_verification_required?'Step 2: Connect Bambu Cloud':'Setup ready',body.cloud_detail||('ESP on home network: '+(body.wifi_ip||'')),0);}"
-          "else{setStatus('Step 1: Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}}"
+  html += "async function updateHealth(){if(healthInFlight)return null;healthInFlight=true;try{const response=await fetch('/api/health',{cache:'no-store'});"
+          "if(!response.ok)return null;const body=await response.json();"
+          "if(body&&body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
+          "if(body.portal_locked){window.location.reload();return null;}"
+          "return applyHealthBody(body);}"
           "catch(error){if(Date.now()>statusLockUntil){setStatus('Portal reachable','Live status could not be refreshed right now.',0);}}"
-          "finally{healthInFlight=false;}}";
+          "finally{healthInFlight=false;}return null;}";
   html += "function buildArcPayload(){const payload={};arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(input){payload[id]=input.value;}});return payload;}";
   html += "function buildPayload(){return Object.assign({wifi_ssid:trimmedValue('wifi_ssid'),"
           "wifi_password:valueOf('wifi_password'),"
           "cloud_email:(document.getElementById('cloud_email')?trimmedValue('cloud_email'):savedConfig.cloud_email),"
           "cloud_region:(document.getElementById('cloud_region')?valueOf('cloud_region'):savedConfig.cloud_region||'eu'),"
           "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):''),"
+          "display_rotation:(document.getElementById('display_rotation')?valueOf('display_rotation'):savedConfig.display_rotation)||'0',"
           "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
@@ -1169,6 +1577,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Saving failed','Please review the fields and try again.',8000);saveButton.disabled=false;}}"
           "catch(error){setStatus('Saving failed','The request to the ESP could not be completed.',8000);saveButton.disabled=false;}});";
+  html += "if(displayRotationSelect){displayRotationSelect.addEventListener('change',updateDisplayRotationControls);}";
+  html += "if(displayRotationApplyButton){displayRotationApplyButton.addEventListener('click',async()=>{const display_rotation=valueOf('display_rotation')||'0';"
+          "if(display_rotation===(savedConfig.display_rotation||'0')){updateDisplayRotationControls();return;}"
+          "displayRotationApplyButton.disabled=true;setStatus('Applying screen rotation...','Saving the new panel orientation and restarting the ESP now.',15000);"
+          "try{const response=await fetch('/api/display-rotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_rotation})});"
+          "const body=await response.json().catch(()=>({}));"
+          "if(response.ok){savedConfig.display_rotation=display_rotation;updateDisplayRotationControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
+          "else{setStatus(body.error||'Rotation change failed',body.detail||'The new display rotation could not be saved.',8000);displayRotationApplyButton.disabled=false;updateDisplayRotationControls();}}"
+          "catch(error){setStatus('Rotation change failed','The request to the ESP could not be completed.',8000);displayRotationApplyButton.disabled=false;updateDisplayRotationControls();}});}";
   html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
   html += "if(sourceModeApplyButton){sourceModeApplyButton.addEventListener('click',async()=>{const source_mode=valueOf('source_mode')||'hybrid';"
           "if(source_mode===(savedConfig.source_mode||'hybrid')){updateSourceModeControls();return;}"
@@ -1183,41 +1600,52 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const cloud_password=valueOf('cloud_password');"
           "const source_mode=savedConfig.source_mode||'hybrid';"
           "if(!cloud_email){setStatus('Cloud credentials missing','Enter the Bambu email first.',5000);return;}"
-          "cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
+          "stopCloudFollowup();cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
           "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,cloud_region,source_mode})});"
-          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
+          "const body=await response.json().catch(()=>({}));renderCloudStatus(body);"
+          "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
           "if(response.ok){savedConfig.cloud_email=cloud_email;savedConfig.cloud_region=cloud_region;"
-          "if(body.cloud_connected){setStatus('Cloud connected',body.detail||'Connected to Bambu Cloud.',7000);}"
-          "else if(body.cloud_verification_required){setStatus(body.cloud_tfa_required?'2FA required':'Email code required',body.detail||'Enter the requested code to finish the login.',10000);}"
-          "else{setStatus('Cloud login started',body.detail||'Waiting for cloud response...',7000);}}"
+          "savedConfig.cloud_password_saved=!!cloud_password||savedConfig.cloud_password_saved;"
+          "const stage=cloudSetupStage(body);"
+          "if(body.cloud_connected||cloudSessionLooksReady(body)){setStatus('Cloud connected',body.detail||body.cloud_detail||'Connected to Bambu Cloud.',7000);if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(350);}}"
+          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Email code required',body.detail||body.cloud_detail||'Enter the requested code to finish the login.',10000);}"
+          "else if(stage==='failed'){setStatus('Cloud connect failed',body.detail||body.cloud_detail||'The cloud login did not complete.',8000);}"
+          "else{const detail=body.detail||body.cloud_detail||'Waiting for cloud response...';setStatus(cloudStageStatusLabel(stage),detail,4000);startCloudFollowup(detail,15000);}}"
           "else{setStatus(body.error||'Cloud connect failed',body.detail||'Please review the credentials and try again.',8000);}}"
-          "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{cloudConnectButton.disabled=false;updateHealth();}});}";
+          "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{cloudConnectButton.disabled=false;if(!cloudSuccessReloadScheduled){await forceHealthRefresh();}}});}"; 
   html += "if(localConnectButton){localConnectButton.addEventListener('click',async()=>{const printer_host=trimmedValue('printer_host');"
           "const printer_serial=trimmedValue('printer_serial');"
           "const printer_access_code=trimmedValue('printer_access_code');"
           "const source_mode=savedConfig.source_mode||'hybrid';"
           "if(!printer_host||!printer_serial){setStatus('Local credentials missing','Enter printer host and serial first.',5000);return;}"
-          "localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
+          "stopLocalFollowup();localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
           "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,source_mode})});"
-          "const body=await response.json().catch(()=>({}));"
+          "const body=await response.json().catch(()=>({}));renderLocalStatus(body);"
           "if(response.ok){if(body.local_connected){setStatus('Local path connected',body.detail||'Connected to local Bambu MQTT.',7000);}"
-          "else{setStatus('Local path started',body.detail||'Waiting for local printer response...',7000);}}"
+          "else if(body.local_error){setStatus('Local path error',body.detail||'The local MQTT path returned an error.',8000);}"
+          "else{const detail=body.detail||'Waiting for local printer response...';setStatus('Local path started',detail,4000);startLocalFollowup(detail,12000);}}"
           "else{setStatus(body.error||'Local connect failed',body.detail||'Please review the local printer fields and try again.',8000);}}"
           "catch(error){setStatus('Local request failed','The request to the ESP did not complete successfully.',7000);}finally{localConnectButton.disabled=false;updateHealth();}});}";
   html += "if(verifyButton){verifyButton.addEventListener('click',async()=>{const code=trimmedValue('cloud_verification_code');"
           "if(!code){setStatus('Cloud code missing','Please enter the requested code first.',5000);return;}"
-          "verifyButton.disabled=true;setStatus('Connecting cloud...','Completing the cloud login now.',8000);"
+          "stopCloudFollowup();verifyButton.disabled=true;setStatus('Connecting cloud...','Completing the cloud login now.',8000);"
           "try{const response=await fetch('/api/cloud/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});"
-          "const body=await response.json().catch(()=>({}));updateCloudVerification(body);applyResolvedSerial(body);"
-          "if(response.ok){setStatus('Cloud code accepted',body.detail||'The cloud should connect within a few seconds.',7000);"
+          "const body=await response.json().catch(()=>({}));renderCloudStatus(body);"
+          "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
+          "if(response.ok){"
+          "const stage=cloudSetupStage(body);"
+          "if(body.cloud_connected||cloudSessionLooksReady(body)){setStatus('Cloud connected',body.detail||body.cloud_detail||'Connected to Bambu Cloud.',7000);if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(350);}}"
+          "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Email code required',body.detail||body.cloud_detail||'Please check the code and try again.',8000);}"
+          "else if(stage==='failed'){setStatus('Cloud code was rejected',body.detail||body.cloud_detail||'Please check the code and try again.',7000);}"
+          "else{const detail=body.detail||body.cloud_detail||'The cloud accepted the code and is finishing login now.';setStatus(cloudStageStatusLabel(stage),detail,4000);startCloudFollowup(detail,15000);}"
           "const codeInput=document.getElementById('cloud_verification_code');if(codeInput){codeInput.value='';}}"
           "else{setStatus(body.error||'Cloud code was rejected',body.detail||'Please check the code and try again.',7000);}}"
-          "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{verifyButton.disabled=false;updateHealth();}});}";
+          "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{verifyButton.disabled=false;if(!cloudSuccessReloadScheduled){await forceHealthRefresh();}}});}"; 
   html += "if(wifiSsidSelect){wifiSsidSelect.addEventListener('change',()=>{if(wifiSsidSelect.value){const wifiInput=document.getElementById('wifi_ssid');if(wifiInput){wifiInput.value=wifiSsidSelect.value;}}});}";
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
-  html += "updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}});";
+  html += "updateDisplayRotationControls();updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}stopCloudFollowup();stopLocalFollowup();});";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -1242,7 +1670,7 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
 
   std::string body = "{";
   body += "\"status\":\"ok\",";
-  body += "\"portal\":\"setup\",";
+  body += "\"portal\":\"setup\"";
   append_portal_access_fields(&body, access);
   if (request_authorized) {
     body += ",\"source_mode\":\"";
@@ -1252,7 +1680,7 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
     body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
     body += ",";
     body += "\"wifi_ip\":\"" + json_escape(portal->wifi_manager_.station_ip()) + "\"";
-    const BambuCloudSnapshot cloud = portal->cloud_client_.snapshot();
+    const BambuCloudSnapshot cloud = portal->cloud_client_.refreshed_snapshot();
     const PrinterSnapshot local = portal->printer_client_.snapshot();
     append_cloud_status_fields(&body, cloud);
     append_local_status_fields(&body, local, portal->printer_client_.is_configured());
@@ -1362,17 +1790,24 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   const WifiCredentials wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials cloud = portal->config_store_.load_cloud_credentials();
   const SourceMode source_mode = portal->config_store_.load_source_mode();
+  const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
   const PrinterConnection printer = portal->config_store_.load_printer_config();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
+  const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
+  const std::string effective_printer_serial =
+      !printer.serial.empty() ? printer.serial : cloud_snapshot.resolved_serial;
 
   std::string body = "{";
   body += "\"wifi_ssid\":\"" + json_escape(wifi.ssid) + "\",";
   body += "\"cloud_email\":\"" + json_escape(cloud.email) + "\",";
   body += "\"cloud_region\":\"" + json_escape(to_string(cloud.region)) + "\",";
   body += "\"printer_host\":\"" + json_escape(printer.host) + "\",";
-  body += "\"printer_serial\":\"" + json_escape(printer.serial) + "\",";
+  body += "\"printer_serial\":\"" + json_escape(effective_printer_serial) + "\",";
   body += "\"source_mode\":\"";
   body += to_string(source_mode);
+  body += "\",";
+  body += "\"display_rotation\":\"";
+  body += to_string(display_rotation);
   body += "\",";
   body += "\"state_source\":\"";
   body += to_string(source_mode);
@@ -1381,7 +1816,6 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   body += (portal->wifi_manager_.is_station_connected() ? "true" : "false");
   body += ",";
   body += "\"wifi_ip\":\"" + json_escape(portal->wifi_manager_.station_ip()) + "\"";
-  const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
   const PrinterSnapshot local_snapshot = portal->printer_client_.snapshot();
   append_cloud_status_fields(&body, cloud_snapshot);
   append_local_status_fields(&body, local_snapshot, portal->printer_client_.is_configured());
@@ -1435,6 +1869,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
       .region = parse_cloud_region(trim_copy(read_string_field(root, "cloud_region"))),
   }, stored_cloud);
   const SourceMode source_mode = parse_source_mode_field(root);
+  const DisplayRotation display_rotation = parse_display_rotation_field(root);
 
   const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
@@ -1485,6 +1920,8 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
                       "save cloud failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
                       "save source mode failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(display_rotation), kTag,
+                      "save display rotation failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_arc_color_scheme(arc_colors), kTag,
                       "save arc colors failed");
@@ -1579,6 +2016,37 @@ esp_err_t SetupPortal::handle_source_mode_post(httpd_req_t* request) {
   return ESP_OK;
 }
 
+esp_err_t SetupPortal::handle_display_rotation_post(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const DisplayRotation rotation = parse_display_rotation_field(root);
+  cJSON_Delete(root);
+
+  ESP_LOGI(kTag, "Saving display rotation only: %s", to_string(rotation));
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(rotation), kTag,
+                      "save display rotation failed");
+
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+
+  send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
+  return ESP_OK;
+}
+
 esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
   auto* portal = static_cast<SetupPortal*>(request->user_ctx);
   if (portal == nullptr) {
@@ -1632,18 +2100,31 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
 
   const BambuCloudSnapshot before = portal->cloud_client_.snapshot();
   BambuCloudSnapshot current = before;
-  for (int attempt = 0; attempt < 40; ++attempt) {
+  for (int attempt = 0; attempt < 60; ++attempt) {
     vTaskDelay(pdMS_TO_TICKS(100));
-    current = portal->cloud_client_.snapshot();
-    if (current.connected || current.verification_required || current.detail != before.detail ||
-        current.configured != before.configured) {
+    current = portal->cloud_client_.refreshed_snapshot();
+    if (cloud_connect_result_ready(before, current)) {
       break;
     }
   }
 
+  const bool login_still_pending = cloud_login_still_pending(current);
+  if (current.setup_stage == CloudSetupStage::kFailed) {
+    httpd_resp_set_status(request, "502 Bad Gateway");
+  }
+
   std::string body = "{\"status\":\"";
-  body += current.connected ? "connected"
-                            : (current.verification_required ? "verification_required" : "queued");
+  if (cloud_portal_ready(current)) {
+    body += "connected";
+  } else if (current.verification_required) {
+    body += "verification_required";
+  } else if (current.setup_stage == CloudSetupStage::kFailed) {
+    body += "failed";
+  } else if (login_still_pending) {
+    body += "queued";
+  } else {
+    body += "saved";
+  }
   body += "\",\"detail\":\"";
   body += json_escape(current.detail);
   body += "\"";
@@ -1674,20 +2155,51 @@ esp_err_t SetupPortal::handle_cloud_verify(httpd_req_t* request) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "verification code missing");
   }
 
-  portal->cloud_client_.submit_verification_code(code);
   BambuCloudSnapshot snapshot = portal->cloud_client_.snapshot();
   const std::string previous_detail = snapshot.detail;
+  const std::string previous_resolved_serial = snapshot.resolved_serial;
+  const bool previous_connected = snapshot.connected;
+  const bool previous_session_connected = snapshot.session_connected;
   const bool previous_verification_required = snapshot.verification_required;
-  for (int attempt = 0; attempt < 40; ++attempt) {
+  const bool previous_configured = snapshot.configured;
+  const CloudSetupStage previous_setup_stage = snapshot.setup_stage;
+  BambuCloudSnapshot previous_snapshot;
+  previous_snapshot.configured = previous_configured;
+  previous_snapshot.connected = previous_connected;
+  previous_snapshot.session_connected = previous_session_connected;
+  previous_snapshot.setup_stage = previous_setup_stage;
+  previous_snapshot.detail = previous_detail;
+  previous_snapshot.resolved_serial = previous_resolved_serial;
+  previous_snapshot.verification_required = previous_verification_required;
+
+  portal->cloud_client_.submit_verification_code(code);
+  for (int attempt = 0; attempt < 80; ++attempt) {
     vTaskDelay(pdMS_TO_TICKS(100));
-    snapshot = portal->cloud_client_.snapshot();
-    if (snapshot.connected || snapshot.detail != previous_detail ||
-        snapshot.verification_required != previous_verification_required) {
+    snapshot = portal->cloud_client_.refreshed_snapshot();
+    if (cloud_verify_result_ready(previous_snapshot, snapshot)) {
       break;
     }
   }
 
-  std::string body = "{\"status\":\"accepted\",\"detail\":\"";
+  const bool login_still_pending = cloud_login_still_pending(snapshot);
+  if (snapshot.verification_required) {
+    httpd_resp_set_status(request, "409 Conflict");
+  } else if (snapshot.setup_stage == CloudSetupStage::kFailed ||
+             (!cloud_portal_ready(snapshot) && !login_still_pending)) {
+    httpd_resp_set_status(request, "502 Bad Gateway");
+  }
+
+  std::string body = "{\"status\":\"";
+  if (cloud_portal_ready(snapshot)) {
+    body += "connected";
+  } else if (snapshot.verification_required) {
+    body += "verification_required";
+  } else if (login_still_pending) {
+    body += "queued";
+  } else {
+    body += "failed";
+  }
+  body += "\",\"detail\":\"";
   body += json_escape(snapshot.detail);
   body += "\"";
   append_cloud_status_fields(&body, snapshot);
@@ -1754,18 +2266,35 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
   portal->camera_client_.configure(printer);
 
   PrinterSnapshot current = before;
-  for (int attempt = 0; attempt < 40; ++attempt) {
+  for (int attempt = 0; attempt < 80; ++attempt) {
     vTaskDelay(pdMS_TO_TICKS(100));
     current = portal->printer_client_.snapshot();
     if (current.connection == PrinterConnectionState::kOnline ||
         current.connection == PrinterConnectionState::kError ||
-        current.detail != before.detail || current.stage != before.stage) {
+        current.local_configured != before.local_configured ||
+        current.detail != before.detail || current.stage != before.stage ||
+        current.resolved_serial != before.resolved_serial) {
       break;
     }
   }
 
+  const bool local_pending = current.local_configured &&
+                             current.connection != PrinterConnectionState::kOnline &&
+                             current.connection != PrinterConnectionState::kError;
+  if (current.connection == PrinterConnectionState::kError) {
+    httpd_resp_set_status(request, "502 Bad Gateway");
+  }
+
   std::string body = "{\"status\":\"";
-  body += current.connection == PrinterConnectionState::kOnline ? "connected" : "queued";
+  if (current.connection == PrinterConnectionState::kOnline) {
+    body += "connected";
+  } else if (current.connection == PrinterConnectionState::kError) {
+    body += "error";
+  } else if (local_pending) {
+    body += "queued";
+  } else {
+    body += "saved";
+  }
   body += "\",\"detail\":\"";
   body += json_escape(current.detail);
   body += "\"";

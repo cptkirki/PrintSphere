@@ -19,12 +19,28 @@ struct cJSON;
 
 namespace printsphere {
 
+enum class CloudSetupStage : uint8_t {
+  kIdle,
+  kLoggingIn,
+  kEmailCodeRequired,
+  kTfaRequired,
+  kCodeSubmitted,
+  kBindingPrinter,
+  kConnectingMqtt,
+  kConnected,
+  kFailed,
+};
+
+const char* to_string(CloudSetupStage stage);
+
 struct BambuCloudSnapshot {
   bool configured = false;
   bool connected = false;
+  bool session_connected = false;
   uint64_t last_update_ms = 0;
   PrinterModel model = PrinterModel::kUnknown;
   SourceCapabilities capabilities{};
+  CloudSetupStage setup_stage = CloudSetupStage::kIdle;
   std::string detail = "Cloud login not configured";
   std::string preview_url;
   std::shared_ptr<std::vector<uint8_t>> preview_blob;
@@ -71,6 +87,7 @@ class BambuCloudClient {
     uint64_t live_data_last_update_ms = 0;
     PrinterModel model = PrinterModel::kUnknown;
     SourceCapabilities capabilities{};
+    CloudSetupStage setup_stage = CloudSetupStage::kIdle;
     PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
     float progress_percent = 0.0f;
     float nozzle_temp_c = 0.0f;
@@ -103,9 +120,12 @@ class BambuCloudClient {
   struct CloudRestRuntimeState {
     bool configured = false;
     bool session_ready = false;
+    bool verification_required = false;
+    bool tfa_required = false;
     uint64_t last_update_ms = 0;
     PrinterModel model = PrinterModel::kUnknown;
     SourceCapabilities capabilities{};
+    CloudSetupStage setup_stage = CloudSetupStage::kIdle;
     bool chamber_light_supported = false;
     std::array<char, 96> detail{};
     std::array<char, 24> resolved_serial{};
@@ -121,11 +141,17 @@ class BambuCloudClient {
   void set_fetch_paused(bool paused);
   void set_live_mqtt_enabled(bool enabled) { live_mqtt_enabled_.store(enabled); }
   void set_preview_fetch_enabled(bool enabled);
-  void request_reload_from_store() { reload_requested_.store(true); }
+  void request_reload_from_store() {
+    reload_requested_.store(true);
+    if (task_handle_ != nullptr) {
+      xTaskNotifyGive(task_handle_);
+    }
+  }
   void submit_verification_code(std::string code);
   bool set_chamber_light(bool on);
   esp_err_t start();
   BambuCloudSnapshot snapshot() const;
+  BambuCloudSnapshot refreshed_snapshot();
 
  private:
   enum class AuthMode : uint8_t {
@@ -191,6 +217,10 @@ class BambuCloudClient {
   CloudRestRuntimeState rest_runtime_copy() const;
   void store_rest_runtime(CloudRestRuntimeState runtime, bool notify_task);
   void publish_combined_snapshot();
+  void apply_cloud_session_state(bool configured, bool connected, bool verification_required,
+                                 bool tfa_required, const std::string& detail,
+                                 bool session_ready, bool clear_live_state);
+  void apply_cloud_token_expired_state();
 
   mutable std::mutex mutex_{};
   BambuCloudSnapshot snapshot_{};
