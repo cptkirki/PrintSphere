@@ -17,8 +17,7 @@ Depending on printer model, source mode, and current code support, it can show:
 - cloud cover image and project title
 - local camera snapshots
 - printer error details and HMS information
-
-![20260313_143723](https://github.com/user-attachments/assets/d034439a-e9b4-43c0-ba95-79031c930dcb)
+<img width="576" height="345" alt="image" src="https://github.com/user-attachments/assets/d034439a-e9b4-43c0-ba95-79031c930dcb" />
 
 
 It also supports:
