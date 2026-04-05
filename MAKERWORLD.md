@@ -96,7 +96,7 @@ Additional hardware:
 - Never guess LiPo polarity.
 - cut one wire of (+ or -) 
 - solder the cut wire to the slide switch and add heat-shrink tubing to the switch contacts. 
-  ![20260405_223952](https://github.com/user-attachments/assets/9eb3d04a-818d-43c4-bdc2-1852d4b4e9c8)
+  - <img width="750" height="1000" alt="image" src="https://github.com/user-attachments/assets/9eb3d04a-818d-43c4-bdc2-1852d4b4e9c8" />
 
 ### 4. Prepare The Slide Switch
 
