@@ -9,4 +9,5 @@ esphome-Vorlage/
 release/*
 !release/
 !release/firmware.bin
+!release/firmware-v*.bin
 *.pyc
