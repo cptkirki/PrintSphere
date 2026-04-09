@@ -1993,7 +1993,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"micro\" id=\"ota-status\">Select a .bin file built for PrintSphere (ESP32-S3).</div></div>";
     html += "<hr style=\"border:none;border-top:1px solid var(--line);margin:16px 0 4px\">";
     html += "<div class=\"field\"><label for=\"ota_url\">Or flash from URL</label>";
-    html += "<input type=\"url\" id=\"ota_url\" placeholder=\"https://github.com/cptkirki/PrintSphere/blob/main/release/printsphere_ota-v1.4.bin\" autocomplete=\"off\" spellcheck=\"false\"></div>";
+    html += "<input type=\"url\" id=\"ota_url\" placeholder=\"https://github.com/cptkirki/PrintSphere/blob/main/release/ota/printsphere_ota.bin\" autocomplete=\"off\" spellcheck=\"false\"></div>";
     html += "<p class=\"micro\">GitHub blob links (github.com/&hellip;/blob/&hellip;) are converted to raw download URLs automatically.</p>";
     html += "<div id=\"ota-url-progress-wrap\" style=\"display:none;margin:4px 0;height:8px;border-radius:6px;background:#0e1620;overflow:hidden\">";
     html += "<div id=\"ota-url-progress-bar\" style=\"height:100%;width:0%;background:var(--accent);transition:width .3s;\"></div></div>";

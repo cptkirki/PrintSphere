@@ -17,6 +17,9 @@ release/firmware-v*-fix*.bin
 release/firmware-v*debug*.bin
 release/printsphere_ota-v*-fix*.bin
 release/printsphere_ota-v*debug*.bin
+!release/ota/
+release/ota/*
+!release/ota/printsphere_ota.bin
 !release/debug/
 release/debug/*
 !release/debug/firmware.bin
