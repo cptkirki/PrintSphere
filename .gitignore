@@ -11,10 +11,16 @@ release/*
 !release/
 !release/firmware.bin
 !release/firmware-v*.bin
+!release/printsphere_ota.bin
 !release/printsphere_ota-v*.bin
+release/firmware-v*-fix*.bin
+release/firmware-v*debug*.bin
+release/printsphere_ota-v*-fix*.bin
+release/printsphere_ota-v*debug*.bin
 !release/debug/
 release/debug/*
 !release/debug/firmware.bin
 !release/debug/firmware-v*.bin
+!release/debug/printsphere_ota.bin
 !release/debug/printsphere_ota-v*.bin
 *.pyc
