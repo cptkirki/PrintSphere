@@ -964,7 +964,7 @@ esp_err_t SetupPortal::start() {
   config.server_port = 80;
   config.stack_size = 8192;
   // Leave some headroom for portal endpoints so feature additions do not silently exhaust slots.
-  config.max_uri_handlers = 25;
+  config.max_uri_handlers = 28;
   config.recv_wait_timeout = 30;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
