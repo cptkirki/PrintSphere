@@ -228,7 +228,6 @@ bool printer_model_has_secondary_chamber_light(PrinterModel model) {
 bool printer_model_supports_local_status(PrinterModel model) {
   switch (model) {
     case PrinterModel::kP2S:
-      return false;
     case PrinterModel::kUnknown:
     case PrinterModel::kA1:
     case PrinterModel::kA1Mini:

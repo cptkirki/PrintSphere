@@ -113,6 +113,7 @@ struct PrinterSnapshot {
   std::string setup_ap_password;
   std::string setup_ap_ip;
   uint8_t battery_percent = 0;
+  bool battery_present = false;
   bool charging = false;
   bool usb_present = false;
   float pmu_temp_c = 0.0f;

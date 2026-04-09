@@ -127,6 +127,8 @@ class PrinterClient {
   std::atomic<uint32_t> rebuild_request_tick_{0};
   std::atomic<uint32_t> rebuild_delay_ticks_{0};
   std::atomic<bool> runtime_dirty_{false};
+  uint32_t consecutive_probe_failures_{0};
+  uint32_t consecutive_mqtt_errors_{0};
 };
 
 }  // namespace printsphere

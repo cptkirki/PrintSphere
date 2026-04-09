@@ -1255,6 +1255,7 @@ H	0500020000020005	-	Failed to connect to the internet; please check the network
 H	0500020000020006	-	Streaming function error. Please check the network and try again. You can restart or update the printer if the issue persists.
 H	0500020000020007	-	Liveview service login failed; please check your network connection.
 H	0500020000020008	-	Time synchronization failed
+H	050002000003000A	-	MQTT cloud connection lost (idle). Resolves automatically when a print job is sent.
 H	0500030000010001	-	The MC module is malfunctioning; please restart the device or check device cable connection.
 H	0500030000010002	-	The toolhead is malfunctioning. Please restart the device.
 H	0500030000010003	-	The AMS module is malfunctioning. Please restart the device.
@@ -3530,6 +3531,8 @@ H	0C00030000030007	-	Possible first layer defects have been detected. Please che
 H	0C00030000030008	-	Possible spaghetti defects were detected. Please check the print quality and decide if the job should be stopped.
 H	0C0003000003000B	-	Inspecting the first layer: please wait a moment.
 H	0C0003000003000D	-	Detected that the extruder may not be extruding normally. Please check and decide if printing should be stopped.
+H	0C0003000003000E	-	Your printer seems to be printing without extruding.
+H	0C0003000003000F	-	Your nozzle seems to be covered with jammed or clogged material.
 H	0C00030000030010	-	Your printer seems to be printing without extruding.
 H	0C0003000003001A	-	
 H	0C0003000003001B	-	Possible spaghetti defects were detected. Please check the print quality and decide if the job should be stopped.

@@ -75,7 +75,7 @@ TickType_t hybrid_cloud_fallback_delay(const PrinterSnapshot& local_snapshot,
 
 Application::Application()
     : setup_portal_(config_store_, wifi_manager_, cloud_client_, printer_client_, camera_client_,
-                    ui_) {
+                    ui_, pmu_manager_) {
   cloud_client_.set_config_store(&config_store_);
 }
 
@@ -102,6 +102,7 @@ void Application::run() {
            static_cast<unsigned int>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
   ui_.set_arc_color_scheme(config_store_.load_arc_color_scheme());
   ui_.set_display_rotation(config_store_.load_display_rotation());
+  ui_.set_battery_display_policy(config_store_.load_battery_display_policy());
   ESP_ERROR_CHECK(ui_.initialize());
   if (!initialize_error_lookup_storage()) {
     ESP_LOGW(kTag, "Embedded error lookup unavailable; falling back to generic error text");
@@ -109,7 +110,7 @@ void Application::run() {
 
   const BambuCloudCredentials cloud_credentials = config_store_.load_cloud_credentials();
   source_mode_ = config_store_.load_source_mode();
-  const PrinterConnection printer_connection = config_store_.load_printer_config();
+  const PrinterConnection printer_connection = config_store_.load_active_printer_profile().to_connection();
   cloud_client_.configure(cloud_credentials, printer_connection.serial);
   ESP_ERROR_CHECK(cloud_client_.start());
 
@@ -125,6 +126,34 @@ void Application::run() {
     const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
     if (ui_.consume_portal_unlock_request()) {
       setup_portal_.request_unlock_pin();
+    }
+    const int switch_idx = ui_.consume_printer_switch_request();
+    if (switch_idx >= 0 &&
+        static_cast<uint8_t>(switch_idx) != config_store_.load_active_printer_index()) {
+      config_store_.save_active_printer_index(static_cast<uint8_t>(switch_idx));
+      const PrinterConnection new_conn = config_store_.load_active_printer_profile().to_connection();
+      printer_client_.configure(new_conn);
+      camera_client_.configure(new_conn);
+      cloud_client_.configure(config_store_.load_cloud_credentials(), new_conn.serial);
+      ESP_LOGI(kTag, "Switched active printer to profile %d", switch_idx);
+    }
+    if (ui_.is_config_page_active()) {
+      const auto profiles = config_store_.load_printer_profiles();
+      const uint8_t active_idx = config_store_.load_active_printer_index();
+      const bool local_connected = printer_client_.snapshot().local_connected;
+      std::vector<Ui::PrinterCardInfo> cards;
+      cards.reserve(profiles.size());
+      for (const auto& p : profiles) {
+        Ui::PrinterCardInfo ci;
+        ci.index = p.index;
+        ci.name = p.display_name;
+        ci.model = p.model;
+        ci.host = p.host;
+        ci.active = (p.index == active_idx);
+        ci.connected = ci.active && local_connected;
+        cards.push_back(std::move(ci));
+      }
+      ui_.update_printer_cards(cards);
     }
     const PortalAccessSnapshot portal_access = setup_portal_.access_snapshot();
     const bool wifi_connected = wifi_manager_.is_station_connected();
@@ -342,6 +371,7 @@ void Application::run() {
     const PowerSnapshot power = pmu_manager_.sample();
     if (power.available) {
       snapshot.battery_percent = power.battery_percent;
+      snapshot.battery_present = power.battery_present;
       snapshot.charging = power.charging;
       snapshot.usb_present = power.usb_present;
       snapshot.pmu_temp_c = power.temperature_c;

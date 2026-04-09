@@ -473,8 +473,16 @@ void P1sCameraClient::task_loop() {
     const bool ok = fetch_frame_once(connection);
     last_fetch_us = esp_timer_get_time();
     if (!ok) {
+      ++consecutive_connect_failures_;
+      const uint32_t backoff_ms =
+          consecutive_connect_failures_ <= 1 ? 2000U :
+          consecutive_connect_failures_ <= 2 ? 4000U :
+          consecutive_connect_failures_ <= 4 ? 8000U :
+          consecutive_connect_failures_ <= 6 ? 15000U : 30000U;
       set_status_snapshot(true, enabled_.load(), false, "Camera image failed");
-      vTaskDelay(pdMS_TO_TICKS(1500));
+      vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+    } else {
+      consecutive_connect_failures_ = 0;
     }
   }
 }

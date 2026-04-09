@@ -2,6 +2,7 @@
 
 #pragma once
 #include "esp_lcd_types.h"
+#include "driver/gpio.h"
 
 /* LCD color formats */
 #define ESP_LCD_COLOR_FORMAT_RGB565    (1)
@@ -18,6 +19,7 @@
 /* LCD display definition */
 #define BSP_LCD_H_RES              (466)
 #define BSP_LCD_V_RES              (466)
+#define BSP_LCD_TE_GPIO            (GPIO_NUM_13)  // TE signal: CO5300 → ESP32-S3 GPIO13
 
 #ifdef __cplusplus
 extern "C" {

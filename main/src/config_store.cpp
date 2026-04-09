@@ -195,29 +195,6 @@ bool ConfigStore::load_portal_lock_enabled() const {
   return parse_bool_or_default(load_string("portal_lock"), true);
 }
 
-PrinterConnection ConfigStore::load_printer_config() const {
-  PrinterConnection connection;
-  connection.host = load_string("prn_host");
-  connection.serial = load_string("prn_serial");
-  connection.access_code = load_string("prn_access");
-
-  const std::string mqtt_port = load_string("prn_port");
-  if (!mqtt_port.empty()) {
-    const long parsed = std::strtol(mqtt_port.c_str(), nullptr, 10);
-    if (parsed > 0 && parsed <= 65535) {
-      connection.mqtt_port = static_cast<uint16_t>(parsed);
-    }
-  }
-
-  if (connection.is_ready()) {
-    ESP_LOGI(kTag, "Loaded stored printer config for host %s", connection.host.c_str());
-  } else {
-    ESP_LOGD(kTag, "Stored local printer config incomplete; local path remains optional until configured");
-  }
-
-  return connection;
-}
-
 ArcColorScheme ConfigStore::load_arc_color_scheme() const {
   ArcColorScheme colors;
   colors.printing = parse_color_or_default(load_string("arc_print"), colors.printing);
@@ -234,6 +211,35 @@ ArcColorScheme ConfigStore::load_arc_color_scheme() const {
   colors.offline = parse_color_or_default(load_string("arc_offline"), colors.offline);
   colors.unknown = parse_color_or_default(load_string("arc_unknown"), colors.unknown);
   return colors;
+}
+
+BatteryDisplayPolicy ConfigStore::load_battery_display_policy() const {
+  BatteryDisplayPolicy policy;
+  policy.dim_enabled = parse_bool_or_default(load_string("bat_dim"), true);
+  policy.screen_off_enabled = parse_bool_or_default(load_string("bat_off"), true);
+
+  const std::string pct_str = load_string("bat_dim_pct");
+  if (!pct_str.empty()) {
+    const long parsed = std::strtol(pct_str.c_str(), nullptr, 10);
+    if (parsed >= 0 && parsed <= 100) {
+      policy.dim_brightness_percent = static_cast<int>(parsed);
+    }
+  }
+
+  const auto load_timeout = [&](const char* key, uint32_t default_s) -> uint32_t {
+    const std::string s = load_string(key);
+    if (!s.empty()) {
+      const long v = std::strtol(s.c_str(), nullptr, 10);
+      if (v > 0 && v <= 3600) return static_cast<uint32_t>(v);
+    }
+    return default_s;
+  };
+  policy.dim_timeout_idle_s   = load_timeout("bat_dim_idle", 20);
+  policy.dim_timeout_active_s = load_timeout("bat_dim_act",  30);
+  policy.off_timeout_idle_s   = load_timeout("bat_off_idle", 60);
+  policy.off_timeout_active_s = load_timeout("bat_off_act",  120);
+
+  return policy;
 }
 
 esp_err_t ConfigStore::save_wifi_credentials(const WifiCredentials& credentials) const {
@@ -278,13 +284,6 @@ esp_err_t ConfigStore::save_portal_lock_enabled(bool enabled) const {
   return save_string("portal_lock", enabled ? "1" : "0");
 }
 
-esp_err_t ConfigStore::save_printer_config(const PrinterConnection& connection) const {
-  ESP_RETURN_ON_ERROR(save_string("prn_host", connection.host), kTag, "save host failed");
-  ESP_RETURN_ON_ERROR(save_string("prn_serial", connection.serial), kTag, "save serial failed");
-  ESP_RETURN_ON_ERROR(save_string("prn_access", connection.access_code), kTag, "save access failed");
-  return save_string("prn_port", std::to_string(connection.mqtt_port));
-}
-
 esp_err_t ConfigStore::save_arc_color_scheme(const ArcColorScheme& colors) const {
   ESP_RETURN_ON_ERROR(save_string("arc_print", color_to_html_hex(colors.printing)), kTag,
                       "save printing color failed");
@@ -311,6 +310,22 @@ esp_err_t ConfigStore::save_arc_color_scheme(const ArcColorScheme& colors) const
   ESP_RETURN_ON_ERROR(save_string("arc_offline", color_to_html_hex(colors.offline)), kTag,
                       "save offline color failed");
   return save_string("arc_unknown", color_to_html_hex(colors.unknown));
+}
+
+esp_err_t ConfigStore::save_battery_display_policy(const BatteryDisplayPolicy& policy) const {
+  ESP_RETURN_ON_ERROR(save_string("bat_dim", policy.dim_enabled ? "1" : "0"), kTag,
+                      "save bat_dim failed");
+  ESP_RETURN_ON_ERROR(save_string("bat_dim_pct", std::to_string(policy.dim_brightness_percent)),
+                      kTag, "save bat_dim_pct failed");
+  ESP_RETURN_ON_ERROR(save_string("bat_off", policy.screen_off_enabled ? "1" : "0"), kTag,
+                      "save bat_off failed");
+  ESP_RETURN_ON_ERROR(save_string("bat_dim_idle", std::to_string(policy.dim_timeout_idle_s)),
+                      kTag, "save bat_dim_idle failed");
+  ESP_RETURN_ON_ERROR(save_string("bat_dim_act",  std::to_string(policy.dim_timeout_active_s)),
+                      kTag, "save bat_dim_act failed");
+  ESP_RETURN_ON_ERROR(save_string("bat_off_idle", std::to_string(policy.off_timeout_idle_s)),
+                      kTag, "save bat_off_idle failed");
+  return save_string("bat_off_act",  std::to_string(policy.off_timeout_active_s));
 }
 
 esp_err_t ConfigStore::save_string(const char* key, const std::string& value) const {
@@ -349,6 +364,127 @@ std::string ConfigStore::load_string(const char* key) const {
   }
 
   return std::string(buffer.data());
+}
+
+// ---------------------------------------------------------------------------
+// Multi-printer profile support
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string profile_key(uint8_t index, const char* suffix) {
+  char key[16] = {};
+  std::snprintf(key, sizeof(key), "prn_%u_%s", static_cast<unsigned>(index), suffix);
+  return key;
+}
+}  // namespace
+
+uint8_t ConfigStore::load_printer_profile_count() const {
+  const std::string count_str = load_string("prn_count");
+  if (count_str.empty()) return 0;
+  const long parsed = std::strtol(count_str.c_str(), nullptr, 10);
+  return (parsed >= 0 && parsed <= kMaxPrinterProfiles) ? static_cast<uint8_t>(parsed) : 0;
+}
+
+uint8_t ConfigStore::load_active_printer_index() const {
+  const std::string idx_str = load_string("prn_active");
+  if (idx_str.empty()) return 0;
+  const long parsed = std::strtol(idx_str.c_str(), nullptr, 10);
+  return (parsed >= 0 && parsed < kMaxPrinterProfiles) ? static_cast<uint8_t>(parsed) : 0;
+}
+
+esp_err_t ConfigStore::save_active_printer_index(uint8_t index) const {
+  return save_string("prn_active", std::to_string(index));
+}
+
+std::vector<PrinterProfile> ConfigStore::load_printer_profiles() const {
+  const uint8_t count = load_printer_profile_count();
+  std::vector<PrinterProfile> profiles;
+  profiles.reserve(count);
+  for (uint8_t i = 0; i < count; ++i) {
+    PrinterProfile p;
+    p.index = i;
+    p.serial = load_string(profile_key(i, "ser").c_str());
+    p.host = load_string(profile_key(i, "host").c_str());
+    p.access_code = load_string(profile_key(i, "acc").c_str());
+    p.display_name = load_string(profile_key(i, "name").c_str());
+    p.model = load_string(profile_key(i, "mdl").c_str());
+    p.cloud_bound = load_string(profile_key(i, "cld").c_str()) == "1";
+    if (!p.serial.empty() || !p.host.empty()) {
+      profiles.push_back(std::move(p));
+    }
+  }
+  return profiles;
+}
+
+esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const {
+  const uint8_t idx = profile.index;
+  if (idx >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
+
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "ser").c_str(), profile.serial), kTag,
+                      "save profile serial");
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "host").c_str(), profile.host), kTag,
+                      "save profile host");
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "acc").c_str(), profile.access_code), kTag,
+                      "save profile access");
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "name").c_str(), profile.display_name), kTag,
+                      "save profile name");
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "mdl").c_str(), profile.model), kTag,
+                      "save profile model");
+  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "cld").c_str(), profile.cloud_bound ? "1" : "0"), kTag,
+                      "save profile cloud_bound");
+
+  const uint8_t count = load_printer_profile_count();
+  if (idx >= count) {
+    ESP_RETURN_ON_ERROR(save_string("prn_count", std::to_string(idx + 1)), kTag,
+                        "save profile count");
+  }
+  return ESP_OK;
+}
+
+esp_err_t ConfigStore::delete_printer_profile(uint8_t index) const {
+  if (index >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
+  const uint8_t count = load_printer_profile_count();
+  if (index >= count) return ESP_ERR_NOT_FOUND;
+
+  // Shift all profiles above index down by one
+  for (uint8_t i = index; i + 1 < count; ++i) {
+    PrinterProfile next;
+    next.index = i;
+    next.serial = load_string(profile_key(i + 1, "ser").c_str());
+    next.host = load_string(profile_key(i + 1, "host").c_str());
+    next.access_code = load_string(profile_key(i + 1, "acc").c_str());
+    next.display_name = load_string(profile_key(i + 1, "name").c_str());
+    next.model = load_string(profile_key(i + 1, "mdl").c_str());
+    next.cloud_bound = load_string(profile_key(i + 1, "cld").c_str()) == "1";
+    save_printer_profile(next);
+  }
+  // Clear the last slot
+  const uint8_t last = count - 1;
+  save_string(profile_key(last, "ser").c_str(), "");
+  save_string(profile_key(last, "host").c_str(), "");
+  save_string(profile_key(last, "acc").c_str(), "");
+  save_string(profile_key(last, "name").c_str(), "");
+  save_string(profile_key(last, "mdl").c_str(), "");
+  save_string(profile_key(last, "cld").c_str(), "");
+  save_string("prn_count", std::to_string(count - 1));
+
+  // Adjust active index if needed
+  const uint8_t active = load_active_printer_index();
+  if (active == index) {
+    save_active_printer_index(0);
+  } else if (active > index && active > 0) {
+    save_active_printer_index(active - 1);
+  }
+  return ESP_OK;
+}
+
+PrinterProfile ConfigStore::load_active_printer_profile() const {
+  const uint8_t active = load_active_printer_index();
+  const auto profiles = load_printer_profiles();
+  for (const auto& p : profiles) {
+    if (p.index == active) return p;
+  }
+  return PrinterProfile{};
 }
 
 }  // namespace printsphere

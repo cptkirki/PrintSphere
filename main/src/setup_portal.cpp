@@ -9,7 +9,10 @@
 
 #include "cJSON.h"
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
+#include "esp_https_ota.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -31,6 +34,8 @@ constexpr size_t kMaxRequestBody = 4096;
 constexpr char kPortalSessionCookieName[] = "printsphere_portal_session";
 constexpr uint64_t kPortalPinLifetimeMs = 2ULL * 60ULL * 1000ULL;
 constexpr uint64_t kPortalSessionLifetimeMs = 10ULL * 60ULL * 1000ULL;
+constexpr uint64_t kPortalSessionExtendMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint64_t kPortalProvisioningGraceMs = 5ULL * 60ULL * 1000ULL;
 constexpr char kPortalReleaseVersion[] = PRINTSPHERE_RELEASE_VERSION;
 constexpr char kFaviconSvg[] =
     "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">"
@@ -345,6 +350,14 @@ void append_portal_access_fields(std::string* body, const PortalAccessSnapshot& 
   *body += ",\"portal_session_remaining_s\":";
   *body += std::to_string(access.session_remaining_s);
   *body += ",\"portal_detail\":\"" + json_escape(access.detail) + "\"";
+  *body += ",\"portal_open_remaining_s\":";
+  if (access.grace_remaining_s > 0) {
+    *body += std::to_string(access.grace_remaining_s);
+  } else if (access.session_active && access.session_remaining_s > 0) {
+    *body += std::to_string(access.session_remaining_s);
+  } else {
+    *body += "0";
+  }
 }
 
 void send_json(httpd_req_t* request, const std::string& body) {
@@ -759,6 +772,13 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
       snapshot.detail = "Web Config is open while the setup access point is active.";
     } else if (!wifi_manager_.is_station_connected()) {
       snapshot.detail = "Web Config is open while PrintSphere is waiting for Wi-Fi credentials.";
+    } else if (provisioning_grace_expiry_ms_ != 0 && current_ms < provisioning_grace_expiry_ms_) {
+      const uint32_t grace_remaining_s =
+          static_cast<uint32_t>((provisioning_grace_expiry_ms_ - current_ms) / 1000ULL);
+      snapshot.grace_remaining_s = grace_remaining_s;
+      snapshot.detail = "Web Config is open for " +
+                        duration_text(std::max<uint32_t>(grace_remaining_s, 1U)) +
+                        " after initial setup. Finish your configuration now.";
     } else {
       switch (config_store_.load_source_mode()) {
         case SourceMode::kCloudOnly:
@@ -851,7 +871,22 @@ bool SetupPortal::is_lock_required() const {
     return false;
   }
 
-  return is_provisioning_complete();
+  if (!is_provisioning_complete()) {
+    return false;
+  }
+
+  // Grace period: keep portal open for a few minutes after first provisioning
+  const uint64_t current_ms = now_ms();
+  if (provisioning_grace_expiry_ms_ == 0) {
+    provisioning_grace_expiry_ms_ = current_ms + kPortalProvisioningGraceMs;
+    ESP_LOGI(kTag, "Provisioning complete — portal grace period active for %u s",
+             static_cast<unsigned>(kPortalProvisioningGraceMs / 1000ULL));
+  }
+  if (current_ms < provisioning_grace_expiry_ms_) {
+    return false;
+  }
+
+  return true;
 }
 
 bool SetupPortal::is_lock_enabled() const { return config_store_.load_portal_lock_enabled(); }
@@ -928,7 +963,8 @@ esp_err_t SetupPortal::start() {
   config.server_port = 80;
   config.stack_size = 8192;
   // Leave some headroom for portal endpoints so feature additions do not silently exhaust slots.
-  config.max_uri_handlers = 20;
+  config.max_uri_handlers = 25;
+  config.recv_wait_timeout = 30;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
 
@@ -1019,6 +1055,14 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &display_rotation_uri), kTag,
                       "display rotation handler failed");
 
+  httpd_uri_t battery_display_uri = {};
+  battery_display_uri.uri = "/api/battery-display";
+  battery_display_uri.method = HTTP_POST;
+  battery_display_uri.handler = &SetupPortal::handle_battery_display_post;
+  battery_display_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &battery_display_uri), kTag,
+                      "battery display handler failed");
+
   httpd_uri_t portal_access_uri = {};
   portal_access_uri.uri = "/api/portal-access";
   portal_access_uri.method = HTTP_POST;
@@ -1051,6 +1095,78 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &local_connect_uri), kTag,
                       "local connect handler failed");
 
+  httpd_uri_t printers_get_uri = {};
+  printers_get_uri.uri = "/api/printers";
+  printers_get_uri.method = HTTP_GET;
+  printers_get_uri.handler = &SetupPortal::handle_printers_get;
+  printers_get_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &printers_get_uri), kTag,
+                      "printers get handler failed");
+
+  httpd_uri_t printers_select_uri = {};
+  printers_select_uri.uri = "/api/printers/select";
+  printers_select_uri.method = HTTP_POST;
+  printers_select_uri.handler = &SetupPortal::handle_printers_select;
+  printers_select_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &printers_select_uri), kTag,
+                      "printers select handler failed");
+
+  httpd_uri_t printers_save_uri = {};
+  printers_save_uri.uri = "/api/printers/save";
+  printers_save_uri.method = HTTP_POST;
+  printers_save_uri.handler = &SetupPortal::handle_printers_save;
+  printers_save_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &printers_save_uri), kTag,
+                      "printers save handler failed");
+
+  httpd_uri_t printers_delete_uri = {};
+  printers_delete_uri.uri = "/api/printers/delete";
+  printers_delete_uri.method = HTTP_POST;
+  printers_delete_uri.handler = &SetupPortal::handle_printers_delete;
+  printers_delete_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &printers_delete_uri), kTag,
+                      "printers delete handler failed");
+
+  httpd_uri_t printers_clear_local_uri = {};
+  printers_clear_local_uri.uri = "/api/printers/clear-local";
+  printers_clear_local_uri.method = HTTP_POST;
+  printers_clear_local_uri.handler = &SetupPortal::handle_printers_clear_local;
+  printers_clear_local_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &printers_clear_local_uri), kTag,
+                      "printers clear-local handler failed");
+
+  httpd_uri_t session_extend_uri = {};
+  session_extend_uri.uri = "/api/session/extend";
+  session_extend_uri.method = HTTP_POST;
+  session_extend_uri.handler = &SetupPortal::handle_session_extend;
+  session_extend_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &session_extend_uri), kTag,
+                      "session extend handler failed");
+
+  httpd_uri_t ota_upload_uri = {};
+  ota_upload_uri.uri = "/api/ota/upload";
+  ota_upload_uri.method = HTTP_POST;
+  ota_upload_uri.handler = &SetupPortal::handle_ota_upload;
+  ota_upload_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ota_upload_uri), kTag,
+                      "ota upload handler failed");
+
+  httpd_uri_t ota_url_uri = {};
+  ota_url_uri.uri = "/api/ota/url";
+  ota_url_uri.method = HTTP_POST;
+  ota_url_uri.handler = &SetupPortal::handle_ota_url;
+  ota_url_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ota_url_uri), kTag,
+                      "ota url handler failed");
+
+  httpd_uri_t ota_status_uri = {};
+  ota_status_uri.uri = "/api/ota/status";
+  ota_status_uri.method = HTTP_GET;
+  ota_status_uri.handler = &SetupPortal::handle_ota_status;
+  ota_status_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ota_status_uri), kTag,
+                      "ota status handler failed");
+
   ESP_LOGI(kTag, "Setup portal started");
   return ESP_OK;
 }
@@ -1069,14 +1185,26 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const SourceMode source_mode = portal->config_store_.load_source_mode();
   const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
   const bool portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
-  const PrinterConnection printer = portal->config_store_.load_printer_config();
+  const PrinterProfile active_profile = portal->config_store_.load_active_printer_profile();
+  const PrinterConnection printer = active_profile.to_connection();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const CloudPortalPresentation cloud_portal =
       cloud_portal_presentation(portal->cloud_client_.refreshed_snapshot());
   const BambuCloudSnapshot& cloud_snapshot = cloud_portal.snapshot;
   const PrinterSnapshot local_snapshot = portal->printer_client_.snapshot();
-  const std::string effective_printer_serial =
-      !printer.serial.empty() ? printer.serial : cloud_snapshot.resolved_serial;
+  const auto all_cloud_devices = portal->cloud_client_.get_cloud_devices();
+  const auto all_profiles = portal->config_store_.load_printer_profiles();
+  const std::string effective_printer_serial = [&]() -> std::string {
+    if (!printer.serial.empty()) return printer.serial;
+    for (const auto& cd : all_cloud_devices) {
+      bool has_local = false;
+      for (const auto& p : all_profiles) {
+        if (p.serial == cd.serial && p.has_local_config()) { has_local = true; break; }
+      }
+      if (!has_local) return cd.serial;
+    }
+    return cloud_snapshot.resolved_serial;
+  }();
   const bool wifi_connected = portal->wifi_manager_.is_station_connected();
   const bool setup_ap_active = portal->wifi_manager_.is_setup_access_point_active();
   const bool wifi_configured = wifi.is_configured();
@@ -1177,7 +1305,24 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       cloud_snapshot.tfa_required || cloud_snapshot.setup_stage == CloudSetupStage::kFailed;
   const bool local_section_open =
       !local_configured || local_snapshot.connection == PrinterConnectionState::kError;
+  const bool has_cloud_without_local = [&]() {
+    for (const auto& cd : all_cloud_devices) {
+      bool found_local = false;
+      for (const auto& p : all_profiles) {
+        if (p.serial == cd.serial && p.has_local_config()) { found_local = true; break; }
+      }
+      if (!found_local) return true;
+    }
+    return false;
+  }();
+  const bool local_needs_setup = !local_configured || has_cloud_without_local;
   const bool arc_section_open = false;
+  const BatteryDisplayPolicy bat_policy = portal->config_store_.load_battery_display_policy();
+  const std::string bat_badge_value =
+      bat_policy.dim_enabled || bat_policy.screen_off_enabled ? "Active" : "Disabled";
+  const char* bat_badge_class =
+      bat_policy.dim_enabled || bat_policy.screen_off_enabled ? "info" : "idle";
+  const PowerSnapshot power = portal->pmu_manager_.sample();
   std::string html;
 
   const auto add_badge = [](std::string* html, const char* id, const std::string& label,
@@ -1242,16 +1387,19 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "border-radius:24px;box-shadow:0 14px 32px rgba(0,0,0,.2);} .hero{padding:24px;display:grid;gap:18px;}"
           ".section{padding:0;overflow:hidden;} .section-body{padding:0 22px 22px;display:grid;gap:16px;}"
           ".footer-card{padding:18px;display:grid;gap:8px;} .stack{display:grid;gap:18px;}";
-  html += ".hero-top{display:grid;gap:10px;} .hero-brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}"
+  html += ".hero-top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;} .hero-brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}"
           " .eyebrow{font-size:18px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;"
           "color:#b9d4ef;} .hero-version{display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;"
           "border-radius:999px;border:1px solid #31557d;background:#111b29;color:#dceafa;font-size:12px;font-weight:700;"
           "letter-spacing:.08em;text-transform:uppercase;text-decoration:none;transition:border-color .18s ease,background .18s ease,color .18s ease;}"
           " .hero-version:hover{border-color:#4d86c7;background:#142235;color:#f8fbff;} .title{font-size:34px;line-height:1.05;} .subtitle{max-width:720px;color:var(--muted);"
-          "line-height:1.55;} .section-head{display:grid;gap:6px;} .section-head p,.hint,.micro{color:var(--muted);"
-          "line-height:1.5;} .micro{font-size:13px;} .section-summary{display:flex;gap:14px;align-items:flex-start;"
-          "justify-content:space-between;padding:22px;cursor:pointer;list-style:none;} .section-summary::-webkit-details-marker{display:none;}"
-          ".section-summary-main{flex:1 1 auto;} .section-summary-side{display:flex;align-items:center;gap:10px;flex:0 0 auto;}"
+          "line-height:1.55;} .section-head p,.hint,.micro{color:var(--muted);"
+          "line-height:1.5;} .micro{font-size:13px;} .section-summary{display:grid;grid-template-columns:1fr auto;"
+          "gap:6px 14px;align-items:center;padding:22px;cursor:pointer;list-style:none;} .section-summary::-webkit-details-marker{display:none;}"
+          ".section-summary-main{display:contents;}"
+          " .section-summary h2{grid-column:1;grid-row:1;margin:0;}"
+          " .section-summary p{grid-column:1/-1;grid-row:2;margin:0;}"
+          " .section-summary-side{grid-column:2;grid-row:1;display:flex;align-items:center;gap:10px;}"
           ".summary-pill{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border-radius:999px;"
           "border:1px solid var(--line);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;"
           "background:#0f1721;color:var(--text);white-space:nowrap;} .summary-pill.ok{border-color:#22614c;background:#10231d;}"
@@ -1274,6 +1422,23 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           ".color-grid input{min-height:54px;padding:6px 10px;background:#0c131b;}";
   html += ".status-line{font-size:16px;font-weight:700;} .status-detail{color:var(--muted);}"
           ".hidden{display:none !important;}";
+  html += ".printer-card{padding:16px 18px;border-radius:18px;border:1px solid var(--line);background:#0f1721;"
+          "display:grid;gap:10px;margin-bottom:12px;transition:border-color .2s,box-shadow .2s;}"
+          ".printer-card.active{border-color:#22614c;box-shadow:0 0 12px rgba(66,194,145,.15);}"
+          ".printer-card.cloud-only{border-style:dashed;}"
+          ".printer-name-input{background:transparent;border:1px solid var(--line);border-radius:8px;"
+          "color:#fff;font-weight:700;font-size:1em;padding:4px 8px;flex:1;min-width:0;}"
+          ".printer-name-input:focus{outline:none;border-color:#42c291;}"
+          "#portal-timer{display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;"
+          "border-radius:999px;border:1px solid #7d6222;background:#241c0e;color:#f0a64b;font-size:12px;font-weight:700;"
+          "letter-spacing:.08em;white-space:nowrap;cursor:pointer;transition:border-color .18s ease,background .18s ease;}"
+          "#portal-timer:hover{border-color:#f0a64b;background:#352a12;}"
+          ".printer-card-header{display:flex;align-items:center;justify-content:space-between;gap:10px;}"
+          ".printer-card-body{display:flex;flex-wrap:wrap;gap:8px;}"
+          ".printer-tag{display:inline-flex;padding:4px 10px;border-radius:999px;border:1px solid var(--line);"
+          "font-size:12px;font-weight:600;color:var(--muted);background:#121a23;}"
+          ".printer-tag.ok{border-color:#22614c;color:#42c291;}"
+          ".printer-card-actions{display:flex;gap:8px;flex-wrap:wrap;}";
   html += "@media(max-width:840px){.badge-grid,.color-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}";
   html += "@media(max-width:640px){body{padding:16px;} .title{font-size:28px;} .badge-grid,.grid-2,.grid-3,.color-grid"
           "{grid-template-columns:1fr;} .hero,.footer-card{padding:18px;} .hero-brand{gap:10px;} .eyebrow{font-size:16px;}"
@@ -1296,7 +1461,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<section class=\"hero\">";
   html += "<div class=\"hero-top\"><div class=\"hero-brand\"><div class=\"eyebrow\">PrintSphere</div><a class=\"hero-version\" href=\"https://github.com/cptkirki/PrintSphere\" target=\"_blank\" rel=\"noopener noreferrer\">";
   html += json_escape(kPortalReleaseVersion);
-  html += "</a></div>";
+  html += "</a></div><div id=\"portal-timer\" style=\"display:none\" title=\"Click to extend session by 5 minutes\"></div></div>";
   html += "<h1 class=\"title\">Web Config</h1>";
   html += "<p class=\"subtitle\">";
   html += show_connection_steps
@@ -1318,121 +1483,27 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "</div>";
   html += "</section>";
 
-  html += "<form id=\"config-form\" class=\"stack\">";
-
-  begin_collapsible_section(
-      "Wi-Fi",
-      "This network is used for cloud access, local printer access and the setup portal after first boot.",
-      wifi_section_badge_value, wifi_section_badge_class, wifi_section_open);
-  html += "<div class=\"grid-2\">";
-  html += "<div class=\"field\"><label for=\"wifi_ssid\">Wi-Fi SSID</label><input id=\"wifi_ssid\" value=\"";
-  html += json_escape(wifi.ssid);
-  html += "\" autocomplete=\"off\"></div>";
-  html += "<div class=\"field\"><label for=\"wifi_password\">Wi-Fi Password</label><input id=\"wifi_password\" type=\"password\" value=\"\" placeholder=\"";
-  html += json_escape(wifi_password_placeholder);
-  html += "\" autocomplete=\"off\"></div>";
-  html += "</div>";
-  html += "<div class=\"grid-2\">";
-  html += "<div class=\"field\"><label for=\"wifi_ssid_select\">Detected Networks</label><select id=\"wifi_ssid_select\"><option value=\"\">Select detected Wi-Fi...</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"wifi-scan-button\">Scan Networks</button>";
-  html += "<div class=\"micro\" id=\"wifi-scan-detail\">Pick a detected SSID or type one manually for hidden networks.</div></div>";
-  html += "</div>";
-  html += "<p class=\"micro\">Current network status: <span id=\"wifi-detail\">";
-  html += json_escape(wifi_badge_value);
-  html += "</span></p>";
-  end_collapsible_section();
-
-  if (show_connection_steps) {
-    html += "<div class=\"grid-2\">";
-  }
-
-  begin_collapsible_section(
-      "Screen Rotation",
-      "Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.",
-      rotation_section_badge_value, "info", rotation_section_open);
-  html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
-  html += "<option value=\"0\"";
-  if (display_rotation == DisplayRotation::k0) {
-    html += " selected";
-  }
-  html += ">0 deg (default)</option>";
-  html += "<option value=\"90\"";
-  if (display_rotation == DisplayRotation::k90) {
-    html += " selected";
-  }
-  html += ">90 deg</option>";
-  html += "<option value=\"180\"";
-  if (display_rotation == DisplayRotation::k180) {
-    html += " selected";
-  }
-  html += ">180 deg</option>";
-  html += "<option value=\"270\"";
-  if (display_rotation == DisplayRotation::k270) {
-    html += " selected";
-  }
-  html += ">270 deg</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
-  html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
-  html += "<p class=\"micro\">Current orientation: ";
-  html += json_escape(display_rotation_badge_value(display_rotation));
-  html += "</p>";
-  end_collapsible_section();
-
-  if (show_connection_steps) {
+  // --- Reorderable provisioning section renderers ---
+  const auto render_wifi_section = [&]() {
     begin_collapsible_section(
-        "Connection Mode",
-        "This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.",
-        source_badge_value, "info", connection_mode_section_open);
-    html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
-    html += "<option value=\"hybrid\"";
-    if (source_mode == SourceMode::kHybrid) {
-      html += " selected";
-    }
-    html += ">Hybrid (recommended): auto-pick the best status path for your printer, keep local camera when available</option>";
-    html += "<option value=\"cloud_only\"";
-    if (source_mode == SourceMode::kCloudOnly) {
-      html += " selected";
-    }
-    html += ">Cloud only: cloud monitoring and preview, local MQTT/camera disabled</option>";
-    html += "<option value=\"local_only\"";
-    if (source_mode == SourceMode::kLocalOnly) {
-      html += " selected";
-    }
-    html += ">Local only</option></select></div>";
-    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
-    html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
+        "Wi-Fi",
+        "This network is used for cloud access, local printer access and the setup portal after first boot.",
+        wifi_section_badge_value, wifi_section_badge_class, wifi_section_open);
+    html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"wifi-scan-button\">Scan Networks</button>";
+    html += "<div class=\"micro\" id=\"wifi-scan-detail\">Scan for visible networks or type an SSID manually.</div></div>";
+    html += "<div class=\"field\" id=\"wifi-ssid-manual-field\"><label for=\"wifi_ssid\">Wi-Fi SSID</label><input id=\"wifi_ssid\" value=\"";
+    html += json_escape(wifi.ssid);
+    html += "\" autocomplete=\"off\"></div>";
+    html += "<div class=\"field\" id=\"wifi-ssid-scan-field\" style=\"display:none\"><label for=\"wifi_ssid_select\">Detected Networks</label><select id=\"wifi_ssid_select\"><option value=\"\">Select detected Wi-Fi...</option></select></div>";
+    html += "<div class=\"field\"><label for=\"wifi_password\">Wi-Fi Password</label><input id=\"wifi_password\" type=\"password\" value=\"\" placeholder=\"";
+    html += json_escape(wifi_password_placeholder);
+    html += "\" autocomplete=\"off\"></div>";
+    html += "<p class=\"micro\">Current network status: <span id=\"wifi-detail\">";
+    html += json_escape(wifi_badge_value);
+    html += "</span></p>";
     end_collapsible_section();
-    html += "</div>";
-  }
-
-  begin_collapsible_section(
-      "Portal Access",
-      "Controls whether the setup portal requires a 6-digit PIN on your home network after provisioning is complete.",
-      portal_lock_badge_value, portal_lock_badge_class, portal_access_section_open);
-  html += "<div class=\"field\"><label for=\"portal_lock_enabled\">Portal Lock</label><select id=\"portal_lock_enabled\">";
-  html += "<option value=\"true\"";
-  if (portal_lock_enabled) {
-    html += " selected";
-  }
-  html += ">Enabled: require PIN unlock on the home network</option>";
-  html += "<option value=\"false\"";
-  if (!portal_lock_enabled) {
-    html += " selected";
-  }
-  html += ">Disabled: keep the portal open on the home network</option></select></div>";
-  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"portal-access-apply-button\">Apply + Restart</button>";
-  html += "<div class=\"micro hidden\" id=\"portal-access-apply-hint\">Portal access changes apply after the ESP restarts so the new lock mode is active immediately.</div></div>";
-  html += "<div class=\"hint-box\"><strong>Security:</strong> ";
-  html += setup_ap_active
-              ? "The portal always stays open while the setup access point is active."
-              : (portal_lock_enabled
-                     ? "Long-press on the device display to show a temporary 6-digit unlock PIN whenever you need browser access."
-                     : "With the PIN lock disabled, anyone on the same home network can open Web Config without the device-generated PIN.");
-  html += "</div>";
-  html += "<p class=\"micro\">The lock never applies while PrintSphere is still in setup AP mode.</p>";
-  end_collapsible_section();
-
-  if (show_connection_steps) {
+  };
+  const auto render_cloud_section = [&]() {
     begin_collapsible_section(
         "Bambu Cloud",
         "Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.",
@@ -1482,9 +1553,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += json_escape(cloud_code_note);
     html += "</p>";
     end_collapsible_section();
-  }
-
-  if (show_connection_steps) {
+  };
+  const auto render_local_section = [&]() {
     begin_collapsible_section(
         "Local Printer Path",
         "The local MQTT path provides live status, layers, temperatures and also powers camera snapshots on page 3.",
@@ -1507,6 +1577,381 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"micro\">This saves the local printer credentials immediately. In Hybrid and Local only it also reconnects MQTT and camera without rebooting.</div></div>";
     html += "<p class=\"micro\">In Hybrid mode PrintSphere auto-picks the better status path for your printer and still uses the local camera when available.</p>";
     end_collapsible_section();
+  };
+
+  html += "<form id=\"config-form\" class=\"stack\">";
+
+  // Unconfigured provisioning sections at top
+  if (!wifi_configured) {
+    render_wifi_section();
+  }
+  if (show_connection_steps && !cloud_section_configured) {
+    render_cloud_section();
+  }
+  if (show_connection_steps && local_needs_setup) {
+    render_local_section();
+  }
+
+  if (show_connection_steps) {
+    html += "<div class=\"grid-2\">";
+  }
+
+  if (wifi_configured) {
+  begin_collapsible_section(
+      "Screen Rotation",
+      "Uses the board's hardware display rotation and keeps touch aligned with it. Changing it restarts the ESP.",
+      rotation_section_badge_value, "info", rotation_section_open);
+  html += "<div class=\"field\"><label for=\"display_rotation\">Screen Rotation</label><select id=\"display_rotation\">";
+  html += "<option value=\"0\"";
+  if (display_rotation == DisplayRotation::k0) {
+    html += " selected";
+  }
+  html += ">0 deg (default)</option>";
+  html += "<option value=\"90\"";
+  if (display_rotation == DisplayRotation::k90) {
+    html += " selected";
+  }
+  html += ">90 deg</option>";
+  html += "<option value=\"180\"";
+  if (display_rotation == DisplayRotation::k180) {
+    html += " selected";
+  }
+  html += ">180 deg</option>";
+  html += "<option value=\"270\"";
+  if (display_rotation == DisplayRotation::k270) {
+    html += " selected";
+  }
+  html += ">270 deg</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
+  html += "<p class=\"micro\">Current orientation: ";
+  html += json_escape(display_rotation_badge_value(display_rotation));
+  html += "</p>";
+  end_collapsible_section();
+
+  begin_collapsible_section(
+      "Energy",
+      "Controls display power during battery operation. Touch always wakes the display. Changes apply after restart.",
+      bat_badge_value, bat_badge_class, false);
+
+  // Dim on/off
+  html += "<div class=\"field\"><label for=\"bat_dim_enabled\">Dim Display on Battery</label><select id=\"bat_dim_enabled\">";
+  html += "<option value=\"true\"";
+  if (bat_policy.dim_enabled) html += " selected";
+  html += ">Yes: reduce brightness after idle timeout</option>";
+  html += "<option value=\"false\"";
+  if (!bat_policy.dim_enabled) html += " selected";
+  html += ">No: keep display at full brightness</option></select></div>";
+
+  // Dim options group (brightness + timeouts), hidden when dim disabled
+  html += "<div id=\"bat-dim-options-group\"";
+  if (!bat_policy.dim_enabled) html += " style=\"display:none\"";
+  html += ">";
+  html += "<div class=\"field\"><label for=\"bat_dim_brightness\">Dim Brightness (%)</label><select id=\"bat_dim_brightness\">";
+  html += "<option value=\"0\"";
+  if (bat_policy.dim_brightness_percent == 0) html += " selected";
+  html += ">Auto (~33% of current brightness)</option>";
+  {
+    const int steps[] = {5, 10, 15, 20, 25, 30, 40, 50};
+    for (int step : steps) {
+      html += "<option value=\"";
+      html += std::to_string(step);
+      html += "\"";
+      if (bat_policy.dim_brightness_percent == step) html += " selected";
+      html += ">";
+      html += std::to_string(step);
+      html += "%</option>";
+    }
+  }
+  html += "</select></div>";
+  html += "<div class=\"field\"><label for=\"bat_dim_timeout_idle\">Dim after (idle)</label><select id=\"bat_dim_timeout_idle\">";
+  {
+    const uint32_t vals[] = {5, 10, 15, 20, 30, 45, 60};
+    for (uint32_t v : vals) {
+      html += "<option value=\"";
+      html += std::to_string(v);
+      html += "\"";
+      if (bat_policy.dim_timeout_idle_s == v) html += " selected";
+      html += ">";
+      html += (v < 60 ? std::to_string(v) + " s" : std::to_string(v / 60) + " min");
+      html += "</option>";
+    }
+  }
+  html += "</select></div>";
+  html += "<div class=\"field\"><label for=\"bat_dim_timeout_active\">Dim after (during print)</label><select id=\"bat_dim_timeout_active\">";
+  {
+    const uint32_t vals[] = {15, 20, 30, 45, 60, 90};
+    for (uint32_t v : vals) {
+      html += "<option value=\"";
+      html += std::to_string(v);
+      html += "\"";
+      if (bat_policy.dim_timeout_active_s == v) html += " selected";
+      html += ">";
+      html += (v < 60 ? std::to_string(v) + " s" : std::to_string(v / 60) + " min");
+      html += "</option>";
+    }
+  }
+  html += "</select></div>";
+  html += "</div>"; // bat-dim-options-group
+
+  // Screen off on/off
+  html += "<div class=\"field\"><label for=\"bat_off_enabled\">Turn Off Display on Battery</label><select id=\"bat_off_enabled\">";
+  html += "<option value=\"true\"";
+  if (bat_policy.screen_off_enabled) html += " selected";
+  html += ">Yes: turn off display after extended idle time</option>";
+  html += "<option value=\"false\"";
+  if (!bat_policy.screen_off_enabled) html += " selected";
+  html += ">No: keep display on (may dim if enabled above)</option></select></div>";
+
+  // Off options group (timeouts), hidden when off disabled
+  html += "<div id=\"bat-off-options-group\"";
+  if (!bat_policy.screen_off_enabled) html += " style=\"display:none\"";
+  html += ">";
+  html += "<div class=\"field\"><label for=\"bat_off_timeout_idle\">Screen-off after (idle)</label><select id=\"bat_off_timeout_idle\">";
+  {
+    const uint32_t vals[] = {30, 45, 60, 90, 120, 180, 300};
+    for (uint32_t v : vals) {
+      html += "<option value=\"";
+      html += std::to_string(v);
+      html += "\"";
+      if (bat_policy.off_timeout_idle_s == v) html += " selected";
+      html += ">";
+      html += (v < 60 ? std::to_string(v) + " s" : std::to_string(v / 60) + " min");
+      html += "</option>";
+    }
+  }
+  html += "</select></div>";
+  html += "<div class=\"field\"><label for=\"bat_off_timeout_active\">Screen-off after (during print)</label><select id=\"bat_off_timeout_active\">";
+  {
+    const uint32_t vals[] = {60, 90, 120, 180, 300, 600};
+    for (uint32_t v : vals) {
+      html += "<option value=\"";
+      html += std::to_string(v);
+      html += "\"";
+      if (bat_policy.off_timeout_active_s == v) html += " selected";
+      html += ">";
+      const uint32_t mins = v / 60;
+      const uint32_t secs = v % 60;
+      if (secs) {
+        html += std::to_string(mins) + " min " + std::to_string(secs) + " s";
+      } else {
+        html += std::to_string(mins) + " min";
+      }
+      html += "</option>";
+    }
+  }
+  html += "</select></div>";
+  html += "</div>"; // bat-off-options-group
+
+  // Live battery info (if PMU available)
+  if (power.available && power.battery_present) {
+    char bat_info[80] = {};
+    std::snprintf(bat_info, sizeof(bat_info), "Battery: %u%% \xC2\xB7 %s",
+                  static_cast<unsigned>(power.battery_percent),
+                  power.charging ? "Charging" : (power.usb_present ? "USB (not charging)" : "On battery"));
+    html += "<p class=\"micro\">";
+    html += bat_info;
+    if (power.temperature_c > 0.0f) {
+      char tmp[24] = {};
+      std::snprintf(tmp, sizeof(tmp), " \xC2\xB7 %.1f\xC2\xB0" "C", power.temperature_c);
+      html += tmp;
+    }
+    html += "</p>";
+  } else if (power.available && !power.battery_present && power.usb_present) {
+    html += "<p class=\"micro\">USB powered \xC2\xB7 No battery detected</p>";
+  }
+
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"bat-display-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"bat-display-apply-hint\">Energy settings apply after the ESP restarts.</div></div>";
+  end_collapsible_section();
+  } // wifi_configured (Screen Rotation + Energy)
+
+  if (show_connection_steps) {
+    html += "</div>";
+    html += "<div class=\"grid-2\">";
+    begin_collapsible_section(
+        "Connection Mode",
+        "This decides which printer path drives the UI. Changing it needs a reboot because the active runtime wiring changes between cloud, local and hybrid.",
+        source_badge_value, "info", connection_mode_section_open);
+    html += "<div class=\"field\"><label for=\"source_mode\">Connection Mode</label><select id=\"source_mode\">";
+    html += "<option value=\"hybrid\"";
+    if (source_mode == SourceMode::kHybrid) {
+      html += " selected";
+    }
+    html += ">Hybrid (recommended): auto-pick the best status path for your printer, keep local camera when available</option>";
+    html += "<option value=\"cloud_only\"";
+    if (source_mode == SourceMode::kCloudOnly) {
+      html += " selected";
+    }
+    html += ">Cloud only: cloud monitoring and preview, local MQTT/camera disabled</option>";
+    html += "<option value=\"local_only\"";
+    if (source_mode == SourceMode::kLocalOnly) {
+      html += " selected";
+    }
+    html += ">Local only</option></select></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"source-mode-apply-button\">Apply + Restart</button>";
+    html += "<div class=\"micro hidden\" id=\"source-mode-apply-hint\">A mode change rewires the active clients, so the ESP restarts right away after saving it.</div></div>";
+    end_collapsible_section();
+  }
+
+  // --- Printer Selection section ---
+  if (show_connection_steps) {
+    const auto profiles = portal->config_store_.load_printer_profiles();
+    const uint8_t active_idx = portal->config_store_.load_active_printer_index();
+    const auto cloud_devices = portal->cloud_client_.get_cloud_devices();
+    const std::string printer_count_str = std::to_string(profiles.size());
+    const char* printer_badge_class = profiles.empty() ? "idle" : "ok";
+    begin_collapsible_section(
+        "Printer Selection",
+        "Switch between configured printers without rebooting. Cloud printers are automatically matched with local profiles by serial number.",
+        printer_count_str + (profiles.size() == 1 ? " Printer" : " Printers"),
+        printer_badge_class, false);
+    html += "<div id=\"printer-list\">";
+    // Render saved profiles
+    for (const auto& p : profiles) {
+      const bool is_active = (p.index == active_idx);
+      const bool has_cloud = p.cloud_bound;
+      html += "<div class=\"printer-card";
+      if (is_active) html += " active";
+      html += "\" data-index=\"";
+      html += std::to_string(p.index);
+      html += "\" data-serial=\"";
+      html += json_escape(p.serial);
+      html += "\">";
+      html += "<div class=\"printer-card-header\">";
+      html += "<input type=\"text\" class=\"printer-name-input\" data-index=\"";
+      html += std::to_string(p.index);
+      html += "\" data-serial=\"";
+      html += json_escape(p.serial);
+      html += "\" value=\"";
+      const std::string card_name = p.display_name.empty()
+          ? (!p.model.empty() ? p.model : ("Printer " + std::to_string(p.index + 1)))
+          : p.display_name;
+      html += json_escape(card_name);
+      html += "\" placeholder=\"Profile name\">";
+      html += "<span class=\"summary-pill ";
+      html += is_active ? "ok" : "idle";
+      html += "\">";
+      html += is_active ? "Active" : "Idle";
+      html += "</span></div>";
+      html += "<div class=\"printer-card-body\">";
+      if (!p.model.empty()) {
+        html += "<span class=\"printer-tag\">";
+        html += json_escape(p.model);
+        html += "</span>";
+      }
+      if (p.has_local_config()) {
+        html += "<span class=\"printer-tag\">Local: ";
+        html += json_escape(p.host);
+        html += "</span>";
+      }
+      if (has_cloud) {
+        html += "<span class=\"printer-tag ok\">Cloud</span>";
+      }
+      if (!p.serial.empty()) {
+        html += "<span class=\"printer-tag\">";
+        html += json_escape(p.serial.substr(0, 6) + "...");
+        html += "</span>";
+      }
+      html += "</div>";
+      html += "<div class=\"printer-card-actions\">";
+      if (!is_active) {
+        html += "<button type=\"button\" class=\"secondary printer-select-btn\" data-index=\"";
+        html += std::to_string(p.index);
+        html += "\">Select</button>";
+      }
+      if (p.has_local_config()) {
+        html += "<button type=\"button\" class=\"secondary printer-clear-local-btn\" data-index=\"";
+        html += std::to_string(p.index);
+        html += "\">Clear Local</button>";
+      }
+      html += "<button type=\"button\" class=\"secondary printer-delete-btn\" data-index=\"";
+      html += std::to_string(p.index);
+      html += "\">Delete</button></div></div>";
+    }
+    // Show cloud-only devices that don't have a local profile yet
+    for (const auto& cd : cloud_devices) {
+      bool already_saved = false;
+      for (const auto& p : profiles) {
+        if (p.serial == cd.serial) { already_saved = true; break; }
+      }
+      if (already_saved) continue;
+      html += "<div class=\"printer-card cloud-only\" data-serial=\"";
+      html += json_escape(cd.serial);
+      html += "\">";
+      html += "<div class=\"printer-card-header\"><strong>";
+      html += json_escape(cd.display_name.empty() ? to_string(cd.model) : cd.display_name);
+      html += "</strong><span class=\"summary-pill info\">Cloud only</span></div>";
+      html += "<div class=\"printer-card-body\">";
+      html += "<span class=\"printer-tag\">";
+      html += to_string(cd.model);
+      html += "</span>";
+      html += "<span class=\"printer-tag\">";
+      html += cd.online ? "Online" : "Offline";
+      html += "</span>";
+      html += "<span class=\"printer-tag\">";
+      html += json_escape(cd.serial.substr(0, 6) + "...");
+      html += "</span></div>";
+      html += "<div class=\"printer-card-actions\">";
+      html += "<button type=\"button\" class=\"secondary printer-add-cloud-btn\" data-serial=\"";
+      html += json_escape(cd.serial);
+      html += "\" data-name=\"";
+      html += json_escape(cd.display_name);
+      html += "\" data-model=\"";
+      html += to_string(cd.model);
+      html += "\">Add to Profiles</button></div></div>";
+    }
+    html += "</div>";
+    if (cloud.is_configured()) {
+      html += "<div style=\"margin-top:12px\"><button type=\"button\" class=\"secondary\" id=\"load-cloud-printers-btn\">Load Cloud Printers</button>"
+              "<span id=\"cloud-printers-status\" style=\"margin-left:10px;font-size:0.85em;color:#888\"></span></div>";
+    }
+    html += "<div class=\"hint-box\"><strong>Tip:</strong> Selecting a printer reconnects all paths (cloud, local MQTT, camera) live — no reboot needed.</div>";
+    end_collapsible_section();
+  }
+
+  if (wifi_configured) {
+  begin_collapsible_section(
+      "Portal Access",
+      "Controls whether the setup portal requires a 6-digit PIN on your home network after provisioning is complete.",
+      portal_lock_badge_value, portal_lock_badge_class, portal_access_section_open);
+  html += "<div class=\"field\"><label for=\"portal_lock_enabled\">Portal Lock</label><select id=\"portal_lock_enabled\">";
+  html += "<option value=\"true\"";
+  if (portal_lock_enabled) {
+    html += " selected";
+  }
+  html += ">Enabled: require PIN unlock on the home network</option>";
+  html += "<option value=\"false\"";
+  if (!portal_lock_enabled) {
+    html += " selected";
+  }
+  html += ">Disabled: keep the portal open on the home network</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"portal-access-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"portal-access-apply-hint\">Portal access changes apply after the ESP restarts so the new lock mode is active immediately.</div></div>";
+  html += "<div class=\"hint-box\"><strong>Security:</strong> ";
+  html += setup_ap_active
+              ? "The portal always stays open while the setup access point is active."
+              : (portal_lock_enabled
+                     ? "Long-press on the device display to show a temporary 6-digit unlock PIN whenever you need browser access."
+                     : "With the PIN lock disabled, anyone on the same home network can open Web Config without the device-generated PIN.");
+  html += "</div>";
+  html += "<p class=\"micro\">The lock never applies while PrintSphere is still in setup AP mode.</p>";
+  end_collapsible_section();
+  } // wifi_configured (Portal Access)
+
+  if (show_connection_steps) {
+    html += "</div>";
+  }
+
+  // Configured provisioning sections (sunk to bottom)
+  if (show_connection_steps && cloud_section_configured) {
+    render_cloud_section();
+  }
+  if (show_connection_steps && !local_needs_setup) {
+    render_local_section();
+  }
+  if (wifi_configured) {
+    render_wifi_section();
   }
 
   if (show_connection_steps) {
@@ -1530,6 +1975,30 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     add_color_field("arc_offline", "Offline", arc_colors.offline);
     add_color_field("arc_unknown", "Fallback", arc_colors.unknown);
     html += "</div>";
+    end_collapsible_section();
+  }
+
+  // --- Firmware Update (OTA) section ---
+  if (show_connection_steps) {
+    begin_collapsible_section(
+        "Firmware Update",
+        "Upload a compiled PrintSphere .bin firmware image to update the device over-the-air without a USB connection.",
+        "OTA", "idle", false);
+    html += "<div class=\"hint-box\"><strong>Warning:</strong> The device restarts immediately after a successful flash. Only upload firmware built for PrintSphere (ESP32-S3).</div>";
+    html += "<div class=\"field\"><label for=\"ota_file\">Firmware .bin file</label>";
+    html += "<input type=\"file\" id=\"ota_file\" accept=\".bin\"></div>";
+    html += "<div id=\"ota-progress-wrap\" style=\"display:none;margin:4px 0;height:8px;border-radius:6px;background:#0e1620;overflow:hidden\">";
+    html += "<div id=\"ota-progress-bar\" style=\"height:100%;width:0%;background:var(--accent);transition:width .25s;\"></div></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"ota-upload-button\">Upload &amp; Flash</button>";
+    html += "<div class=\"micro\" id=\"ota-status\">Select a .bin file built for PrintSphere (ESP32-S3).</div></div>";
+    html += "<hr style=\"border:none;border-top:1px solid var(--line);margin:16px 0 4px\">";
+    html += "<div class=\"field\"><label for=\"ota_url\">Or flash from URL</label>";
+    html += "<input type=\"url\" id=\"ota_url\" placeholder=\"https://github.com/cptkirki/PrintSphere/blob/main/release/printsphere_ota-v1.4.bin\" autocomplete=\"off\" spellcheck=\"false\"></div>";
+    html += "<p class=\"micro\">GitHub blob links (github.com/&hellip;/blob/&hellip;) are converted to raw download URLs automatically.</p>";
+    html += "<div id=\"ota-url-progress-wrap\" style=\"display:none;margin:4px 0;height:8px;border-radius:6px;background:#0e1620;overflow:hidden\">";
+    html += "<div id=\"ota-url-progress-bar\" style=\"height:100%;width:0%;background:var(--accent);transition:width .3s;\"></div></div>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"ota-url-button\">Flash from URL</button>";
+    html += "<div class=\"micro\" id=\"ota-url-status\">Enter a direct .bin URL or a GitHub blob link above.</div></div>";
     end_collapsible_section();
   }
 
@@ -1557,6 +2026,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const wifiScanButton=document.getElementById('wifi-scan-button');";
   html += "const wifiSsidSelect=document.getElementById('wifi_ssid_select');";
   html += "const wifiScanDetail=document.getElementById('wifi-scan-detail');";
+  html += "const wifiSsidManualField=document.getElementById('wifi-ssid-manual-field');";
+  html += "const wifiSsidScanField=document.getElementById('wifi-ssid-scan-field');";
   html += "const displayRotationSelect=document.getElementById('display_rotation');";
   html += "const displayRotationApplyButton=document.getElementById('display-rotation-apply-button');";
   html += "const displayRotationApplyHint=document.getElementById('display-rotation-apply-hint');";
@@ -1566,6 +2037,17 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const sourceModeSelect=document.getElementById('source_mode');";
   html += "const sourceModeApplyButton=document.getElementById('source-mode-apply-button');";
   html += "const sourceModeApplyHint=document.getElementById('source-mode-apply-hint');";
+  html += "const batDimSelect=document.getElementById('bat_dim_enabled');";
+  html += "const batDimOptionsGroup=document.getElementById('bat-dim-options-group');";
+  html += "const batOffOptionsGroup=document.getElementById('bat-off-options-group');";
+  html += "const batDimBrightnessSelect=document.getElementById('bat_dim_brightness');";
+  html += "const batDimTimeoutIdleSelect=document.getElementById('bat_dim_timeout_idle');";
+  html += "const batDimTimeoutActiveSelect=document.getElementById('bat_dim_timeout_active');";
+  html += "const batOffSelect=document.getElementById('bat_off_enabled');";
+  html += "const batOffTimeoutIdleSelect=document.getElementById('bat_off_timeout_idle');";
+  html += "const batOffTimeoutActiveSelect=document.getElementById('bat_off_timeout_active');";
+  html += "const batDisplayApplyButton=document.getElementById('bat-display-apply-button');";
+  html += "const batDisplayApplyHint=document.getElementById('bat-display-apply-hint');";
   html += "const cloudConnectButton=document.getElementById('cloud-connect-button');";
   html += "const localConnectButton=document.getElementById('local-connect-button');";
   html += "const verifyButton=document.getElementById('verify-button');";
@@ -1573,6 +2055,24 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "let statusLockUntil=0;";
   html += "let arcPreviewTimer=null;";
   html += "let healthTimer=null;";
+  html += "let portalTimerSeconds=0;let portalTimerInterval=null;";
+  html += "function updatePortalTimer(){"
+          "const el=document.getElementById('portal-timer');"
+          "if(!el)return;"
+          "if(portalTimerSeconds<=0){el.style.display='none';return;}"
+          "const m=Math.floor(portalTimerSeconds/60);const s=portalTimerSeconds%60;"
+          "el.textContent=(m>0?(m+'m '+s+'s'):(s+'s'));"
+          "el.style.display='';portalTimerSeconds--;}";
+  html += "function extendSession(){"
+          "fetch('/api/session/extend',{method:'POST',credentials:'same-origin'})"
+          ".then(r=>r.json()).then(d=>{if(d.remaining_s)syncPortalTimer(d.remaining_s);})"
+          ".catch(()=>{});}";
+  html += "function syncPortalTimer(secs){"
+          "portalTimerSeconds=secs||0;"
+          "if(portalTimerSeconds>0&&!portalTimerInterval){"
+          "portalTimerInterval=setInterval(updatePortalTimer,1000);updatePortalTimer();}"
+          "else if(portalTimerSeconds<=0&&portalTimerInterval){"
+          "clearInterval(portalTimerInterval);portalTimerInterval=null;updatePortalTimer();}}";
   html += "let cloudFollowupTimer=null;";
   html += "let cloudFollowupUntil=0;";
   html += "let cloudFollowupDetail='';";
@@ -1602,6 +2102,20 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += cloud_password_saved ? "true" : "false";
   html += ",printer_access_code_saved:";
   html += printer_access_code_saved ? "true" : "false";
+  html += ",bat_dim_enabled:";
+  html += bat_policy.dim_enabled ? "true" : "false";
+  html += ",bat_dim_brightness:\"";
+  html += std::to_string(bat_policy.dim_brightness_percent);
+  html += "\",bat_off_enabled:";
+  html += bat_policy.screen_off_enabled ? "true" : "false";
+  html += ",bat_dim_timeout_idle:";
+  html += std::to_string(bat_policy.dim_timeout_idle_s);
+  html += ",bat_dim_timeout_active:";
+  html += std::to_string(bat_policy.dim_timeout_active_s);
+  html += ",bat_off_timeout_idle:";
+  html += std::to_string(bat_policy.off_timeout_idle_s);
+  html += ",bat_off_timeout_active:";
+  html += std::to_string(bat_policy.off_timeout_active_s);
   html += "};";
   html += "function setStatus(line,detail,lockMs){statusEl.textContent=line||'';statusDetailEl.textContent=detail||'';"
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
@@ -1629,8 +2143,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const networks=Array.isArray(body&&body.networks)?body.networks:[];"
           "wifiSsidSelect.innerHTML='<option value=\"\">Select detected Wi-Fi...</option>';"
           "networks.forEach((ssid)=>{const option=document.createElement('option');option.value=ssid;option.textContent=ssid;wifiSsidSelect.appendChild(option);});"
+          "var manualOpt=document.createElement('option');manualOpt.value='__manual__';manualOpt.textContent='\u270e Type SSID manually\u2026';wifiSsidSelect.appendChild(manualOpt);"
           "if(currentSsid&&networks.includes(currentSsid)){wifiSsidSelect.value=currentSsid;}"
-          "else if(previousValue&&networks.includes(previousValue)){wifiSsidSelect.value=previousValue;}}";
+          "else if(previousValue&&networks.includes(previousValue)){wifiSsidSelect.value=previousValue;}"
+          "if(networks.length&&wifiSsidScanField&&wifiSsidManualField){wifiSsidScanField.style.display='';wifiSsidManualField.style.display='none';}}";
   html += "async function refreshWifiScan(){if(!wifiSsidSelect||wifiScanInFlight)return;"
           "wifiScanInFlight=true;"
           "if(wifiScanButton){wifiScanButton.disabled=true;}if(wifiScanDetail){wifiScanDetail.textContent='Scanning nearby Wi-Fi networks...';}"
@@ -1680,6 +2196,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(body.wifi_connected){if(body.cloud_status_line){setStatus(body.cloud_status_line,body.cloud_status_detail||body.cloud_detail||body.detail||'',0);}"
           "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
           "else{setStatus('Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
+          "syncPortalTimer(body.portal_open_remaining_s||0);"
           "return body;}";
   html += "async function forceHealthRefresh(){try{const response=await fetch('/api/health',{cache:'no-store'});"
           "if(!response.ok)return null;const body=await response.json();if(body.portal_locked){window.location.reload();return null;}"
@@ -1748,6 +2265,27 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "portalAccessApplyButton.classList.toggle('hidden',!changed);"
           "portalAccessApplyHint.classList.toggle('hidden',!changed);"
           "if(!changed){portalAccessApplyButton.disabled=false;}}";
+  html += "function updateBatDisplayControls(){"
+          "if(batDimSelect&&batDimOptionsGroup){batDimOptionsGroup.style.display=batDimSelect.value==='true'?'':'none';}"
+          "if(batOffSelect&&batOffOptionsGroup){batOffOptionsGroup.style.display=batOffSelect.value==='true'?'':'none';}"
+          "if(!batDisplayApplyButton||!batDisplayApplyHint)return;"
+          "const dimNow=batDimSelect?batDimSelect.value==='true':savedConfig.bat_dim_enabled!==false;"
+          "const pctNow=batDimBrightnessSelect?batDimBrightnessSelect.value:String(savedConfig.bat_dim_brightness||'0');"
+          "const offNow=batOffSelect?batOffSelect.value==='true':savedConfig.bat_off_enabled!==false;"
+          "const diIdleNow=batDimTimeoutIdleSelect?batDimTimeoutIdleSelect.value:String(savedConfig.bat_dim_timeout_idle||20);"
+          "const diActNow=batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:String(savedConfig.bat_dim_timeout_active||30);"
+          "const ofIdleNow=batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:String(savedConfig.bat_off_timeout_idle||60);"
+          "const ofActNow=batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:String(savedConfig.bat_off_timeout_active||120);"
+          "const changed=dimNow!==(savedConfig.bat_dim_enabled!==false)"
+              "||pctNow!==String(savedConfig.bat_dim_brightness||'0')"
+              "||offNow!==(savedConfig.bat_off_enabled!==false)"
+              "||diIdleNow!==String(savedConfig.bat_dim_timeout_idle||20)"
+              "||diActNow!==String(savedConfig.bat_dim_timeout_active||30)"
+              "||ofIdleNow!==String(savedConfig.bat_off_timeout_idle||60)"
+              "||ofActNow!==String(savedConfig.bat_off_timeout_active||120);"
+          "batDisplayApplyButton.classList.toggle('hidden',!changed);"
+          "batDisplayApplyHint.classList.toggle('hidden',!changed);"
+          "if(!changed){batDisplayApplyButton.disabled=false;}}";
   html += "function updateCloudVerification(body){const note=document.getElementById('cloud-verify-note');"
           "const label=document.getElementById('cloud-verification-label');"
           "const input=document.getElementById('cloud_verification_code');"
@@ -1777,7 +2315,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
-          "printer_access_code:(document.getElementById('printer_access_code')?trimmedValue('printer_access_code'):'' )},buildArcPayload());}";
+          "printer_access_code:(document.getElementById('printer_access_code')?trimmedValue('printer_access_code'):'' ),"
+          "bat_dim_enabled:(batDimSelect?batDimSelect.value==='true':savedConfig.bat_dim_enabled!==false),"
+          "bat_dim_brightness:(batDimBrightnessSelect?batDimBrightnessSelect.value:String(savedConfig.bat_dim_brightness||'0')),"
+          "bat_off_enabled:(batOffSelect?batOffSelect.value==='true':savedConfig.bat_off_enabled!==false),"
+          "bat_dim_timeout_idle:Number(batDimTimeoutIdleSelect?batDimTimeoutIdleSelect.value:savedConfig.bat_dim_timeout_idle||20),"
+          "bat_dim_timeout_active:Number(batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:savedConfig.bat_dim_timeout_active||30),"
+          "bat_off_timeout_idle:Number(batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:savedConfig.bat_off_timeout_idle||60),"
+          "bat_off_timeout_active:Number(batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:savedConfig.bat_off_timeout_active||120)"
+          "},buildArcPayload());}";
   html += "async function postArcColors(url){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildArcPayload())});"
           "const body=await response.json().catch(()=>({}));if(!response.ok){throw new Error(body.error||'Arc color request failed');}return body;}";
   html += "function queueArcPreview(){clearTimeout(arcPreviewTimer);arcPreviewTimer=setTimeout(async()=>{try{await postArcColors('/api/arc/preview');}"
@@ -1792,6 +2338,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Saving failed','Please review the fields and try again.',8000);saveButton.disabled=false;}}"
           "catch(error){setStatus('Saving failed','The request to the ESP could not be completed.',8000);saveButton.disabled=false;}});";
+  html += "document.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.type!=='submit'){e.preventDefault();e.target.blur();}});";
+  html += "{const pt=document.getElementById('portal-timer');if(pt){pt.addEventListener('click',extendSession);}}";
   html += "if(displayRotationSelect){displayRotationSelect.addEventListener('change',updateDisplayRotationControls);}";
   html += "if(displayRotationApplyButton){displayRotationApplyButton.addEventListener('click',async()=>{const display_rotation=valueOf('display_rotation')||'0';"
           "if(display_rotation===(savedConfig.display_rotation||'0')){updateDisplayRotationControls();return;}"
@@ -1810,7 +2358,30 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){savedConfig.portal_lock_enabled=portal_lock_enabled;updatePortalAccessControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Portal access change failed',body.detail||'The new portal access mode could not be saved.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}}"
           "catch(error){setStatus('Portal access change failed','The request to the ESP could not be completed.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}});}";
-  html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
+  html += "if(batDimSelect){batDimSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batDimBrightnessSelect){batDimBrightnessSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batOffSelect){batOffSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batDimTimeoutIdleSelect){batDimTimeoutIdleSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batDimTimeoutActiveSelect){batDimTimeoutActiveSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batOffTimeoutIdleSelect){batOffTimeoutIdleSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batOffTimeoutActiveSelect){batOffTimeoutActiveSelect.addEventListener('change',updateBatDisplayControls);}";
+  html += "if(batDisplayApplyButton){batDisplayApplyButton.addEventListener('click',async()=>{"
+          "const bat_dim_enabled=batDimSelect?batDimSelect.value==='true':savedConfig.bat_dim_enabled!==false;"
+          "const bat_dim_brightness=batDimBrightnessSelect?batDimBrightnessSelect.value:String(savedConfig.bat_dim_brightness||'0');"
+          "const bat_off_enabled=batOffSelect?batOffSelect.value==='true':savedConfig.bat_off_enabled!==false;"
+          "const bat_dim_timeout_idle=Number(batDimTimeoutIdleSelect?batDimTimeoutIdleSelect.value:savedConfig.bat_dim_timeout_idle||20);"
+          "const bat_dim_timeout_active=Number(batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:savedConfig.bat_dim_timeout_active||30);"
+          "const bat_off_timeout_idle=Number(batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:savedConfig.bat_off_timeout_idle||60);"
+          "const bat_off_timeout_active=Number(batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:savedConfig.bat_off_timeout_active||120);"
+          "batDisplayApplyButton.disabled=true;setStatus('Applying energy settings...','Saving settings and restarting the ESP now.',15000);"
+          "try{const response=await fetch('/api/battery-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bat_dim_enabled,bat_dim_brightness,bat_off_enabled,bat_dim_timeout_idle,bat_dim_timeout_active,bat_off_timeout_idle,bat_off_timeout_active})});"
+          "const body=await response.json().catch(()=>({}));"
+          "if(response.ok){savedConfig.bat_dim_enabled=bat_dim_enabled;savedConfig.bat_dim_brightness=bat_dim_brightness;savedConfig.bat_off_enabled=bat_off_enabled;"
+              "savedConfig.bat_dim_timeout_idle=bat_dim_timeout_idle;savedConfig.bat_dim_timeout_active=bat_dim_timeout_active;"
+              "savedConfig.bat_off_timeout_idle=bat_off_timeout_idle;savedConfig.bat_off_timeout_active=bat_off_timeout_active;"
+              "updateBatDisplayControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
+          "else{setStatus(body.error||'Energy settings change failed',body.detail||'The energy settings could not be saved.',8000);batDisplayApplyButton.disabled=false;updateBatDisplayControls();}}"
+          "catch(error){setStatus('Energy settings change failed','The request to the ESP could not be completed.',8000);batDisplayApplyButton.disabled=false;updateBatDisplayControls();}})}";  html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
   html += "if(sourceModeApplyButton){sourceModeApplyButton.addEventListener('click',async()=>{const source_mode=valueOf('source_mode')||'hybrid';"
           "if(source_mode===(savedConfig.source_mode||'hybrid')){updateSourceModeControls();return;}"
           "sourceModeApplyButton.disabled=true;setStatus('Applying connection mode...','Saving the new mode and restarting the ESP now.',15000);"
@@ -1845,9 +2416,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "stopLocalFollowup();localConnectButton.disabled=true;setStatus('Connecting local path...','Saving printer credentials and reconnecting MQTT now.',8000);"
           "try{const response=await fetch('/api/local/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_host,printer_serial,printer_access_code,source_mode})});"
           "const body=await response.json().catch(()=>({}));renderLocalStatus(body);"
-          "if(response.ok){if(body.local_connected){setStatus('Local path connected',body.detail||'Connected to local Bambu MQTT.',7000);}"
+          "if(response.ok){if(body.local_connected){setStatus('Local path connected',body.detail||'Connected to local Bambu MQTT.',7000);schedulePortalReload(800);}"
           "else if(body.local_error){setStatus('Local path error',body.detail||'The local MQTT path returned an error.',8000);}"
-          "else{const detail=body.detail||'Waiting for local printer response...';setStatus('Local path started',detail,4000);startLocalFollowup(detail,12000);}}"
+          "else{const detail=body.detail||'Waiting for local printer response...';setStatus('Local path started',detail,4000);startLocalFollowup(detail,12000);schedulePortalReload(2000);}}"
           "else{setStatus(body.error||'Local connect failed',body.detail||'Please review the local printer fields and try again.',8000);}}"
           "catch(error){setStatus('Local request failed','The request to the ESP did not complete successfully.',7000);}finally{localConnectButton.disabled=false;updateHealth();}});}";
   html += "if(verifyButton){verifyButton.addEventListener('click',async()=>{const code=trimmedValue('cloud_verification_code');"
@@ -1865,11 +2436,165 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const codeInput=document.getElementById('cloud_verification_code');if(codeInput){codeInput.value='';}}"
           "else{setStatus(body.error||'Cloud code was rejected',body.detail||'Please check the code and try again.',7000);}}"
           "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{verifyButton.disabled=false;if(!cloudSuccessReloadScheduled){await forceHealthRefresh();}}});}"; 
-  html += "if(wifiSsidSelect){wifiSsidSelect.addEventListener('change',()=>{if(wifiSsidSelect.value){const wifiInput=document.getElementById('wifi_ssid');if(wifiInput){wifiInput.value=wifiSsidSelect.value;}}});}";
+  html += "if(wifiSsidSelect){wifiSsidSelect.addEventListener('change',()=>{if(wifiSsidSelect.value==='__manual__'){if(wifiSsidScanField){wifiSsidScanField.style.display='none';}if(wifiSsidManualField){wifiSsidManualField.style.display='';}var inp=document.getElementById('wifi_ssid');if(inp){inp.focus();}return;}if(wifiSsidSelect.value){const wifiInput=document.getElementById('wifi_ssid');if(wifiInput){wifiInput.value=wifiSsidSelect.value;}}});}";  
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
   html += "arcInputIds.forEach((id)=>{const input=document.getElementById(id);if(!input)return;"
           "input.addEventListener('input',queueArcPreview);input.addEventListener('change',commitArcColors);});";
   html += "updateDisplayRotationControls();updatePortalAccessControls();updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}stopCloudFollowup();stopLocalFollowup();});";
+
+  // --- Printer selection JS ---
+  html += "(function(){const btn=document.getElementById('load-cloud-printers-btn');"
+          "if(!btn)return;"
+          "const st=document.getElementById('cloud-printers-status');"
+          "const list=document.getElementById('printer-list');"
+          "btn.addEventListener('click',async()=>{"
+          "btn.disabled=true;if(st)st.textContent='Loading...';"
+          "try{const r=await fetch('/api/printers');const d=await r.json();"
+          "const savedSerials=new Set((d.profiles||[]).map(p=>p.serial));"
+          "const cloud=(d.cloud_devices||[]).filter(c=>!savedSerials.has(c.serial));"
+          "if(cloud.length===0){if(st)st.textContent='No additional cloud printers found.';btn.disabled=false;return;}"
+          "list.querySelectorAll('.printer-card.cloud-only').forEach(c=>c.remove());"
+          "cloud.forEach(cd=>{"
+          "const card=document.createElement('div');card.className='printer-card cloud-only';card.dataset.serial=cd.serial;"
+          "const name=cd.display_name||cd.model||cd.serial;"
+          "card.innerHTML=\'<div class=\"printer-card-header\"><strong>\'+name+\'</strong><span class=\"summary-pill info\">Cloud only</span></div>\'"
+          "+\'<div class=\"printer-card-body\"><span class=\"printer-tag\">\'+(cd.model||\'\')+\'</span>\'"
+          "+\'<span class=\"printer-tag\">\'+( cd.online?\"Online\":\"Offline\")+\'</span>\'"
+          "+\'<span class=\"printer-tag\">\'+(cd.serial||\'\').substring(0,6)+\'...</span></div>\'"
+          "+\'<div class=\"printer-card-actions\"><button type=\"button\" class=\"secondary printer-add-cloud-btn\" data-serial=\"\'+cd.serial+\'\" data-name=\"\'+( cd.display_name||\'\')+\'\" data-model=\"\'+( cd.model||\'\')+\'\">Add to Profiles</button></div>\';"
+          "list.appendChild(card);});"
+          "list.querySelectorAll('.printer-add-cloud-btn').forEach(b=>{"
+          "b.addEventListener('click',async()=>{"
+          "b.disabled=true;"
+          "try{const r2=await fetch('/api/printers/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({serial:b.dataset.serial,display_name:b.dataset.name,model:b.dataset.model,cloud_bound:true})});"
+          "if(r2.ok){location.reload();}else{b.disabled=false;}}catch(e){b.disabled=false;}});});"
+          "if(st)st.textContent=cloud.length+' cloud printer'+(cloud.length>1?'s':'')+' found.';"
+          "btn.disabled=false;"
+          "}catch(e){if(st)st.textContent='Failed to load cloud printers.';btn.disabled=false;}});})();";
+  html += "document.querySelectorAll('.printer-name-input').forEach(inp=>{"
+          "let timer=null;"
+          "inp.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();inp.blur();}});"
+          "inp.addEventListener('input',()=>{"
+          "clearTimeout(timer);"
+          "timer=setTimeout(async()=>{"
+          "const name=inp.value.trim();"
+          "if(!name)return;"
+          "try{await fetch('/api/printers/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({serial:inp.dataset.serial,display_name:name})});"
+          "}catch(e){}},800);});});";
+  html += "document.querySelectorAll('.printer-select-btn').forEach(btn=>{"
+          "btn.addEventListener('click',async()=>{"
+          "btn.disabled=true;setStatus('Switching printer...','Reconnecting all paths to the selected printer.',10000);"
+          "try{const r=await fetch('/api/printers/select',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({index:parseInt(btn.dataset.index)})});"
+          "const body=await r.json();"
+          "if(r.ok){setStatus('Printer switched','Now monitoring '+( body.printer||'selected printer')+'. The page will reload shortly.',5000);"
+          "setTimeout(()=>location.reload(),2000);}else{setStatus(body.error||'Switch failed',body.detail||'',6000);btn.disabled=false;}}"
+          "catch(e){setStatus('Switch failed','Request could not be completed.',6000);btn.disabled=false;}});});";
+  html += "document.querySelectorAll('.printer-clear-local-btn').forEach(btn=>{"
+          "btn.addEventListener('click',async()=>{"
+          "if(!confirm('Clear local connection (host & access code) for this printer?'))return;"
+          "btn.disabled=true;"
+          "try{const r=await fetch('/api/printers/clear-local',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({index:parseInt(btn.dataset.index)})});"
+          "if(r.ok){location.reload();}else{const body=await r.json();setStatus(body.error||'Clear failed',body.detail||'',6000);btn.disabled=false;}}"
+          "catch(e){setStatus('Clear failed','',6000);btn.disabled=false;}});});";
+  html += "document.querySelectorAll('.printer-delete-btn').forEach(btn=>{"
+          "btn.addEventListener('click',async()=>{"
+          "if(!confirm('Delete this printer profile?'))return;"
+          "btn.disabled=true;"
+          "try{const r=await fetch('/api/printers/delete',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({index:parseInt(btn.dataset.index)})});"
+          "if(r.ok){location.reload();}else{const body=await r.json();setStatus(body.error||'Delete failed',body.detail||'',6000);btn.disabled=false;}}"
+          "catch(e){setStatus('Delete failed','',6000);btn.disabled=false;}});});";
+  html += "document.querySelectorAll('.printer-add-cloud-btn').forEach(btn=>{"
+          "btn.addEventListener('click',async()=>{"
+          "btn.disabled=true;"
+          "try{const r=await fetch('/api/printers/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({serial:btn.dataset.serial,display_name:btn.dataset.name,model:btn.dataset.model})});"
+          "if(r.ok){location.reload();}else{const body=await r.json();setStatus(body.error||'Save failed',body.detail||'',6000);btn.disabled=false;}}"
+          "catch(e){setStatus('Save failed','',6000);btn.disabled=false;}});});";
+
+  html += "(function(){";
+  html += "var otaFile=document.getElementById('ota_file');";
+  html += "var otaBtn=document.getElementById('ota-upload-button');";
+  html += "var otaStatus=document.getElementById('ota-status');";
+  html += "var otaWrap=document.getElementById('ota-progress-wrap');";
+  html += "var otaBar=document.getElementById('ota-progress-bar');";
+  html += "if(!otaBtn||!otaFile)return;";
+  html += "otaBtn.addEventListener('click',function(){";
+  html += "var file=otaFile.files&&otaFile.files[0];";
+  html += "if(!file){otaStatus.textContent='Select a .bin file first.';return;}";
+  html += "if(!confirm('This will flash new firmware and restart PrintSphere. Continue?'))return;";
+  html += "otaBtn.disabled=true;otaWrap.style.display='';otaBar.style.width='0%';";
+  html += "otaStatus.textContent='Uploading...';";
+  html += "var xhr=new XMLHttpRequest();";
+  html += "xhr.upload.onprogress=function(e){if(e.lengthComputable){";
+  html += "var pct=Math.round(e.loaded/e.total*100);";
+  html += "otaBar.style.width=pct+'%';";
+  html += "otaStatus.textContent='Uploading '+pct+'% ('+Math.round(e.loaded/1024)+' KB)';}};";
+  html += "xhr.onload=function(){";
+  html += "var body={};try{body=JSON.parse(xhr.responseText||'{}');}catch(e){}";
+  html += "if(xhr.status===200){otaBar.style.width='100%';";
+  html += "otaStatus.textContent='Flash successful - device is restarting...';";
+  html += "setStatus('Firmware flashed','PrintSphere is rebooting to the new firmware now.',60000);}";
+  html += "else{otaStatus.textContent='Upload failed: '+(body.error||xhr.statusText||'unknown error');otaBtn.disabled=false;}};";
+  html += "xhr.onerror=function(){otaStatus.textContent='Upload failed - network error.';otaBtn.disabled=false;};";
+  html += "xhr.open('POST','/api/ota/upload');";
+  html += "xhr.setRequestHeader('Content-Type','application/octet-stream');";
+  html += "xhr.send(file);});";
+  html += "var otaUrlInput=document.getElementById('ota_url');";
+  html += "var otaUrlBtn=document.getElementById('ota-url-button');";
+  html += "var otaUrlStatus=document.getElementById('ota-url-status');";
+  html += "var otaUrlWrap=document.getElementById('ota-url-progress-wrap');";
+  html += "var otaUrlBar=document.getElementById('ota-url-progress-bar');";
+  html += "var otaUrlPoll=null;";
+  html += "function githubToRaw(u){"
+          "if(u.indexOf('github.com/')===-1)return u;"
+          "var p=u.replace('https://github.com/','');"
+          "var parts=p.split('/');"
+          "if(parts.length<4||parts[2]!=='blob')return u;"
+          "return 'https://raw.githubusercontent.com/'+parts[0]+'/'+parts[1]+'/'+parts.slice(3).join('/');}";
+  html += "function startOtaUrlPoll(){"
+          "var poll=function(){"
+          "fetch('/api/ota/status',{cache:'no-store'})"
+          ".then(function(r){return r.json();})"
+          ".then(function(b){"
+          "if(b.state==='downloading'){"
+          "if(otaUrlWrap)otaUrlWrap.style.display='';"
+          "if(otaUrlBar)otaUrlBar.style.width=(b.progress||0)+'%';"
+          "if(otaUrlStatus)otaUrlStatus.textContent='Downloading '+(b.progress||0)+'%...';"
+          "otaUrlPoll=setTimeout(poll,600);"
+          "}else if(b.state==='done'){"
+          "if(otaUrlBar)otaUrlBar.style.width='100%';"
+          "if(otaUrlStatus)otaUrlStatus.textContent='Flash successful \u2014 device is restarting...';"
+          "setStatus('Firmware flashed','PrintSphere is rebooting to the new firmware now.',60000);"
+          "}else if(b.state==='failed'){"
+          "if(otaUrlStatus)otaUrlStatus.textContent='Flash failed: '+(b.error||'unknown error');"
+          "if(otaUrlBtn)otaUrlBtn.disabled=false;"
+          "}})"
+          ".catch(function(){otaUrlPoll=setTimeout(poll,1500);});"
+          "};otaUrlPoll=setTimeout(poll,600);}";
+  html += "if(otaUrlBtn){"
+          "otaUrlBtn.addEventListener('click',function(){"
+          "if(otaUrlPoll){clearTimeout(otaUrlPoll);otaUrlPoll=null;}"
+          "var raw=otaUrlInput?githubToRaw(otaUrlInput.value.trim()):'';"
+          "if(!raw){if(otaUrlStatus)otaUrlStatus.textContent='Enter a URL first.';return;}"
+          "if(raw.indexOf('https://')!==0){if(otaUrlStatus)otaUrlStatus.textContent='Only HTTPS URLs are supported.';return;}"
+          "if(!confirm('Flash firmware from:\\n'+raw+'\\n\\nThe device restarts immediately. Continue?'))return;"
+          "otaUrlBtn.disabled=true;"
+          "if(otaUrlWrap)otaUrlWrap.style.display='';"
+          "if(otaUrlBar)otaUrlBar.style.width='0%';"
+          "if(otaUrlStatus)otaUrlStatus.textContent='Starting download...';"
+          "fetch('/api/ota/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:raw})})"
+          ".then(function(r){return r.json().then(function(b){return{ok:r.ok,body:b};});})"
+          ".then(function(res){"
+          "if(res.ok){startOtaUrlPoll();}"
+          "else{if(otaUrlStatus)otaUrlStatus.textContent='Error: '+(res.body&&res.body.error?res.body.error:'request failed');otaUrlBtn.disabled=false;}"
+          "}).catch(function(){if(otaUrlStatus)otaUrlStatus.textContent='Request failed.';otaUrlBtn.disabled=false;});"
+          "});}";
+  html += "})();";
   html += "</script>";
   html += "</main></body></html>";
 
@@ -1977,6 +2702,46 @@ esp_err_t SetupPortal::handle_unlock(httpd_req_t* request) {
   return ESP_OK;
 }
 
+esp_err_t SetupPortal::handle_session_extend(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  uint32_t remaining_s = 0;
+  {
+    const uint64_t current_ms = now_ms();
+    std::lock_guard<std::mutex> lock(portal->access_mutex_);
+    portal->prune_access_state_locked(current_ms);
+    if (!portal->session_token_.empty()) {
+      // Locked session: extend the session token expiry
+      portal->session_expiry_ms_ += kPortalSessionExtendMs;
+      remaining_s = remaining_seconds(portal->session_expiry_ms_, now_ms());
+    } else if (portal->provisioning_grace_expiry_ms_ > current_ms) {
+      // Grace period (no lock active): extend the grace window
+      portal->provisioning_grace_expiry_ms_ += kPortalSessionExtendMs;
+      remaining_s = static_cast<uint32_t>(
+          (portal->provisioning_grace_expiry_ms_ - current_ms) / 1000ULL);
+    }
+  }
+
+  if (!portal->session_token_.empty()) {
+    const std::string cookie = session_cookie_header(
+        portal->session_token_,
+        remaining_s > 0 ? remaining_s : 0);
+    httpd_resp_set_hdr(request, "Set-Cookie", cookie.c_str());
+  }
+
+  std::string body = "{\"status\":\"ok\",\"remaining_s\":";
+  body += std::to_string(remaining_s);
+  body += "}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
 esp_err_t SetupPortal::handle_wifi_scan(httpd_req_t* request) {
   auto* portal = static_cast<SetupPortal*>(request->user_ctx);
   if (portal == nullptr) {
@@ -2016,11 +2781,23 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   const SourceMode source_mode = portal->config_store_.load_source_mode();
   const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
   const bool portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
-  const PrinterConnection printer = portal->config_store_.load_printer_config();
+  const PrinterConnection printer = portal->config_store_.load_active_printer_profile().to_connection();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
+  const BatteryDisplayPolicy bat_policy_get = portal->config_store_.load_battery_display_policy();
   const BambuCloudSnapshot cloud_snapshot = portal->cloud_client_.snapshot();
-  const std::string effective_printer_serial =
-      !printer.serial.empty() ? printer.serial : cloud_snapshot.resolved_serial;
+  const std::string effective_printer_serial = [&]() -> std::string {
+    if (!printer.serial.empty()) return printer.serial;
+    const auto cloud_devs = portal->cloud_client_.get_cloud_devices();
+    const auto profiles = portal->config_store_.load_printer_profiles();
+    for (const auto& cd : cloud_devs) {
+      bool has_local = false;
+      for (const auto& p : profiles) {
+        if (p.serial == cd.serial && p.has_local_config()) { has_local = true; break; }
+      }
+      if (!has_local) return cd.serial;
+    }
+    return cloud_snapshot.resolved_serial;
+  }();
 
   std::string body = "{";
   body += "\"wifi_ssid\":\"" + json_escape(wifi.ssid) + "\",";
@@ -2060,6 +2837,12 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   body += ",\"arc_setup\":\"" + color_to_html_hex(arc_colors.setup) + "\"";
   body += ",\"arc_offline\":\"" + color_to_html_hex(arc_colors.offline) + "\"";
   body += ",\"arc_unknown\":\"" + color_to_html_hex(arc_colors.unknown) + "\"";
+  body += ",\"bat_dim_enabled\":";
+  body += bat_policy_get.dim_enabled ? "true" : "false";
+  body += ",\"bat_dim_brightness\":";
+  body += std::to_string(bat_policy_get.dim_brightness_percent);
+  body += ",\"bat_off_enabled\":";
+  body += bat_policy_get.screen_off_enabled ? "true" : "false";
   body += "}";
 
   send_json(request, body);
@@ -2083,7 +2866,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
 
   const WifiCredentials stored_wifi = portal->config_store_.load_wifi_credentials();
   const BambuCloudCredentials stored_cloud = portal->config_store_.load_cloud_credentials();
-  const PrinterConnection stored_printer = portal->config_store_.load_printer_config();
+  const PrinterConnection stored_printer = portal->config_store_.load_active_printer_profile().to_connection();
   const std::string stored_cloud_access_token = portal->config_store_.load_cloud_access_token();
   const bool stored_portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
 
@@ -2110,6 +2893,34 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
 
   ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
   const bool colors_valid = parse_arc_colors_from_json(root, &arc_colors);
+
+  const BatteryDisplayPolicy stored_bat_policy = portal->config_store_.load_battery_display_policy();
+  BatteryDisplayPolicy bat_policy_post;
+  bat_policy_post.dim_enabled = read_bool_field(root, "bat_dim_enabled", stored_bat_policy.dim_enabled);
+  bat_policy_post.screen_off_enabled = read_bool_field(root, "bat_off_enabled", stored_bat_policy.screen_off_enabled);
+  {
+    const std::string pct_str = trim_copy(read_string_field(root, "bat_dim_brightness"));
+    if (!pct_str.empty()) {
+      const long parsed = std::strtol(pct_str.c_str(), nullptr, 10);
+      bat_policy_post.dim_brightness_percent = (parsed >= 0 && parsed <= 100) ? static_cast<int>(parsed) : stored_bat_policy.dim_brightness_percent;
+    } else {
+      bat_policy_post.dim_brightness_percent = stored_bat_policy.dim_brightness_percent;
+    }
+  }
+  {
+    const auto read_bu = [&](const char* key, uint32_t fallback) -> uint32_t {
+      const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, key);
+      if (cJSON_IsNumber(item)) {
+        const long v = static_cast<long>(item->valuedouble);
+        if (v >= 1 && v <= 3600) return static_cast<uint32_t>(v);
+      }
+      return fallback;
+    };
+    bat_policy_post.dim_timeout_idle_s   = read_bu("bat_dim_timeout_idle",   stored_bat_policy.dim_timeout_idle_s);
+    bat_policy_post.dim_timeout_active_s = read_bu("bat_dim_timeout_active", stored_bat_policy.dim_timeout_active_s);
+    bat_policy_post.off_timeout_idle_s   = read_bu("bat_off_timeout_idle",   stored_bat_policy.off_timeout_idle_s);
+    bat_policy_post.off_timeout_active_s = read_bu("bat_off_timeout_active", stored_bat_policy.off_timeout_active_s);
+  }
 
   cJSON_Delete(root);
 
@@ -2156,9 +2967,20 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
                       "save display rotation failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
                       "save portal lock failed");
-  ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
+  // Update active printer profile with form values
+  {
+    PrinterProfile profile = portal->config_store_.load_active_printer_profile();
+    if (!printer.serial.empty()) {
+      profile.serial = printer.serial;
+      profile.host = printer.host;
+      profile.access_code = printer.access_code;
+      portal->config_store_.save_printer_profile(profile);
+    }
+  }
   ESP_RETURN_ON_ERROR(portal->config_store_.save_arc_color_scheme(arc_colors), kTag,
                       "save arc colors failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_battery_display_policy(bat_policy_post), kTag,
+                      "save battery display policy failed");
 
   if (!portal->reboot_requested_) {
     portal->reboot_requested_ = true;
@@ -2271,6 +3093,65 @@ esp_err_t SetupPortal::handle_display_rotation_post(httpd_req_t* request) {
   ESP_LOGI(kTag, "Saving display rotation only: %s", to_string(rotation));
   ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(rotation), kTag,
                       "save display rotation failed");
+
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+
+  send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_battery_display_post(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const BatteryDisplayPolicy stored = portal->config_store_.load_battery_display_policy();
+  BatteryDisplayPolicy policy;
+  policy.dim_enabled = read_bool_field(root, "bat_dim_enabled", stored.dim_enabled);
+  policy.screen_off_enabled = read_bool_field(root, "bat_off_enabled", stored.screen_off_enabled);
+  {
+    const std::string pct_str = trim_copy(read_string_field(root, "bat_dim_brightness"));
+    if (!pct_str.empty()) {
+      const long parsed = std::strtol(pct_str.c_str(), nullptr, 10);
+      policy.dim_brightness_percent = (parsed >= 0 && parsed <= 100) ? static_cast<int>(parsed) : stored.dim_brightness_percent;
+    } else {
+      policy.dim_brightness_percent = stored.dim_brightness_percent;
+    }
+  }
+  const auto read_bat_uint = [&](const char* key, uint32_t fallback) -> uint32_t {
+    const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+      const long v = static_cast<long>(item->valuedouble);
+      if (v >= 1 && v <= 3600) return static_cast<uint32_t>(v);
+    }
+    return fallback;
+  };
+  policy.dim_timeout_idle_s   = read_bat_uint("bat_dim_timeout_idle",   stored.dim_timeout_idle_s);
+  policy.dim_timeout_active_s = read_bat_uint("bat_dim_timeout_active", stored.dim_timeout_active_s);
+  policy.off_timeout_idle_s   = read_bat_uint("bat_off_timeout_idle",   stored.off_timeout_idle_s);
+  policy.off_timeout_active_s = read_bat_uint("bat_off_timeout_active", stored.off_timeout_active_s);
+  cJSON_Delete(root);
+
+  ESP_LOGI(kTag, "Saving energy policy: dim=%s pct=%d dim_idle=%us dim_act=%us off=%s off_idle=%us off_act=%us",
+           policy.dim_enabled ? "yes" : "no", policy.dim_brightness_percent,
+           policy.dim_timeout_idle_s, policy.dim_timeout_active_s,
+           policy.screen_off_enabled ? "yes" : "no",
+           policy.off_timeout_idle_s, policy.off_timeout_active_s);
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_battery_display_policy(policy), kTag,
+                      "save battery display policy failed");
 
   if (!portal->reboot_requested_) {
     portal->reboot_requested_ = true;
@@ -2490,7 +3371,7 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
     return parse_err;
   }
 
-  const PrinterConnection stored_printer = portal->config_store_.load_printer_config();
+  const PrinterConnection stored_printer = portal->config_store_.load_active_printer_profile().to_connection();
   const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
       .serial = trim_copy(read_string_field(root, "printer_serial")),
@@ -2518,9 +3399,44 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
     return ESP_OK;
   }
 
-  ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_config(printer), kTag, "save printer failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
                       "save source mode failed");
+
+  // Upsert into multi-profile system
+  {
+    auto profiles = portal->config_store_.load_printer_profiles();
+    PrinterProfile profile;
+    bool found = false;
+    for (const auto& p : profiles) {
+      if (p.serial == printer.serial) { profile = p; found = true; break; }
+    }
+    if (!found) {
+      profile.index = static_cast<uint8_t>(profiles.size());
+    }
+    profile.serial = printer.serial;
+    profile.host = printer.host;
+    profile.access_code = printer.access_code;
+    if (profile.display_name.empty() || profile.model.empty() || !profile.cloud_bound) {
+      // Try to resolve model name from cloud device list
+      const auto cloud_devs = portal->cloud_client_.get_cloud_devices();
+      for (const auto& cd : cloud_devs) {
+        if (cd.serial == printer.serial) {
+          if (profile.display_name.empty()) {
+            profile.display_name = !cd.display_name.empty() ? cd.display_name : to_string(cd.model);
+          }
+          if (profile.model.empty()) {
+            profile.model = to_string(cd.model);
+          }
+          profile.cloud_bound = true;
+          break;
+        }
+      }
+    }
+    if (profile.index < kMaxPrinterProfiles) {
+      portal->config_store_.save_printer_profile(profile);
+      portal->config_store_.save_active_printer_index(profile.index);
+    }
+  }
   if (source_mode == SourceMode::kCloudOnly) {
     send_json(
         request,
@@ -2571,9 +3487,555 @@ esp_err_t SetupPortal::handle_local_connect(httpd_req_t* request) {
   return ESP_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Printer profile REST endpoints
+// ---------------------------------------------------------------------------
+
+esp_err_t SetupPortal::handle_printers_get(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+
+  const auto profiles = portal->config_store_.load_printer_profiles();
+  const uint8_t active_idx = portal->config_store_.load_active_printer_index();
+  const auto cloud_devices = portal->cloud_client_.get_cloud_devices();
+
+  std::string body = "{\"active\":";
+  body += std::to_string(active_idx);
+  body += ",\"profiles\":[";
+  for (size_t i = 0; i < profiles.size(); ++i) {
+    if (i > 0) body += ",";
+    const auto& p = profiles[i];
+    body += "{\"index\":";
+    body += std::to_string(p.index);
+    body += ",\"serial\":\"";
+    body += json_escape(p.serial);
+    body += "\",\"host\":\"";
+    body += json_escape(p.host);
+    body += "\",\"display_name\":\"";
+    body += json_escape(p.display_name);
+    body += "\",\"model\":\"";
+    body += json_escape(p.model);
+    body += "\",\"has_local\":";
+    body += p.has_local_config() ? "true" : "false";
+    body += ",\"cloud_bound\":";
+    body += p.cloud_bound ? "true" : "false";
+    body += "}";
+  }
+  body += "],\"cloud_devices\":[";
+  for (size_t i = 0; i < cloud_devices.size(); ++i) {
+    if (i > 0) body += ",";
+    const auto& cd = cloud_devices[i];
+    body += "{\"serial\":\"";
+    body += json_escape(cd.serial);
+    body += "\",\"display_name\":\"";
+    body += json_escape(cd.display_name);
+    body += "\",\"model\":\"";
+    body += to_string(cd.model);
+    body += "\",\"online\":";
+    body += cd.online ? "true" : "false";
+    body += "}";
+  }
+  body += "]}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_printers_select(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) return parse_err;
+
+  const cJSON* index_item = cJSON_GetObjectItem(root, "index");
+  if (!cJSON_IsNumber(index_item)) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "index field required");
+  }
+  const uint8_t new_index = static_cast<uint8_t>(cJSON_GetNumberValue(index_item));
+  cJSON_Delete(root);
+
+  const auto profiles = portal->config_store_.load_printer_profiles();
+  const PrinterProfile* selected = nullptr;
+  for (const auto& p : profiles) {
+    if (p.index == new_index) { selected = &p; break; }
+  }
+  if (selected == nullptr) {
+    httpd_resp_set_status(request, "404 Not Found");
+    send_json(request, "{\"error\":\"Profile not found\"}");
+    return ESP_OK;
+  }
+
+  portal->config_store_.save_active_printer_index(new_index);
+
+  // Live-reconnect all clients
+  const PrinterConnection conn = selected->to_connection();
+  if (conn.is_ready()) {
+    portal->printer_client_.configure(conn);
+    portal->camera_client_.configure(conn);
+  }
+  const BambuCloudCredentials cloud_creds = portal->config_store_.load_cloud_credentials();
+  portal->cloud_client_.configure(cloud_creds, selected->serial);
+
+  std::string body = "{\"status\":\"ok\",\"printer\":\"";
+  body += json_escape(selected->display_name.empty() ? selected->serial : selected->display_name);
+  body += "\"}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_printers_save(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) return parse_err;
+
+  const std::string serial = trim_copy(read_string_field(root, "serial"));
+  const std::string host = trim_copy(read_string_field(root, "host"));
+  const std::string access_code = trim_copy(read_string_field(root, "access_code"));
+  const std::string display_name = trim_copy(read_string_field(root, "display_name"));
+  const std::string model = trim_copy(read_string_field(root, "model"));
+  const cJSON* cloud_bound_item = cJSON_GetObjectItem(root, "cloud_bound");
+  const bool cloud_bound_explicit = cJSON_IsBool(cloud_bound_item) && cJSON_IsTrue(cloud_bound_item);
+  cJSON_Delete(root);
+
+  if (serial.empty()) {
+    httpd_resp_set_status(request, "400 Bad Request");
+    send_json(request, "{\"error\":\"Serial number is required\"}");
+    return ESP_OK;
+  }
+
+  // Check if a profile with this serial already exists — update it
+  auto profiles = portal->config_store_.load_printer_profiles();
+  PrinterProfile profile;
+  bool found = false;
+  for (const auto& p : profiles) {
+    if (p.serial == serial) {
+      profile = p;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    profile.index = static_cast<uint8_t>(profiles.size());
+    if (profile.index >= kMaxPrinterProfiles) {
+      httpd_resp_set_status(request, "507 Insufficient Storage");
+      send_json(request, "{\"error\":\"Maximum number of printer profiles reached\"}");
+      return ESP_OK;
+    }
+  }
+
+  profile.serial = serial;
+  if (!host.empty()) profile.host = host;
+  if (!access_code.empty()) profile.access_code = access_code;
+  if (!display_name.empty()) profile.display_name = display_name;
+  if (!model.empty()) profile.model = model;
+  if (cloud_bound_explicit) profile.cloud_bound = true;
+  // Update cloud_bound from live cloud device list
+  if (!profile.cloud_bound) {
+    const auto cloud_devs = portal->cloud_client_.get_cloud_devices();
+    for (const auto& cd : cloud_devs) {
+      if (cd.serial == serial) { profile.cloud_bound = true; break; }
+    }
+  }
+  portal->config_store_.save_printer_profile(profile);
+
+  std::string body = "{\"status\":\"saved\",\"index\":";
+  body += std::to_string(profile.index);
+  body += "}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_printers_delete(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) return parse_err;
+
+  const cJSON* index_item = cJSON_GetObjectItem(root, "index");
+  if (!cJSON_IsNumber(index_item)) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "index field required");
+  }
+  const uint8_t del_index = static_cast<uint8_t>(cJSON_GetNumberValue(index_item));
+  cJSON_Delete(root);
+
+  const uint8_t active_idx = portal->config_store_.load_active_printer_index();
+  const esp_err_t err = portal->config_store_.delete_printer_profile(del_index);
+  if (err != ESP_OK) {
+    httpd_resp_set_status(request, "404 Not Found");
+    send_json(request, "{\"error\":\"Profile not found\"}");
+    return ESP_OK;
+  }
+
+  // If the deleted profile was the active one, clear legacy config and disconnect clients
+  if (del_index == active_idx) {
+    const PrinterConnection empty_conn;
+    portal->printer_client_.configure(empty_conn);
+    portal->camera_client_.configure(empty_conn);
+    // Reconfigure cloud to drop the serial binding
+    const BambuCloudCredentials cloud_creds = portal->config_store_.load_cloud_credentials();
+    portal->cloud_client_.configure(cloud_creds, "");
+    // Switch active to first remaining profile if any
+    const auto remaining = portal->config_store_.load_printer_profiles();
+    if (!remaining.empty()) {
+      portal->config_store_.save_active_printer_index(remaining.front().index);
+      const PrinterConnection new_conn = remaining.front().to_connection();
+      if (new_conn.is_ready()) {
+        portal->printer_client_.configure(new_conn);
+        portal->camera_client_.configure(new_conn);
+      }
+      portal->cloud_client_.configure(cloud_creds, remaining.front().serial);
+    }
+  }
+
+  send_json(request, "{\"status\":\"deleted\"}");
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_printers_clear_local(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) return parse_err;
+
+  const cJSON* index_item = cJSON_GetObjectItem(root, "index");
+  if (!cJSON_IsNumber(index_item)) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "index field required");
+  }
+  const uint8_t idx = static_cast<uint8_t>(cJSON_GetNumberValue(index_item));
+  cJSON_Delete(root);
+
+  auto profiles = portal->config_store_.load_printer_profiles();
+  PrinterProfile* target = nullptr;
+  for (auto& p : profiles) {
+    if (p.index == idx) { target = &p; break; }
+  }
+  if (target == nullptr) {
+    httpd_resp_set_status(request, "404 Not Found");
+    send_json(request, "{\"error\":\"Profile not found\"}");
+    return ESP_OK;
+  }
+
+  target->host.clear();
+  target->access_code.clear();
+  portal->config_store_.save_printer_profile(*target);
+
+  // If this is the active profile, disconnect local clients
+  const uint8_t active_idx = portal->config_store_.load_active_printer_index();
+  if (idx == active_idx) {
+    const PrinterConnection empty_conn;
+    portal->printer_client_.configure(empty_conn);
+    portal->camera_client_.configure(empty_conn);
+  }
+
+  send_json(request, "{\"status\":\"local_cleared\"}");
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  const int total = request->content_len;
+  if (total <= 0 || total > 8 * 1024 * 1024) {
+    httpd_resp_set_status(request, "400 Bad Request");
+    send_json(request, "{\"error\":\"Invalid firmware size\",\"detail\":\"Expected a .bin file up to 8 MB.\"}");
+    return ESP_OK;
+  }
+
+  const esp_partition_t* update_partition = esp_ota_get_next_update_partition(nullptr);
+  if (update_partition == nullptr) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"error\":\"No OTA partition\",\"detail\":\"This build was flashed without an OTA partition layout.\"}");
+    return ESP_OK;
+  }
+
+  ESP_LOGI(kTag, "OTA upload: %d bytes -> partition '%s'", total, update_partition->label);
+
+  esp_ota_handle_t ota_handle = 0;
+  esp_err_t err = esp_ota_begin(update_partition, static_cast<size_t>(total), &ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_begin failed: %s", esp_err_to_name(err));
+    httpd_resp_set_status(request, "500 Internal Server Error");
+    send_json(request, "{\"error\":\"OTA begin failed\",\"detail\":\"Could not start the OTA write session.\"}");
+    return ESP_OK;
+  }
+
+  constexpr size_t kOtaBufSize = 4096;
+  std::unique_ptr<char[]> buf(new (std::nothrow) char[kOtaBufSize]);
+  if (!buf) {
+    esp_ota_abort(ota_handle);
+    httpd_resp_set_status(request, "500 Internal Server Error");
+    send_json(request, "{\"error\":\"Out of memory\",\"detail\":\"Could not allocate OTA receive buffer.\"}");
+    return ESP_OK;
+  }
+
+  int received = 0;
+  while (received < total) {
+    const int to_recv = std::min(static_cast<int>(kOtaBufSize), total - received);
+    const int ret = httpd_req_recv(request, buf.get(), to_recv);
+    if (ret <= 0) {
+      esp_ota_abort(ota_handle);
+      ESP_LOGE(kTag, "OTA receive error at %d/%d bytes (ret=%d)", received, total, ret);
+      return ret == 0 ? ESP_OK : ESP_FAIL;
+    }
+    err = esp_ota_write(ota_handle, buf.get(), static_cast<size_t>(ret));
+    if (err != ESP_OK) {
+      esp_ota_abort(ota_handle);
+      ESP_LOGE(kTag, "esp_ota_write failed: %s", esp_err_to_name(err));
+      httpd_resp_set_status(request, "500 Internal Server Error");
+      send_json(request, "{\"error\":\"OTA write failed\",\"detail\":\"Flash write error.\"}");
+      return ESP_OK;
+    }
+    received += ret;
+  }
+
+  err = esp_ota_end(ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_end failed: %s", esp_err_to_name(err));
+    httpd_resp_set_status(request, "422 Unprocessable Entity");
+    send_json(
+        request,
+        "{\"error\":\"Firmware validation failed\",\"detail\":\"The uploaded file does not appear to be a valid PrintSphere firmware image.\"}");
+    return ESP_OK;
+  }
+
+  err = esp_ota_set_boot_partition(update_partition);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+    httpd_resp_set_status(request, "500 Internal Server Error");
+    send_json(
+        request,
+        "{\"error\":\"Boot partition switch failed\",\"detail\":\"The firmware was written but the boot slot could not be updated.\"}");
+    return ESP_OK;
+  }
+
+  ESP_LOGI(kTag, "OTA upload complete: %d bytes written, scheduling reboot", received);
+  send_json(request, "{\"status\":\"success\",\"rebooting\":true}");
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+  return ESP_OK;
+}
+
 void SetupPortal::reboot_task(void*) {
   vTaskDelay(pdMS_TO_TICKS(1500));
   esp_restart();
+}
+
+esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  std::string url = trim_copy(read_string_field(root, "url"));
+  cJSON_Delete(root);
+
+  if (url.empty()) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "url field missing");
+  }
+
+  // Convert GitHub blob URL to raw download URL
+  const std::string gh_prefix = "https://github.com/";
+  const std::string blob_marker = "/blob/";
+  if (url.rfind(gh_prefix, 0) == 0) {
+    const size_t blob_pos = url.find(blob_marker, gh_prefix.size());
+    if (blob_pos != std::string::npos) {
+      url = "https://raw.githubusercontent.com/" +
+            url.substr(gh_prefix.size(), blob_pos - gh_prefix.size()) + "/" +
+            url.substr(blob_pos + blob_marker.size());
+      ESP_LOGI(kTag, "OTA URL converted to raw: %s", url.c_str());
+    }
+  }
+
+  if (url.rfind("https://", 0) != 0) {
+    httpd_resp_set_status(request, "400 Bad Request");
+    send_json(request, "{\"error\":\"Only HTTPS URLs are supported\"}");
+    return ESP_OK;
+  }
+
+  if (!portal->wifi_manager_.is_station_connected()) {
+    httpd_resp_set_status(request, "409 Conflict");
+    send_json(request, "{\"error\":\"Wi-Fi not connected\",\"detail\":\"Connect to Wi-Fi first.\"}");
+    return ESP_OK;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+    if (portal->ota_url_status_.state == OtaUrlState::kDownloading) {
+      httpd_resp_set_status(request, "409 Conflict");
+      send_json(request, "{\"error\":\"OTA download already in progress\"}");
+      return ESP_OK;
+    }
+    portal->ota_url_pending_ = url;
+    portal->ota_url_status_.state = OtaUrlState::kDownloading;
+    portal->ota_url_status_.progress_percent = 0;
+    portal->ota_url_status_.error.clear();
+  }
+
+  ESP_LOGI(kTag, "Starting OTA URL task: %s", url.c_str());
+  xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr);
+
+  std::string body = "{\"status\":\"started\",\"url\":\"";
+  body += json_escape(url);
+  body += "\"}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_ota_status(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  OtaUrlState state;
+  int progress;
+  std::string error;
+  {
+    std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+    state = portal->ota_url_status_.state;
+    progress = portal->ota_url_status_.progress_percent;
+    error = portal->ota_url_status_.error;
+  }
+
+  const char* state_str = "idle";
+  switch (state) {
+    case OtaUrlState::kDownloading: state_str = "downloading"; break;
+    case OtaUrlState::kDone:        state_str = "done";        break;
+    case OtaUrlState::kFailed:      state_str = "failed";      break;
+    default: break;
+  }
+
+  std::string body = "{\"state\":\"";
+  body += state_str;
+  body += "\",\"progress\":";
+  body += std::to_string(progress);
+  body += ",\"error\":\"";
+  body += json_escape(error);
+  body += "\"}";
+  send_json(request, body);
+  return ESP_OK;
+}
+
+void SetupPortal::ota_url_task(void* context) {
+  auto* portal = static_cast<SetupPortal*>(context);
+
+  std::string url;
+  {
+    std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+    url = portal->ota_url_pending_;
+  }
+
+  ESP_LOGI(kTag, "OTA URL task: %s", url.c_str());
+
+  esp_http_client_config_t http_cfg = {};
+  http_cfg.url = url.c_str();
+  http_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  http_cfg.timeout_ms = 30000;
+  http_cfg.keep_alive_enable = true;
+
+  esp_https_ota_config_t ota_cfg = {};
+  ota_cfg.http_config = &http_cfg;
+
+  esp_https_ota_handle_t ota_handle = nullptr;
+  esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "OTA URL begin failed: %s", esp_err_to_name(err));
+    {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error = esp_err_to_name(err);
+    }
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  while (true) {
+    err = esp_https_ota_perform(ota_handle);
+    if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+      break;
+    }
+    const int len_read = esp_https_ota_get_image_len_read(ota_handle);
+    const int total = esp_https_ota_get_image_size(ota_handle);
+    if (total > 0) {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.progress_percent = (len_read * 100) / total;
+    }
+  }
+
+  if (err != ESP_OK || !esp_https_ota_is_complete_data_received(ota_handle)) {
+    ESP_LOGE(kTag, "OTA URL download error: %s", esp_err_to_name(err));
+    esp_https_ota_abort(ota_handle);
+    {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error = (err != ESP_OK)
+          ? std::string(esp_err_to_name(err)) : std::string("Incomplete download");
+    }
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  err = esp_https_ota_finish(ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(kTag, "OTA URL finish failed: %s", esp_err_to_name(err));
+    {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error =
+          std::string("Firmware validation failed: ") + esp_err_to_name(err);
+    }
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  ESP_LOGI(kTag, "OTA URL complete, scheduling reboot");
+  {
+    std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+    portal->ota_url_status_.state = OtaUrlState::kDone;
+    portal->ota_url_status_.progress_percent = 100;
+  }
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+  vTaskDelete(nullptr);
 }
 
 }  // namespace printsphere

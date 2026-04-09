@@ -442,6 +442,7 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
     ESP_ERROR_CHECK(spi_bus_initialize(BSP_LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(BSP_LCD_CS, NULL, NULL);
+    io_config.pclk_hz = 80 * 1000 * 1000;  // CO5300 supports up to 80 MHz QSPI
     io_config.trans_queue_depth = CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH;
     co5300_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
@@ -523,7 +524,15 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
     assert(cfg != NULL);
     const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     const bool psram_available = psram_total > 0;
-    const uint32_t buffer_height = psram_available ? LVGL_BUFFER_HEIGHT_PSRAM : LVGL_BUFFER_HEIGHT_INTERNAL;
+    const bool use_te_sync = (cfg->tear_avoid_mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TE_SYNC);
+    // Always use PSRAM for the LVGL draw buffer when available.
+    // With TE sync + PSRAM: the adapter does partial 12-line flushes, each requiring a
+    // ~11KB DMA bounce-copy at flush time. This is fine because the bounce buffer is
+    // small and transient. The adapter ignores buffer_height when use_psram=false and
+    // instead tries to allocate a full-frame (434KB) DMA-capable internal buffer, which
+    // is impossible. DMA exhaustion from AES is fixed by disabling CONFIG_MBEDTLS_HARDWARE_AES.
+    const bool use_psram = psram_available;
+    const uint32_t buffer_height = use_psram ? LVGL_BUFFER_HEIGHT_PSRAM : LVGL_BUFFER_HEIGHT_INTERNAL;
     const size_t max_transfer_sz = BSP_LCD_H_RES * buffer_height * BSP_LCD_BITS_PER_PIXEL / 8;
     const bsp_display_config_t disp_config = {
         .max_transfer_sz = max_transfer_sz,
@@ -532,11 +541,11 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_new(&disp_config, &panel_handle, &io_handle));
 
     ESP_LOGI(TAG, "LVGL display buffers: psram=%s height=%" PRIu32 " max_transfer=%u queue_depth=%d double_buffer=%s",
-             psram_available ? "yes" : "no",
+             use_psram ? "yes" : "no",
              buffer_height,
              (unsigned int)max_transfer_sz,
              CONFIG_BSP_LCD_TRANS_QUEUE_DEPTH,
-             psram_available ? "yes" : "no");
+             (use_psram && !use_te_sync) ? "yes" : "no");
 
     ESP_LOGD(TAG, "Add LCD screen");
     esp_lv_adapter_display_config_t disp_cfg = {
@@ -548,11 +557,30 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
             .buffer_height = buffer_height,
-            .use_psram = psram_available,
+            .use_psram = use_psram,
             .enable_ppa_accel = false,
-            .require_double_buffer = psram_available,
+            // Double-buffer saves ~432KB PSRAM but is not needed with TE sync
+            // (TE sync already prevents tearing; double-buffering would only
+            // matter to hide latency which TE sync already handles).
+            .require_double_buffer = use_psram && !use_te_sync,
         },
         .tear_avoid_mode = cfg->tear_avoid_mode,
+        // TE GPIO13: CO5300 asserts TE at start of each frame blanking interval.
+        // The adapter waits for the TE edge before beginning each SPI flush,
+        // ensuring the display scan-line is in the blanking region and cannot
+        // overtake the SPI write → no horizontal tearing bands.
+        .te_sync = use_te_sync
+            ? (esp_lv_adapter_te_sync_config_t){
+                .gpio_num              = BSP_LCD_TE_GPIO,
+                .time_tvdl_ms          = 0,   // auto (13 ms @ 60 Hz)
+                .time_tvdh_ms          = 0,   // auto (1 ms)
+                .bus_freq_hz           = 80 * 1000 * 1000, // 80 MHz QSPI
+                .data_lines            = 4,   // QSPI
+                .bits_per_pixel        = BSP_LCD_BITS_PER_PIXEL,
+                .intr_type             = GPIO_INTR_DISABLE, // auto-detect edge
+                .refresh_window_percent = 0,  // auto (66%)
+              }
+            : ESP_LV_ADAPTER_TE_SYNC_DISABLED(),
     };
 
     if (!psram_available) {
@@ -639,25 +667,40 @@ esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation)
     }
 
     uint8_t madctl = 0x00;
+    int x_gap = 0;
+    int y_gap = 0;
 
     switch (rotation)
     {
     case BSP_DISPLAY_ROTATE_0:
         madctl = 0x00;
+        // Panel active area starts at native column 6; no row offset.
+        x_gap = 6; y_gap = 0;
         break;
     case BSP_DISPLAY_ROTATE_90:
         madctl = 0x60;
+        // MV bit (row/column exchange): native column axis maps to RASET.
+        // The 6-pixel physical column offset must be applied to y_gap.
+        x_gap = 0; y_gap = 6;
         break;
     case BSP_DISPLAY_ROTATE_180:
         madctl = 0xC0;
+        // No MV: column axis unchanged, same gap as 0°.
+        x_gap = 6; y_gap = 0;
         break;
     case BSP_DISPLAY_ROTATE_270:
         madctl = 0xA0;
+        // MV bit set: same axis swap as 90°.
+        x_gap = 0; y_gap = 6;
         break;
     default:
         ESP_LOGE(TAG, "Invalid rotation value: %d", rotation);
         return ESP_ERR_INVALID_ARG;
     }
+
+    // Re-apply the panel gap so draw_bitmap adds the offset to the correct
+    // axis (CASET for 0°/180°, RASET for 90°/270° where MV swaps axes).
+    esp_lcd_panel_set_gap(panel_handle, x_gap, y_gap);
 
     uint32_t lcd_cmd = 0x36;
     lcd_cmd &= 0xff;

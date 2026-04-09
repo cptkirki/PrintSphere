@@ -29,6 +29,8 @@ idf_component_register(
         "include/error_lookup/error_lookup.tsv"
     REQUIRES
         XPowersLib
+        app_update
+        esp_https_ota
         esp32_s3_touch_amoled_1_75
         esp_driver_gpio
         esp_event

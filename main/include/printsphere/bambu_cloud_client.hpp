@@ -77,6 +77,13 @@ struct BambuCloudSnapshot {
   bool tfa_required = false;
 };
 
+struct CloudDeviceInfo {
+  std::string serial;
+  std::string display_name;
+  PrinterModel model = PrinterModel::kUnknown;
+  bool online = false;
+};
+
 class BambuCloudClient {
  public:
   BambuCloudClient() = default;
@@ -124,6 +131,7 @@ class BambuCloudClient {
     bool session_ready = false;
     bool verification_required = false;
     bool tfa_required = false;
+    bool printer_online = true;
     uint64_t last_update_ms = 0;
     PrinterModel model = PrinterModel::kUnknown;
     SourceCapabilities capabilities{};
@@ -154,6 +162,7 @@ class BambuCloudClient {
   esp_err_t start();
   BambuCloudSnapshot snapshot() const;
   BambuCloudSnapshot refreshed_snapshot();
+  std::vector<CloudDeviceInfo> get_cloud_devices() const;
 
  private:
   enum class AuthMode : uint8_t {
@@ -230,6 +239,8 @@ class BambuCloudClient {
   CloudLiveRuntimeState live_runtime_{};
   mutable std::mutex rest_runtime_mutex_{};
   CloudRestRuntimeState rest_runtime_{};
+  mutable std::mutex cloud_devices_mutex_{};
+  std::vector<CloudDeviceInfo> cloud_devices_{};
   const ConfigStore* config_store_ = nullptr;
   BambuCloudCredentials credentials_{};
   std::string requested_serial_{};

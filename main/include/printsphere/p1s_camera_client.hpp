@@ -77,6 +77,7 @@ class P1sCameraClient {
   std::atomic<bool> refresh_requested_{false};
   std::atomic<bool> reconfigure_requested_{false};
   bool idle_notified_ = false;
+  uint32_t consecutive_connect_failures_ = 0;
 };
 
 }  // namespace printsphere

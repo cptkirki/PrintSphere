@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "lwip/sockets.h"
 
 namespace printsphere {
 
@@ -598,6 +599,13 @@ float packed_temp_current_value(int packed, float fallback) {
   return static_cast<float>(packed & 0xFFFF);
 }
 
+float normalize_temperature_candidate(float value) {
+  if (value > static_cast<float>(0xFFFF)) {
+    return packed_temp_current_value(static_cast<int>(value), value);
+  }
+  return value;
+}
+
 struct NozzleTemperatureBundle {
   float active = 0.0f;
   float secondary = 0.0f;
@@ -623,7 +631,10 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
       continue;
     }
 
-    const float temp = json_number_local(item, "temp", -1000.0f);
+    const float temp = normalize_temperature_candidate(json_number_local(item, "temp", -1000.0f));
+    const int id = json_int_local(item, "id", -1);
+    ESP_LOGI(kTag, "[DBG] nozzle info[%d]: id=%d temp=%.1f (raw int=%d)",
+             i, id, temp, (int)temp);
     if (temp <= -999.0f) {
       continue;
     }
@@ -632,7 +643,6 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
       first_temp = temp;
     }
 
-    const int id = json_int_local(item, "id", -1);
     if (id == active_nozzle_index) {
       *active_temp = temp;
     } else if (id >= 0 && *secondary_temp <= 0.0f) {
@@ -693,6 +703,8 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
                                                           float secondary_fallback) {
   NozzleTemperatureBundle bundle{active_fallback, secondary_fallback};
   const float direct = json_number_local(print, "nozzle_temper", -1000.0f);
+  ESP_LOGI(kTag, "[DBG] nozzle_temper=%.1f (raw int=%d) fallback=%.1f",
+           direct, (int)direct, active_fallback);
   if (direct > -999.0f) {
     bundle.active = direct;
   }
@@ -704,6 +716,8 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
                                active_nozzle_index, &bundle.active, &bundle.secondary);
   merge_nozzle_temp_candidates(child_array_local(extruder, "info"), active_nozzle_index,
                                &bundle.active, &bundle.secondary);
+  ESP_LOGI(kTag, "[DBG] nozzle bundle final: active=%.1f secondary=%.1f active_nozzle_idx=%d",
+           bundle.active, bundle.secondary, active_nozzle_index);
   return bundle;
 }
 
@@ -1073,6 +1087,8 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
   switch (static_cast<esp_mqtt_event_id_t>(event->event_id)) {
     case MQTT_EVENT_CONNECTED: {
       cancel_client_rebuild();
+      consecutive_probe_failures_ = 0;
+      consecutive_mqtt_errors_ = 0;
       mqtt_connected_ = true;
       received_payload_ = false;
       subscription_acknowledged_ = false;
@@ -1163,6 +1179,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       watchdog_probe_tick_ = 0;
       LocalPrinterRuntimeState runtime = runtime_state_copy();
       runtime.connection = PrinterConnectionState::kConnecting;
+      copy_text(&runtime.stage, "");
       copy_text(&runtime.raw_status, "");
       copy_text(&runtime.raw_stage, "");
       copy_text(&runtime.detail, "MQTT disconnected, waiting for reconnect");
@@ -1258,10 +1275,22 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
           ESP_LOGE(kTag, "MQTT refused by broker: %s",
                    connect_return_code_name(error->connect_return_code));
         } else if (error->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-          copy_text(&runtime.detail, "MQTT transport timeout or printer unreachable");
+          const int sock_err = error->esp_transport_sock_errno;
+          if (sock_err == ECONNREFUSED) {
+            copy_text(&runtime.detail, "Printer reachable but MQTT port closed");
+          } else if (sock_err == ETIMEDOUT || sock_err == 0) {
+            copy_text(&runtime.detail,
+                      "MQTT TLS handshake timeout – printer may be off or busy");
+          } else if (sock_err == EHOSTUNREACH || sock_err == ENETUNREACH) {
+            copy_text(&runtime.detail, "Printer network unreachable");
+          } else {
+            copy_text(&runtime.detail,
+                      std::string("MQTT transport error (errno=") +
+                          std::to_string(sock_err) + ")");
+          }
           ESP_LOGE(kTag, "MQTT transport error: esp_err=%s tls=0x%x sock_errno=%d",
                    esp_err_to_name(error->esp_tls_last_esp_err), error->esp_tls_stack_err,
-                   error->esp_transport_sock_errno);
+                   sock_err);
         } else {
           copy_text(&runtime.detail, "TLS or MQTT handshake failed");
           ESP_LOGE(kTag, "MQTT event error type=%d", static_cast<int>(error->error_type));
@@ -1273,7 +1302,15 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
 
       update_local_runtime_metadata(&runtime, true, false);
       store_runtime_state(std::move(runtime), true);
-      schedule_client_rebuild("mqtt error");
+      {
+        ++consecutive_mqtt_errors_;
+        const uint32_t backoff_ms =
+            consecutive_mqtt_errors_ <= 1 ? 2000U :
+            consecutive_mqtt_errors_ <= 2 ? 4000U :
+            consecutive_mqtt_errors_ <= 4 ? 8000U :
+            consecutive_mqtt_errors_ <= 6 ? 15000U : 30000U;
+        schedule_client_rebuild("mqtt error", backoff_ms);
+      }
       break;
     }
 
@@ -1523,6 +1560,10 @@ void PrinterClient::stop_client() {
 
   if (client_ != nullptr) {
     esp_mqtt_client_stop(client_);
+    // Brief delay to let the MQTT internal task fully unwind before destroying the
+    // client handle. Without this, destroying while the task is mid-TLS-handshake
+    // leaks ~13 KB of internal RAM (mbedTLS session context) per failed attempt.
+    vTaskDelay(pdMS_TO_TICKS(300));
     esp_mqtt_client_destroy(client_);
     client_ = nullptr;
   }
@@ -1566,9 +1607,14 @@ void PrinterClient::task_loop() {
         if (requested_at == 0 || tick_elapsed(requested_at, now, delay_ticks)) {
           ESP_LOGW(kTag, "Rebuilding MQTT client after disconnect/error");
           stop_client();
+          cancel_client_rebuild();
           vTaskDelay(pdMS_TO_TICKS(250));
           continue;
         }
+        // Rebuild delay not yet elapsed — wait instead of falling through to
+        // the client_==nullptr path which would immediately start a new TCP probe.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        continue;
       }
     }
 
@@ -1646,6 +1692,90 @@ void PrinterClient::task_loop() {
                connection.host.c_str(), static_cast<unsigned int>(connection.mqtt_port),
                connection.serial.c_str(), connection.mqtt_username.c_str());
 
+      // TCP probe: quick reachability check before expensive TLS+MQTT handshake
+      {
+        int probe_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (probe_sock >= 0) {
+          struct sockaddr_in dest = {};
+          dest.sin_family = AF_INET;
+          dest.sin_port = htons(connection.mqtt_port);
+          inet_aton(connection.host.c_str(), &dest.sin_addr);
+
+          int flags = fcntl(probe_sock, F_GETFL, 0);
+          fcntl(probe_sock, F_SETFL, flags | O_NONBLOCK);
+
+          int rc = connect(probe_sock, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+          if (rc < 0 && errno == EINPROGRESS) {
+            fd_set wset;
+            FD_ZERO(&wset);
+            FD_SET(probe_sock, &wset);
+            struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+            int sel = select(probe_sock + 1, nullptr, &wset, nullptr, &tv);
+            if (sel > 0) {
+              int sock_err = 0;
+              socklen_t optlen = sizeof(sock_err);
+              getsockopt(probe_sock, SOL_SOCKET, SO_ERROR, &sock_err, &optlen);
+              if (sock_err != 0) {
+                rc = -1;
+                errno = sock_err;
+              } else {
+                rc = 0;
+              }
+            } else {
+              rc = -1;
+              errno = ETIMEDOUT;
+            }
+          }
+
+          const int probe_errno = errno;
+          close(probe_sock);
+
+          if (rc < 0) {
+            LocalPrinterRuntimeState probe_fail = runtime_state_copy();
+            probe_fail.connection = PrinterConnectionState::kError;
+            probe_fail.lifecycle = PrintLifecycleState::kError;
+            copy_text(&probe_fail.raw_status, "");
+            copy_text(&probe_fail.raw_stage, "");
+            probe_fail.has_error = true;
+            probe_fail.non_error_stop = false;
+            probe_fail.show_stop_banner = false;
+            copy_text(&probe_fail.resolved_serial, connection.serial);
+
+            if (probe_errno == ECONNREFUSED) {
+              copy_text(&probe_fail.stage, "mqtt-port-closed");
+              copy_text(&probe_fail.detail,
+                        "Printer reachable but MQTT port closed – is it powered on?");
+              ESP_LOGW(kTag, "TCP probe: port %u refused on %s",
+                       static_cast<unsigned>(connection.mqtt_port),
+                       connection.host.c_str());
+            } else {
+              copy_text(&probe_fail.stage, "printer-offline");
+              copy_text(&probe_fail.detail,
+                        std::string("Printer not responding at ") + connection.host);
+              ESP_LOGW(kTag, "TCP probe: host %s unreachable (errno=%d)",
+                       connection.host.c_str(), probe_errno);
+            }
+
+            update_local_runtime_metadata(&probe_fail, true, false);
+            store_runtime_state(std::move(probe_fail), false);
+            publish_runtime_snapshot();
+            ++consecutive_probe_failures_;
+            const uint32_t backoff_ms =
+                consecutive_probe_failures_ <= 1 ? 1500U :
+                consecutive_probe_failures_ <= 2 ? 3000U :
+                consecutive_probe_failures_ <= 3 ? 5000U :
+                consecutive_probe_failures_ <= 5 ? 10000U : 20000U;
+            schedule_client_rebuild("tcp probe failed", backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+          }
+          ESP_LOGI(kTag, "TCP probe: port %u reachable on %s",
+                   static_cast<unsigned>(connection.mqtt_port),
+                   connection.host.c_str());
+          consecutive_probe_failures_ = 0;
+        }
+      }
+
       esp_mqtt_client_config_t mqtt_cfg = {};
       mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
       const std::string& local_ca_bundle = local_bambu_ca_bundle();
@@ -1666,7 +1796,7 @@ void PrinterClient::task_loop() {
       mqtt_cfg.session.disable_clean_session = false;
       mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
       mqtt_cfg.task.stack_size = 10240;
-      mqtt_cfg.network.timeout_ms = 10000;
+      mqtt_cfg.network.timeout_ms = 20000;
       mqtt_cfg.network.reconnect_timeout_ms = 5000;
       {
         std::lock_guard<std::mutex> lock(config_mutex_);

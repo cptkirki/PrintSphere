@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1664,6 +1665,11 @@ BambuCloudSnapshot BambuCloudClient::refreshed_snapshot() {
   return snapshot();
 }
 
+std::vector<CloudDeviceInfo> BambuCloudClient::get_cloud_devices() const {
+  std::lock_guard<std::mutex> lock(cloud_devices_mutex_);
+  return cloud_devices_;
+}
+
 BambuCloudClient::CloudLiveRuntimeState BambuCloudClient::live_runtime_copy() const {
   std::lock_guard<std::mutex> lock(live_runtime_mutex_);
   return live_runtime_;
@@ -1774,8 +1780,10 @@ void BambuCloudClient::apply_cloud_token_expired_state() {
 void BambuCloudClient::publish_combined_snapshot() {
   const CloudRestRuntimeState rest = rest_runtime_copy();
   const CloudLiveRuntimeState live = live_runtime_copy();
+  const bool live_has_recent_data =
+      is_recent_live_data(live.live_data_last_update_ms);
   const bool live_has_recent_state =
-      live.connected || is_recent_live_data(live.live_data_last_update_ms) ||
+      live.connected || live_has_recent_data ||
       live.chamber_light_pending;
   const SourceCapabilities live_capabilities =
       live_has_recent_state ? live.capabilities : SourceCapabilities{};
@@ -1827,13 +1835,13 @@ void BambuCloudClient::publish_combined_snapshot() {
   if (live_has_recent_state && has_text(live.resolved_serial)) {
     current.resolved_serial = text_string(live.resolved_serial);
   }
-  if (live_has_recent_state && has_text(live.raw_status)) {
+  if (live_has_recent_data && has_text(live.raw_status)) {
     current.raw_status = text_string(live.raw_status);
   }
-  if (live_has_recent_state && has_text(live.raw_stage)) {
+  if (live_has_recent_data && has_text(live.raw_stage)) {
     current.raw_stage = text_string(live.raw_stage);
   }
-  if (live_has_recent_state && has_text(live.stage)) {
+  if (live_has_recent_data && has_text(live.stage)) {
     current.stage = text_string(live.stage);
   }
   if (live_has_recent_state &&
@@ -1891,6 +1899,23 @@ void BambuCloudClient::publish_combined_snapshot() {
   } else if (rest.session_ready) {
     current.setup_stage = CloudSetupStage::kBindingPrinter;
   }
+
+  const bool stage_is_stale_connection =
+      current.stage == "subscribed" || current.stage == "connected" ||
+      current.stage == "mqtt";
+  const uint32_t sync_tick = initial_sync_tick_.load();
+  const bool cloud_mqtt_waiting_without_data =
+      mqtt_subscription_acknowledged_.load() && !received_live_payload_.load() &&
+      sync_tick != 0 &&
+      (xTaskGetTickCount() - sync_tick) >= kCloudInitialSyncTimeout;
+  if ((current.stage.empty() || stage_is_stale_connection) && !live_has_recent_data &&
+      (!rest.printer_online || cloud_mqtt_waiting_without_data)) {
+    current.stage = "offline";
+    if (current.lifecycle == PrintLifecycleState::kUnknown) {
+      current.lifecycle = PrintLifecycleState::kIdle;
+    }
+  }
+
   set_snapshot(std::move(current));
 }
 
@@ -2042,6 +2067,7 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
         runtime.configured = credentials_.can_password_login() || !access_token_.empty();
         runtime.connected = false;
         runtime.setup_stage = CloudSetupStage::kIdle;
+        copy_text(&runtime.stage, "");
         store_live_runtime(std::move(runtime), true);
       }
       ESP_LOGW(kTag, "Cloud MQTT disconnected");
@@ -2212,7 +2238,7 @@ bool BambuCloudClient::ensure_mqtt_client_started() {
   mqtt_cfg.buffer.out_size = 4096;
   mqtt_cfg.task.stack_size = 10240;
   mqtt_cfg.network.timeout_ms = 10000;
-  mqtt_cfg.network.reconnect_timeout_ms = 5000;
+  mqtt_cfg.network.reconnect_timeout_ms = 15000;
 
   mqtt_client_ = esp_mqtt_client_init(&mqtt_cfg);
   if (mqtt_client_ == nullptr) {
@@ -2466,6 +2492,47 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     return;
   }
 
+  // Bambu Cloud MQTT sends printer connectivity events on the device-specific report topic.
+  // Payload examples:
+  //   {"event": {"event": "client.disconnected", "disconnected_at": "1695009168663"}}
+  //   {"event": {"event": "client.connected",    "connected_at":    "1695009714757"}}
+  // The event arrives ~3-4 minutes after the printer powers off (cloud LWT/session expiry).
+  // On reconnect it arrives within seconds of the printer coming online.
+  const cJSON* event_wrapper = child_object(root, "event");
+  if (cJSON_IsObject(event_wrapper)) {
+    const std::string event_type = json_string(event_wrapper, "event", {});
+    if (event_type == "client.disconnected") {
+      ESP_LOGI(kTag, "Cloud event: printer disconnected — marking offline");
+      received_live_payload_ = false;
+      initial_sync_sent_ = false;
+      delayed_start_sent_ = false;
+      initial_sync_tick_ = 0;
+      CloudLiveRuntimeState runtime = live_runtime_copy();
+      runtime.connected = false;
+      copy_text(&runtime.stage, "offline");
+      copy_text(&runtime.raw_status, "OFFLINE");
+      if (runtime.lifecycle == PrintLifecycleState::kUnknown) {
+        runtime.lifecycle = PrintLifecycleState::kIdle;
+      }
+      copy_text(&runtime.detail, "Printer offline");
+      store_live_runtime(std::move(runtime), true);
+    } else if (event_type == "client.connected") {
+      // Note: ha-bambulab resets to offline first before re-onlining, because a client.connected
+      // may arrive without a preceding client.disconnected (e.g. after a reboot).  Reset sync
+      // state so the task loop re-issues GET_VERSION + PUSH_ALL and we receive fresh data.
+      ESP_LOGI(kTag, "Cloud event: printer reconnected — requesting fresh sync");
+      received_live_payload_ = false;
+      initial_sync_sent_ = false;
+      delayed_start_sent_ = false;
+      initial_sync_tick_ = 0;
+      request_initial_sync();
+    } else if (!event_type.empty()) {
+      ESP_LOGD(kTag, "Cloud event: unknown event type '%s'", event_type.c_str());
+    }
+    cJSON_Delete(root);
+    return;
+  }
+
   cJSON_Delete(root);
 }
 
@@ -2490,7 +2557,7 @@ void BambuCloudClient::task_loop() {
 
     if (reload_requested_.exchange(false) && config_store_ != nullptr) {
       stop_mqtt_client();
-      configure(config_store_->load_cloud_credentials(), config_store_->load_printer_config().serial);
+      configure(config_store_->load_cloud_credentials(), config_store_->load_active_printer_profile().serial);
       last_preview_fetch_tick = 0;
       preview_retry_not_before_tick = 0;
       last_preview_fetch_enabled = false;
@@ -2964,6 +3031,7 @@ bool BambuCloudClient::fetch_bindings() {
 
   std::string best_serial;
   const cJSON* best_device = nullptr;
+  std::vector<CloudDeviceInfo> all_devices;
   if (cJSON_IsArray(devices)) {
     const int count = cJSON_GetArraySize(devices);
     for (int i = 0; i < count; ++i) {
@@ -2972,6 +3040,17 @@ bool BambuCloudClient::fetch_bindings() {
       if (candidate.empty()) {
         continue;
       }
+
+      CloudDeviceInfo info;
+      info.serial = candidate;
+      info.model = detect_cloud_model(item, PrinterModel::kUnknown);
+      info.online = json_bool(item, "online", true);
+      // Try to get a display name from the device object
+      info.display_name = json_string(item, "name",
+          json_string(item, "dev_product_name",
+              json_string(item, "device_name", to_string(info.model))));
+      all_devices.push_back(std::move(info));
+
       if (!requested_serial_.empty() && candidate == requested_serial_) {
         best_serial = candidate;
         best_device = item;
@@ -2982,6 +3061,10 @@ bool BambuCloudClient::fetch_bindings() {
         best_device = item;
       }
     }
+  }
+  {
+    std::lock_guard<std::mutex> lock(cloud_devices_mutex_);
+    cloud_devices_ = std::move(all_devices);
   }
   if (best_serial.empty()) {
     best_serial = requested_serial_;
@@ -3019,6 +3102,7 @@ bool BambuCloudClient::fetch_bindings() {
     current.chamber_light_supported =
         printer_model_has_chamber_light(current.model);
     const bool printer_online = json_bool(best_device, "online", true);
+    current.printer_online = printer_online;
     if (!has_text(current.detail) || existing_detail == "Restored Bambu Cloud session" ||
         existing_detail == "Logging in to Bambu Cloud" ||
         existing_detail == "Waiting for Wi-Fi for Bambu Cloud" ||
@@ -3515,11 +3599,11 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
 
   esp_http_client_config_t config = {};
   config.url = url.c_str();
-  config.timeout_ms = 15000;
+  config.timeout_ms = 10000;
   config.crt_bundle_attach = esp_crt_bundle_attach;
   config.method = (std::strcmp(method, "POST") == 0) ? HTTP_METHOD_POST : HTTP_METHOD_GET;
   config.keep_alive_enable = false;
-  config.buffer_size = 1024;
+  config.buffer_size = 2048;
   config.buffer_size_tx = 1024;
 
   esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -3573,11 +3657,20 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
   }
 
   *status_code = esp_http_client_get_status_code(client);
-  char buffer[512];
+  constexpr int64_t kMaxReadDurationUs = 20 * 1000 * 1000;  // 20s total read deadline
+  const int64_t read_start_us = esp_timer_get_time();
+  char buffer[1024];
   while (true) {
+    if (esp_timer_get_time() - read_start_us > kMaxReadDurationUs) {
+      ESP_LOGW(kTag, "HTTP read deadline exceeded for %s (%d bytes received)",
+               url.c_str(), static_cast<int>(response_body->size()));
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      return false;
+    }
     const int read = esp_http_client_read(client, buffer, sizeof(buffer));
     if (read < 0) {
-      ESP_LOGW(kTag, "HTTP read failed for %s", url.c_str());
+      ESP_LOGW(kTag, "HTTP read failed for %s (errno=%d)", url.c_str(), errno);
       esp_http_client_close(client);
       esp_http_client_cleanup(client);
       return false;

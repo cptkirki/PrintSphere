@@ -45,16 +45,25 @@ constexpr int kPage3NoteWithImageY = 150;
 constexpr int kPage3SubnoteWithImageY = 182;
 constexpr int kAuxTempRowY = 28;
 constexpr int kSwipeThresholdPx = 24;
-constexpr int kRotatedVisualOffsetX = -6;
-constexpr int kRotatedVisualOffsetY = 12;
+constexpr int kRotatedVisualOffsetX = 0;
+constexpr int kRotatedVisualOffsetY = 0;
 constexpr int kManualMinBrightnessPercent = 4;
-constexpr uint32_t kRingAnimationTickMs = 220U;
-constexpr uint8_t kRingPulseDepthPercent = 35U;
+constexpr uint32_t kRingAnimationTickMs = 33U;
+constexpr uint8_t kRingPulseDepthPercent = 55U;
+constexpr uint32_t kDotPulseDurationMs = 1500U;
+constexpr int32_t kDotPulseOpaMin = 80;
+constexpr int32_t kDotPulseOpaMax = 255;
+constexpr int32_t kParallaxTitleMaxY = -18;
+constexpr int32_t kParallaxCardsMaxY = -8;
 constexpr uint32_t kBatteryDimTimeoutIdleMs = 20000U;
 constexpr uint32_t kBatteryOffTimeoutIdleMs = 60000U;
 constexpr uint32_t kBatteryDimTimeoutActiveMs = 30000U;
 constexpr uint32_t kBatteryOffTimeoutActiveMs = 120000U;
 constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint32_t kCardRevealDurationMs = 300U;
+constexpr int32_t kCardRevealYStart = 28;
+constexpr uint32_t kCardRevealStaggerMs = 55U;
+constexpr uint32_t kPrintRotPeriodMs = 18000U;  // 18s per ambient sweep rotation
 constexpr uint32_t kRingBaseDark = 0x101010;
 constexpr uint32_t kRingIdleSolid = 0x404040;
 constexpr char kDegreeC[] = "\xC2\xB0""C";
@@ -527,6 +536,7 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     case PrintLifecycleState::kPaused:
       visual.main_hex = kRingBaseDark;
       visual.indicator_hex = colors.printing;
+      visual.animated = true;  // enable ambient sweep rotation in handle_ring_timer
       return visual;
     case PrintLifecycleState::kPreparing:
       visual.main_hex = colors.preheat;
@@ -945,6 +955,38 @@ bool should_show_logo(const PrinterSnapshot& snapshot) {
   }
 }
 
+void dot_pulse_exec_cb(void* obj, int32_t val) {
+  lv_obj_set_style_bg_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(val), 0);
+}
+
+void start_dot_pulse(lv_obj_t* dot) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, dot);
+  lv_anim_set_exec_cb(&a, dot_pulse_exec_cb);
+  lv_anim_set_values(&a, kDotPulseOpaMin, kDotPulseOpaMax);
+  lv_anim_set_duration(&a, kDotPulseDurationMs);
+  lv_anim_set_reverse_duration(&a, kDotPulseDurationMs);
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+  lv_anim_start(&a);
+}
+
+// Micro-interaction: uniform scale on card tap (256 = 100% in LVGL 9)
+void card_scale_exec_cb(void* obj, int32_t val) {
+  lv_obj_set_style_transform_scale(static_cast<lv_obj_t*>(obj), val, 0);
+}
+
+// Cascading reveal: vertical slide-in per card
+void card_reveal_y_exec_cb(void* obj, int32_t val) {
+  lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(obj), val, 0);
+}
+
+// Cascading reveal: fade-in per card
+void card_reveal_opa_exec_cb(void* obj, int32_t val) {
+  lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(val), 0);
+}
+
 }  // namespace
 
 void Ui::set_display_rotation(DisplayRotation rotation) {
@@ -962,9 +1004,14 @@ esp_err_t Ui::initialize() {
   portal_hint_boot_ms_ = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
 
   bsp_display_cfg_t display_cfg = {
-      .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+      .lv_adapter_cfg = []() {
+        esp_lv_adapter_config_t cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+        // Pin LVGL render task to core 1 so WiFi/BT on core 0 can't interrupt rendering.
+        cfg.task_core_id = 1;
+        return cfg;
+      }(),
       .rotation = ESP_LV_ADAPTER_ROTATE_0,
-      .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+      .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TE_SYNC,
       .touch_flags = {
           .swap_xy = 0,
           .mirror_x = 1,
@@ -988,6 +1035,22 @@ esp_err_t Ui::initialize() {
   last_activity_tick_ms_.store(lv_tick_get());
   set_brightness_percent(kDefaultBrightnessPercent);
   ESP_RETURN_ON_ERROR(build_dashboard(), kTag, "build_dashboard failed");
+
+  // With LV_SCROLL_SNAP_NONE the pager decelerates freely after finger release.
+  // scroll_throw=90 shrinks velocity to ~10% per tick, reaching zero in ~3 ticks
+  // (~30 ms). SCROLL_END fires almost immediately and our single set_active_page()
+  // animation takes over cleanly — no competing LVGL snap animations.
+  {
+    lv_indev_t* indev = lv_indev_get_next(nullptr);
+    while (indev != nullptr) {
+      if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+        lv_indev_set_scroll_throw(indev, 90);
+        break;
+      }
+      indev = lv_indev_get_next(indev);
+    }
+  }
+
   ring_anim_timer_ = lv_timer_create(&Ui::ring_timer_cb, kRingAnimationTickMs, this);
 
   initialized_ = true;
@@ -1091,6 +1154,287 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
   update_portal_access_visuals_locked();
 }
 
+// --- Page 0: printer cards ---
+
+void Ui::printer_card_click_cb(lv_event_t* event) {
+  auto* self = static_cast<Ui*>(lv_event_get_user_data(event));
+  lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(event));
+  for (const auto& cw : self->page0_cards_) {
+    if (cw.card == target) {
+      self->pending_printer_switch_ = cw.profile_index;
+      self->note_activity(true);
+
+      // Micro-interaction: quick scale bounce (100% → 91% → 100%)
+      lv_anim_t sa;
+      lv_anim_init(&sa);
+      lv_anim_set_var(&sa, target);
+      lv_anim_set_exec_cb(&sa, card_scale_exec_cb);
+      lv_anim_set_values(&sa, 256, 233);
+      lv_anim_set_duration(&sa, 75);
+      lv_anim_set_reverse_duration(&sa, 110);
+      lv_anim_set_path_cb(&sa, lv_anim_path_ease_out);
+      lv_anim_start(&sa);
+      break;
+    }
+  }
+}
+
+int Ui::consume_printer_switch_request() {
+  int val = pending_printer_switch_;
+  pending_printer_switch_ = -1;
+  return val;
+}
+
+void Ui::apply_page0_parallax() {
+  if (page0_title_ == nullptr || page0_card_list_ == nullptr || pager_ == nullptr) {
+    return;
+  }
+
+  int scroll_x = lv_obj_get_scroll_x(pager_);
+  if (scroll_x < 0) scroll_x = 0;
+
+  const int page_w = board::kDisplayWidth;
+  const int clamped = (scroll_x > page_w) ? page_w : scroll_x;
+
+  // Page 0 content: fade out + shift up as we scroll away
+  const int32_t title_y = static_cast<int32_t>(kParallaxTitleMaxY * clamped / page_w);
+  const int32_t cards_y = static_cast<int32_t>(kParallaxCardsMaxY * clamped / page_w);
+  const lv_opa_t page0_opa = static_cast<lv_opa_t>(255 - 255 * clamped / page_w);
+
+  lv_obj_set_style_translate_y(page0_title_, title_y, 0);
+  lv_obj_set_style_translate_y(page0_card_list_, cards_y, 0);
+  // NOTE: lv_obj_set_style_opa() on large containers forces LVGL to render the entire
+  // widget tree into a temporary offscreen layer before blending it at the given opacity.
+  // With LV_DRAW_LAYER_SIMPLE_BUF_SIZE=24KB on a 466px-wide display that means ~14 layer
+  // passes for the card list alone — triggered every LV_EVENT_SCROLL. This reduces scroll
+  // fps to ~4. Use only translate_y for the parallax shift; no opa on large containers.
+  if (page0_empty_note_ != nullptr) {
+    // empty_note is a single small label — opa is cheap here
+    lv_obj_set_style_opa(page0_empty_note_, page0_opa, 0);
+  }
+
+  // Overlay (arc, progress, battery): fade in as we leave page 0
+  const lv_opa_t overlay_opa = static_cast<lv_opa_t>(255 * clamped / page_w);
+
+  // fixed_overlay_ contains the full-screen arc (466×466 px).  Setting opa to any
+  // fractional value forces LVGL to render the entire widget tree into a 24 KB
+  // offscreen-layer buffer → ~18 layer-passes per scroll event → measurable stutter.
+  // Instead we snap to binary visibility: hidden while page 0 dominates, fully
+  // opaque once we cross the midpoint toward page 1.  Exactly 0 and LV_OPA_COVER
+  // are both "fully decided" → LVGL skips the layer path entirely.
+  if (clamped < page_w / 2) {
+    set_hidden(fixed_overlay_, true);
+  } else {
+    set_hidden(fixed_overlay_, false);
+    lv_obj_set_style_opa(fixed_overlay_, LV_OPA_COVER, 0);
+  }
+
+  // Small text labels: opa fade is cheap (entire label fits in the 24 KB layer buffer
+  // in a single pass), so the visual cross-fade is worth keeping.
+  lv_obj_set_style_opa(progress_label_, overlay_opa, 0);
+  lv_obj_set_style_opa(battery_icon_label_, overlay_opa, 0);
+  lv_obj_set_style_opa(battery_pct_label_, overlay_opa, 0);
+}
+
+void Ui::update_printer_cards(const std::vector<PrinterCardInfo>& cards) {
+  if (!initialized_) {
+    return;
+  }
+
+  // Only rebuild (and trigger the reveal animation) when the card data has
+  // actually changed — the caller runs every main-loop tick, so without this
+  // guard the animation restarts hundreds of times per second.
+  const auto cards_equal = [](const std::vector<PrinterCardInfo>& a,
+                               const std::vector<PrinterCardInfo>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i].index != b[i].index ||
+          a[i].active != b[i].active ||
+          a[i].connected != b[i].connected ||
+          a[i].name != b[i].name ||
+          a[i].model != b[i].model ||
+          a[i].host != b[i].host) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (cards_equal(cards, last_printer_cards_)) {
+    return;
+  }
+  last_printer_cards_ = cards;
+
+  LvglLockGuard lock(200);
+  if (!lock.locked()) {
+    return;
+  }
+
+  rebuild_printer_cards_locked(cards);
+}
+
+void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards) {
+  // Remove old card widgets
+  for (auto& cw : page0_cards_) {
+    if (cw.card != nullptr) {
+      lv_obj_delete(cw.card);
+    }
+  }
+  page0_cards_.clear();
+
+  const bool empty = cards.empty();
+  set_hidden(page0_card_list_, empty);
+  set_hidden(page0_empty_note_, !empty);
+  if (empty) {
+    return;
+  }
+
+  const lv_font_t* font_name = &dosis_20;
+  const lv_font_t* font_detail = &lv_font_montserrat_14;
+
+  int card_idx = 0;
+  for (const auto& info : cards) {
+    // Card container — glasmorphism-lite: semi-transparent bg + shadow elevation
+    lv_obj_t* card = lv_obj_create(page0_card_list_);
+    lv_obj_set_size(card, 340, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, 72, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1E1E1E), 0);
+    lv_obj_set_style_bg_opa(card, 195, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_pad_row(card, 2, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    // Shadow for 3D depth on OLED
+    lv_obj_set_style_shadow_width(card, 20, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_50, 0);
+    lv_obj_set_style_shadow_offset_y(card, 6, 0);
+
+    if (info.active) {
+      lv_obj_set_style_border_color(card, lv_color_hex(0x00CC66), 0);
+      lv_obj_set_style_border_width(card, 2, 0);
+      lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
+    } else {
+      // Subtle border to define card edges on dark background
+      lv_obj_set_style_border_color(card, lv_color_hex(0x303030), 0);
+      lv_obj_set_style_border_width(card, 1, 0);
+      lv_obj_set_style_border_opa(card, LV_OPA_60, 0);
+    }
+
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(card, &Ui::printer_card_click_cb, LV_EVENT_CLICKED, this);
+
+    // Status dot — small colored circle in top-right
+    lv_obj_t* dot = lv_obj_create(card);
+    lv_obj_set_size(dot, 10, 10);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(dot, info.connected ? lv_color_hex(0x00CC66) : lv_color_hex(0x666666), 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_align(dot, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    if (info.connected) {
+      start_dot_pulse(dot);
+    }
+
+    // Printer name (bold, larger)
+    lv_obj_t* name_lbl = lv_label_create(card);
+    const std::string display_name = info.name.empty() ? info.model : info.name;
+    set_label_text_if_changed(name_lbl, display_name);
+    lv_obj_set_width(name_lbl, 300);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(name_lbl, font_name, 0);
+    lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // Model
+    lv_obj_t* model_lbl = lv_label_create(card);
+    set_label_text_if_changed(model_lbl, info.model.empty() ? "Unknown" : info.model);
+    lv_obj_set_width(model_lbl, 300);
+    lv_label_set_long_mode(model_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(model_lbl, font_detail, 0);
+    lv_obj_set_style_text_color(model_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_align_to(model_lbl, name_lbl, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    // Host IP
+    lv_obj_t* host_lbl = lv_label_create(card);
+    set_label_text_if_changed(host_lbl, info.host.empty() ? "No local IP" : info.host);
+    lv_obj_set_width(host_lbl, 300);
+    lv_label_set_long_mode(host_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(host_lbl, font_detail, 0);
+    lv_obj_set_style_text_color(host_lbl, lv_color_hex(0x666666), 0);
+    lv_obj_align_to(host_lbl, model_lbl, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    PrinterCardWidgets cw;
+    cw.card = card;
+    cw.name_label = name_lbl;
+    cw.model_label = model_lbl;
+    cw.host_label = host_lbl;
+    cw.status_dot = dot;
+    cw.profile_index = info.index;
+    page0_cards_.push_back(cw);
+
+    // Cascading reveal: start hidden below, fade + slide in with staggered delay
+    lv_obj_set_style_opa(card, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_translate_y(card, kCardRevealYStart, 0);
+    const uint32_t reveal_delay = static_cast<uint32_t>(card_idx) * kCardRevealStaggerMs;
+
+    lv_anim_t ry;
+    lv_anim_init(&ry);
+    lv_anim_set_var(&ry, card);
+    lv_anim_set_exec_cb(&ry, card_reveal_y_exec_cb);
+    lv_anim_set_values(&ry, kCardRevealYStart, 0);
+    lv_anim_set_duration(&ry, kCardRevealDurationMs);
+    lv_anim_set_delay(&ry, reveal_delay);
+    LV_ANIM_SET_EASE_OUT_BACK(&ry);
+    lv_anim_set_path_cb(&ry, lv_anim_path_custom_bezier3);
+    lv_anim_start(&ry);
+
+    lv_anim_t ro;
+    lv_anim_init(&ro);
+    lv_anim_set_var(&ro, card);
+    lv_anim_set_exec_cb(&ro, card_reveal_opa_exec_cb);
+    lv_anim_set_values(&ro, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&ro, kCardRevealDurationMs);
+    lv_anim_set_delay(&ro, reveal_delay);
+    lv_anim_set_path_cb(&ro, lv_anim_path_ease_out);
+    lv_anim_start(&ro);
+
+    ++card_idx;
+  }
+}
+
+void Ui::replay_card_animations_locked() {
+  int card_idx = 0;
+  for (const PrinterCardWidgets& cw : page0_cards_) {
+    lv_obj_set_style_opa(cw.card, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_translate_y(cw.card, kCardRevealYStart, 0);
+    const uint32_t reveal_delay = static_cast<uint32_t>(card_idx) * kCardRevealStaggerMs;
+
+    lv_anim_t ry;
+    lv_anim_init(&ry);
+    lv_anim_set_var(&ry, cw.card);
+    lv_anim_set_exec_cb(&ry, card_reveal_y_exec_cb);
+    lv_anim_set_values(&ry, kCardRevealYStart, 0);
+    lv_anim_set_duration(&ry, kCardRevealDurationMs);
+    lv_anim_set_delay(&ry, reveal_delay);
+    LV_ANIM_SET_EASE_OUT_BACK(&ry);
+    lv_anim_set_path_cb(&ry, lv_anim_path_custom_bezier3);
+    lv_anim_start(&ry);
+
+    lv_anim_t ro;
+    lv_anim_init(&ro);
+    lv_anim_set_var(&ro, cw.card);
+    lv_anim_set_exec_cb(&ro, card_reveal_opa_exec_cb);
+    lv_anim_set_values(&ro, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&ro, kCardRevealDurationMs);
+    lv_anim_set_delay(&ro, reveal_delay);
+    lv_anim_set_path_cb(&ro, lv_anim_path_ease_out);
+    lv_anim_start(&ro);
+
+    ++card_idx;
+  }
+}
+
 void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
   if (!initialized_) {
     return;
@@ -1147,6 +1491,11 @@ void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
     lv_obj_set_style_text_color(progress_label_, text_color, 0);
     lv_obj_set_style_text_color(status_label_, text_color, 0);
     last_ring_text_hex_ = text_hex;
+  }
+  // Reset arc rotation to top (270°) for static states so ambient sweep
+  // is only active when the ring timer is running (ring.animated == true).
+  if (!ring.animated) {
+    lv_arc_set_rotation(status_arc_, 270);
   }
 }
 
@@ -1254,8 +1603,9 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
 
   const std::string battery_icon = battery_icon_text(snapshot);
   const std::string battery_pct = battery_pct_text(snapshot);
-  set_label_text_if_changed(battery_icon_label_, battery_icon);
-  set_label_text_if_changed(battery_pct_label_, battery_pct);
+  const bool show_battery = snapshot.battery_present;
+  set_label_text_if_changed(battery_icon_label_, show_battery ? battery_icon : "");
+  set_label_text_if_changed(battery_pct_label_, show_battery ? battery_pct : "");
 
   const std::string preview_note = preview_note_text(snapshot);
   const std::string preview_subnote = preview_subnote_text(snapshot);
@@ -1265,7 +1615,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   if (snapshot.preview_blob && !snapshot.preview_blob->empty()) {
     const bool preview_blob_changed = last_preview_blob_.get() != snapshot.preview_blob.get();
     last_preview_blob_ = snapshot.preview_blob;
-    if (active_page_ == 1) {
+    if (active_page_ == 2) {
       has_preview_image = ensure_preview_image_loaded_locked(preview_blob_changed);
     } else if (preview_blob_changed) {
       release_preview_image_locked();
@@ -1412,7 +1762,7 @@ void Ui::handle_ring_timer() {
 }
 
 esp_err_t Ui::build_dashboard() {
-  LvglLockGuard lock(1000);
+  LvglLockGuard lock(3000);
   if (!lock.locked()) {
     return ESP_ERR_TIMEOUT;
   }
@@ -1438,7 +1788,10 @@ esp_err_t Ui::build_dashboard() {
   enable_touch_bubble(pager_);
   lv_obj_set_flex_flow(pager_, LV_FLEX_FLOW_ROW);
   lv_obj_set_scroll_dir(pager_, LV_DIR_HOR);
-  lv_obj_set_scroll_snap_x(pager_, LV_SCROLL_SNAP_CENTER);
+  // LV_SCROLL_SNAP_NONE: we handle page snapping ourselves in handle_pager_event.
+  // LV_SCROLL_SNAP_CENTER would make LVGL launch its own snap animation that conflicts
+  // with our set_active_page() call, causing double-animation jitter and page-skip bugs.
+  lv_obj_set_scroll_snap_x(pager_, LV_SCROLL_SNAP_NONE);
   lv_obj_set_scrollbar_mode(pager_, LV_SCROLLBAR_MODE_OFF);
   lv_obj_add_event_cb(pager_, &Ui::pager_event_cb, LV_EVENT_ALL, this);
 
@@ -1450,12 +1803,45 @@ esp_err_t Ui::build_dashboard() {
     return page;
   };
 
+  page0_ = create_page(pager_);
   page1_ = create_page(pager_);
   page2_ = create_page(pager_);
   page3_ = create_page(pager_);
+  enable_touch_bubble(page0_);
   enable_touch_bubble(page1_);
   enable_touch_bubble(page2_);
   enable_touch_bubble(page3_);
+
+  // --- Page 0: printer selection ---
+  page0_title_ = lv_label_create(page0_);
+  set_label_text_if_changed(page0_title_, "Printers");
+  lv_obj_set_width(page0_title_, 320);
+  lv_label_set_long_mode(page0_title_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(page0_title_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(page0_title_, dosis32, 0);
+  lv_obj_set_style_text_color(page0_title_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(page0_title_, LV_ALIGN_TOP_MID, 0, 60);
+
+  page0_card_list_ = lv_obj_create(page0_);
+  lv_obj_set_size(page0_card_list_, 380, 300);
+  lv_obj_align(page0_card_list_, LV_ALIGN_CENTER, 0, 20);
+  make_transparent(page0_card_list_);
+  lv_obj_set_flex_flow(page0_card_list_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(page0_card_list_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(page0_card_list_, 10, 0);
+  lv_obj_set_style_pad_all(page0_card_list_, 0, 0);
+  lv_obj_set_scroll_dir(page0_card_list_, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(page0_card_list_, LV_SCROLLBAR_MODE_OFF);
+
+  page0_empty_note_ = lv_label_create(page0_);
+  set_label_text_if_changed(page0_empty_note_, "No printers configured.\nUse the web portal to add printers.");
+  lv_obj_set_width(page0_empty_note_, 320);
+  lv_label_set_long_mode(page0_empty_note_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(page0_empty_note_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(page0_empty_note_, info20, 0);
+  lv_obj_set_style_text_color(page0_empty_note_, lv_color_hex(0x666666), 0);
+  lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_add_flag(page0_empty_note_, LV_OBJ_FLAG_HIDDEN);
 
   fixed_overlay_ = lv_obj_create(screen_);
   lv_obj_set_size(fixed_overlay_, board::kDisplayWidth, board::kDisplayHeight);
@@ -1769,9 +2155,9 @@ esp_err_t Ui::build_dashboard() {
   enable_touch_bubble(page3_subnote_);
 
   lv_obj_add_event_cb(screen_, &Ui::screen_event_cb, LV_EVENT_ALL, this);
-  lv_obj_scroll_to_x(pager_, 0, LV_ANIM_OFF);
+  lv_obj_scroll_to_x(pager_, board::kDisplayWidth, LV_ANIM_OFF);
 
-  active_page_ = 0;
+  active_page_ = 1;
   scrolling_ = false;
   deferred_snapshot_pending_ = false;
   detail_visible_ = true;
@@ -1785,37 +2171,45 @@ esp_err_t Ui::build_dashboard() {
 }
 
 void Ui::apply_page_visibility() {
-  const bool show_page1 = !scrolling_ && active_page_ == 0;
-  const bool show_page2 = !scrolling_ && active_page_ == 1;
-  const bool show_page3 = !scrolling_ && active_page_ == 2;
+  const bool settled_page1 = !scrolling_ && active_page_ == 1;
+  const bool settled_page2 = !scrolling_ && active_page_ == 2;
+  const bool settled_page3 = !scrolling_ && active_page_ == 3;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_portal_hint =
-      show_page1 && !portal_hint_text_.empty() &&
+      settled_page1 && !portal_hint_text_.empty() &&
       (portal_hint_has_priority || !detail_visible_);
 
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
-  set_hidden(status_label_, !show_page1);
-  set_hidden(detail_label_, !show_page1 || !detail_visible_ || show_portal_hint);
-  set_hidden(layer_label_, !show_page1);
-  set_hidden(nozzle_prefix_label_, !show_page1);
-  set_hidden(nozzle_value_label_, !show_page1);
-  set_hidden(nozzle_aux_label_, !show_page1 || !nozzle_aux_visible_);
-  set_hidden(bed_prefix_label_, !show_page1);
-  set_hidden(bed_value_label_, !show_page1);
-  set_hidden(bed_aux_label_, !show_page1 || !bed_aux_visible_);
-  set_hidden(remaining_row_, !show_page1);
-  set_hidden(badge_slot_, !show_page1);
+
+  // Page 1 detail labels — show only when settled on page 1
+  set_hidden(status_label_, !settled_page1);
+  set_hidden(detail_label_, !settled_page1 || !detail_visible_ || show_portal_hint);
+  set_hidden(layer_label_, !settled_page1);
+  set_hidden(nozzle_prefix_label_, !settled_page1);
+  set_hidden(nozzle_value_label_, !settled_page1);
+  set_hidden(nozzle_aux_label_, !settled_page1 || !nozzle_aux_visible_);
+  set_hidden(bed_prefix_label_, !settled_page1);
+  set_hidden(bed_value_label_, !settled_page1);
+  set_hidden(bed_aux_label_, !settled_page1 || !bed_aux_visible_);
+  set_hidden(remaining_row_, !settled_page1);
+  set_hidden(badge_slot_, !settled_page1);
   set_hidden(portal_hint_label_, !show_portal_hint);
-  set_hidden(page2_image_, !show_page2 || !preview_image_visible_);
-  set_hidden(page3_image_, !show_page3 || !camera_image_visible_);
+  set_hidden(page2_image_, !settled_page2 || !preview_image_visible_);
+  set_hidden(page3_image_, !settled_page3 || !camera_image_visible_);
+
+  // Overlay + page0 opacity are driven by apply_page0_parallax.
+  // When not scrolling, snap to final state.
+  if (!scrolling_) {
+    apply_page0_parallax();
+  }
 
   apply_logo_visibility();
   update_portal_access_visuals_locked();
 }
 
 void Ui::apply_logo_visibility() {
-  const bool show_badge_slot = !scrolling_ && active_page_ == 0;
+  const bool show_badge_slot = !scrolling_ && active_page_ == 1;
   if (!show_badge_slot) {
     set_hidden(logo_badge_, true);
     set_hidden(sync_spinner_, true);
@@ -1872,6 +2266,10 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
     lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
   }
   scrolling_ = false;
+  apply_page0_parallax();
+  if (ring_anim_timer_ != nullptr) {
+    lv_timer_resume(ring_anim_timer_);
+  }
 }
 
 bool Ui::page_enabled(int page) const {
@@ -1879,8 +2277,10 @@ bool Ui::page_enabled(int page) const {
     case 0:
       return true;
     case 1:
-      return preview_page_available_;
+      return true;
     case 2:
+      return preview_page_available_;
+    case 3:
       return camera_page_available_;
     default:
       return false;
@@ -1890,10 +2290,12 @@ bool Ui::page_enabled(int page) const {
 lv_obj_t* Ui::page_object(int page) const {
   switch (page) {
     case 0:
-      return page1_;
+      return page0_;
     case 1:
-      return page2_;
+      return page1_;
     case 2:
+      return page2_;
+    case 3:
       return page3_;
     default:
       return nullptr;
@@ -1902,7 +2304,7 @@ lv_obj_t* Ui::page_object(int page) const {
 
 int Ui::next_enabled_page(int page, int direction) const {
   int candidate = page + direction;
-  while (candidate >= 0 && candidate <= 2) {
+  while (candidate >= 0 && candidate <= 3) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -1916,7 +2318,7 @@ int Ui::clamp_enabled_page(int page) const {
     return page;
   }
 
-  for (int candidate = 0; candidate <= 2; ++candidate) {
+  for (int candidate = 0; candidate <= 3; ++candidate) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -1932,11 +2334,14 @@ int Ui::nearest_enabled_page_for_scroll() const {
     scroll_x = -scroll_x;
   }
 
+  // With LV_SCROLL_SNAP_NONE + scroll_throw=90, the throw decays in ~3 ticks so
+  // scroll_x already reflects the post-throw resting position when SCROLL_END fires.
+  // Simply pick whichever page center is closest to the viewport center.
   const int viewport_center = scroll_x + (board::kDisplayWidth / 2);
   int best_page = clamp_enabled_page(active_page_);
   int best_distance = INT32_MAX;
 
-  for (int page = 0; page <= 2; ++page) {
+  for (int page = 0; page <= 3; ++page) {
     if (!page_enabled(page)) {
       continue;
     }
@@ -1962,17 +2367,27 @@ void Ui::set_active_page(int page) {
   const int previous_page = active_page_;
   lv_obj_update_layout(pager_);
   if (lv_obj_t* target_page = page_object(clamped_page); target_page != nullptr) {
+    // LV_ANIM_ON with ease_in_out causes visible stutter: the ease-in phase is
+    // intentionally slow. The drag has already moved the pager visually — snap to
+    // final position instantly in one frame.
     lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
   }
-  if (previous_page == 1 && clamped_page != 1) {
+  if (previous_page == 2 && clamped_page != 2) {
     release_preview_image_locked();
     preview_image_visible_ = false;
   }
   active_page_ = clamped_page;
-  if (active_page_ == 1) {
+  if (clamped_page == 0 && previous_page != 0) {
+    replay_card_animations_locked();
+  }
+  if (active_page_ == 2) {
     preview_image_visible_ = ensure_preview_image_loaded_locked(false);
   }
   scrolling_ = false;
+  apply_page0_parallax();
+  if (ring_anim_timer_ != nullptr) {
+    lv_timer_resume(ring_anim_timer_);
+  }
   apply_page_visibility();
   if (deferred_snapshot_pending_) {
     apply_snapshot_locked(deferred_snapshot_, true);
@@ -1983,12 +2398,21 @@ void Ui::set_active_page(int page) {
 
 void Ui::handle_pager_event(lv_event_t* event) {
   const lv_event_code_t code = lv_event_get_code(event);
-  if (code != LV_EVENT_SCROLL_BEGIN && code != LV_EVENT_SCROLL_END && code != LV_EVENT_RELEASED) {
+
+  if (code == LV_EVENT_SCROLL) {
+    apply_page0_parallax();
+    return;
+  }
+
+  if (code != LV_EVENT_SCROLL_BEGIN && code != LV_EVENT_SCROLL_END) {
     return;
   }
 
   if (code == LV_EVENT_SCROLL_BEGIN) {
     scrolling_ = true;
+    if (ring_anim_timer_ != nullptr) {
+      lv_timer_pause(ring_anim_timer_);
+    }
     apply_page_visibility();
     return;
   }
@@ -2076,19 +2500,10 @@ void Ui::handle_screen_event(lv_event_t* event) {
       return;
     }
 
-    if (abs_dx >= kSwipeThresholdPx && abs_dx > abs_dy + 8) {
-      if (dx < 0) {
-        const int next_page = next_enabled_page(active_page_, 1);
-        if (next_page != active_page_) {
-          set_active_page(next_page);
-        }
-      } else if (dx > 0) {
-        const int previous_page = next_enabled_page(active_page_, -1);
-        if (previous_page != active_page_) {
-          set_active_page(previous_page);
-        }
-      }
-    } else if (active_page_ == 2 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
+    // Horizontal page swiping is handled by the LVGL pager (flex-row +
+    // LV_SCROLL_SNAP_NONE → handle_pager_event snaps to nearest page on SCROLL_END).
+    // Only handle taps here (camera refresh on page 3).
+    if (active_page_ == 3 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
       std::lock_guard<std::mutex> lock(camera_refresh_mutex_);
       camera_refresh_requested_ = true;
     }
@@ -2096,7 +2511,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 }
 
 void Ui::update_portal_access_visuals_locked() {
-  const bool show_page1 = !scrolling_ && active_page_ == 0;
+  const bool show_page1 = !scrolling_ && active_page_ == 1;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_hint = portal_hint_label_ != nullptr && show_page1 && !portal_hint_text_.empty() &&
                          (portal_hint_has_priority || !detail_visible_);
@@ -2158,10 +2573,18 @@ void Ui::wake_display() {
   apply_brightness_policy();
 }
 
+void Ui::set_battery_display_policy(const BatteryDisplayPolicy& policy) {
+  battery_display_policy_ = policy;
+}
+
 void Ui::apply_brightness_policy() {
   int target_brightness = user_brightness_percent_;
   if (screen_power_mode_ == ScreenPowerMode::kDimmed) {
-    target_brightness = std::max(8, std::min(18, std::max(1, user_brightness_percent_ / 3)));
+    if (battery_display_policy_.dim_brightness_percent > 0) {
+      target_brightness = std::clamp(battery_display_policy_.dim_brightness_percent, 1, 100);
+    } else {
+      target_brightness = std::max(8, std::min(18, std::max(1, user_brightness_percent_ / 3)));
+    }
   } else if (screen_power_mode_ == ScreenPowerMode::kOff) {
     target_brightness = 0;
   }
@@ -2177,14 +2600,18 @@ void Ui::apply_brightness_policy() {
 void Ui::update_power_save(bool on_battery, bool print_active) {
   const uint32_t now = lv_tick_get();
   const uint32_t idle_ms = now - last_activity_tick_ms_.load();
-  const uint32_t dim_timeout = print_active ? kBatteryDimTimeoutActiveMs : kBatteryDimTimeoutIdleMs;
-  const uint32_t off_timeout = print_active ? kBatteryOffTimeoutActiveMs : kBatteryOffTimeoutIdleMs;
+  const uint32_t dim_timeout = (print_active
+      ? battery_display_policy_.dim_timeout_active_s
+      : battery_display_policy_.dim_timeout_idle_s) * 1000U;
+  const uint32_t off_timeout = (print_active
+      ? battery_display_policy_.off_timeout_active_s
+      : battery_display_policy_.off_timeout_idle_s) * 1000U;
 
   ScreenPowerMode target_mode = ScreenPowerMode::kAwake;
   if (on_battery) {
-    if (idle_ms >= off_timeout) {
+    if (battery_display_policy_.screen_off_enabled && idle_ms >= off_timeout) {
       target_mode = ScreenPowerMode::kOff;
-    } else if (idle_ms >= dim_timeout) {
+    } else if (battery_display_policy_.dim_enabled && idle_ms >= dim_timeout) {
       target_mode = ScreenPowerMode::kDimmed;
     }
   }

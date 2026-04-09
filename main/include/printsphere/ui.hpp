@@ -27,10 +27,12 @@ class Ui {
   void set_arc_color_scheme(const ArcColorScheme& colors);
   void apply_snapshot(const PrinterSnapshot& snapshot);
   void update_power_save(bool on_battery, bool print_active);
+  void set_battery_display_policy(const BatteryDisplayPolicy& policy);
   bool is_low_power_mode_active() const;
   ScreenPowerMode screen_power_mode() const { return screen_power_mode_; }
-  bool is_page2_active() const { return !scrolling_ && active_page_ == 1; }
-  bool is_camera_page_active() const { return !scrolling_ && active_page_ == 2; }
+  bool is_config_page_active() const { return !scrolling_ && active_page_ == 0; }
+  bool is_page2_active() const { return !scrolling_ && active_page_ == 2; }
+  bool is_camera_page_active() const { return !scrolling_ && active_page_ == 3; }
   bool is_page_transition_active() const { return scrolling_; }
   void set_portal_access_state(bool lock_enabled, bool request_authorized, bool session_active,
                                bool pin_active, const std::string& pin_code,
@@ -38,6 +40,17 @@ class Ui {
   bool consume_camera_refresh_request();
   bool consume_chamber_light_toggle_request();
   bool consume_portal_unlock_request();
+
+  struct PrinterCardInfo {
+    uint8_t index = 0;
+    std::string name;
+    std::string model;
+    std::string host;
+    bool active = false;
+    bool connected = false;
+  };
+  void update_printer_cards(const std::vector<PrinterCardInfo>& cards);
+  int consume_printer_switch_request();
 
  private:
   esp_err_t build_dashboard();
@@ -73,6 +86,28 @@ class Ui {
   lv_obj_t* screen_ = nullptr;
   lv_obj_t* pager_ = nullptr;
   lv_obj_t* fixed_overlay_ = nullptr;
+  lv_obj_t* page0_ = nullptr;
+  lv_obj_t* page0_title_ = nullptr;
+  lv_obj_t* page0_card_list_ = nullptr;
+  lv_obj_t* page0_empty_note_ = nullptr;
+
+  struct PrinterCardWidgets {
+    lv_obj_t* card = nullptr;
+    lv_obj_t* name_label = nullptr;
+    lv_obj_t* model_label = nullptr;
+    lv_obj_t* host_label = nullptr;
+    lv_obj_t* status_dot = nullptr;
+    uint8_t profile_index = 0;
+  };
+  std::vector<PrinterCardWidgets> page0_cards_;
+  std::vector<PrinterCardInfo>    last_printer_cards_;  // change-detection cache
+  int pending_printer_switch_ = -1;
+
+  void rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards);
+  void replay_card_animations_locked();
+  void apply_page0_parallax();
+  static void printer_card_click_cb(lv_event_t* event);
+
   lv_obj_t* page1_ = nullptr;
   lv_obj_t* page2_ = nullptr;
   lv_obj_t* page3_ = nullptr;
@@ -174,6 +209,7 @@ class Ui {
   PrinterSnapshot deferred_snapshot_{};
   PrinterSnapshot last_snapshot_{};
   DisplayRotation display_rotation_ = DisplayRotation::k0;
+  BatteryDisplayPolicy battery_display_policy_{};
 };
 
 }  // namespace printsphere
