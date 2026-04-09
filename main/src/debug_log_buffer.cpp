@@ -27,13 +27,16 @@ int log_hook(const char* fmt, va_list args) {
   va_list args_uart;
   va_copy(args_uart, args);
 
-  // Format the message into a stack buffer.
-  char line[512];
-  const int n = vsnprintf(line, sizeof(line), fmt, args);
-  const size_t len = (n > 0) ? std::min(static_cast<size_t>(n), sizeof(line) - 1) : 0;
-
-  if (len > 0 && g_buf != nullptr) {
+  // IMPORTANT: use a static buffer instead of a stack-allocated one.
+  // The hook is called from arbitrary FreeRTOS tasks (including sys_evt which
+  // has only ~2304 bytes of stack).  A 512-byte local array would overflow
+  // small-stack system tasks.  The static buffer is in BSS (not on the stack)
+  // and is safe to use because we hold g_mutex before writing to it.
+  if (g_buf != nullptr) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    static char line[512];
+    const int n = vsnprintf(line, sizeof(line), fmt, args);
+    const size_t len = (n > 0) ? std::min(static_cast<size_t>(n), sizeof(line) - 1) : 0;
     for (size_t i = 0; i < len; ++i) {
       g_buf[g_write_total % kBufSize] = line[i];
       ++g_write_total;
@@ -41,7 +44,7 @@ int log_hook(const char* fmt, va_list args) {
   }
 
   // Keep original UART output alive.
-  int result = n;
+  int result = 0;
   if (g_orig_vprintf != nullptr) {
     result = g_orig_vprintf(fmt, args_uart);
   }
