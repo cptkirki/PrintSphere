@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "printsphere/bambu_status.hpp"
+#include "printsphere/debug_log_buffer.hpp"
 #include "printsphere/ui.hpp"
 
 namespace printsphere {
@@ -1167,6 +1168,16 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ota_status_uri), kTag,
                       "ota status handler failed");
 
+#ifdef PRINTSPHERE_DEBUG_BUILD
+  httpd_uri_t debug_log_uri = {};
+  debug_log_uri.uri = "/api/debug/log";
+  debug_log_uri.method = HTTP_GET;
+  debug_log_uri.handler = &SetupPortal::handle_debug_log;
+  debug_log_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &debug_log_uri), kTag,
+                      "debug log handler failed");
+#endif
+
   ESP_LOGI(kTag, "Setup portal started");
   return ESP_OK;
 }
@@ -2002,6 +2013,30 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     end_collapsible_section();
   }
 
+#ifdef PRINTSPHERE_DEBUG_BUILD
+  if (show_connection_steps) {
+    begin_collapsible_section(
+        "Debug Console",
+        "Live ESP-IDF log stream captured on-device. Only available in debug builds.",
+        "DBG", "idle", false);
+    html += "<div id=\"dbg-terminal\""
+            " style=\"background:#0d1117;border:1px solid #21262d;border-radius:10px;"
+            "height:320px;overflow-y:auto;padding:10px 12px;font-family:monospace;"
+            "font-size:11.5px;line-height:1.55;color:#c9d1d9;\">"
+            "<pre id=\"dbg-log\" style=\"margin:0;white-space:pre-wrap;word-break:break-all;\"></pre>"
+            "</div>";
+    html += "<div class=\"actions\" style=\"flex-wrap:wrap;gap:8px;\">";
+    html += "<button type=\"button\" class=\"secondary\" id=\"dbg-download-btn\">Download Log</button>";
+    html += "<button type=\"button\" class=\"secondary\" id=\"dbg-clear-btn\">Clear</button>";
+    html += "<label style=\"display:flex;align-items:center;gap:6px;font-size:13px;font-weight:400;"
+            "color:var(--muted);cursor:pointer;margin:0;\">";
+    html += "<input type=\"checkbox\" id=\"dbg-autoscroll\" checked style=\"width:auto;\"> Auto-scroll</label>";
+    html += "<span id=\"dbg-status\" class=\"micro\" style=\"margin-left:auto;\">Connecting&hellip;</span>";
+    html += "</div>";
+    end_collapsible_section();
+  }
+#endif
+
   html += "<section class=\"footer-card\">";
   html += "<div class=\"actions\">";
   html += "<button type=\"submit\" class=\"primary\" id=\"save-button\">";
@@ -2596,6 +2631,50 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "});}";
   html += "})();";
   html += "</script>";
+
+#ifdef PRINTSPHERE_DEBUG_BUILD
+  // Debug console JS — isolated IIFE, runs only in debug builds.
+  html += "<script>";
+  html += "(function(){";
+  html += "var dbgLog=document.getElementById('dbg-log');";
+  html += "var dbgTerminal=document.getElementById('dbg-terminal');";
+  html += "var dbgStatus=document.getElementById('dbg-status');";
+  html += "var dbgOffset=0;";
+  html += "var dbgFull='';";
+  html += "if(!dbgLog)return;";  // section absent (e.g. not logged in)
+  html += "function dbgPoll(){"
+          "fetch('/api/debug/log?offset='+dbgOffset,{credentials:'same-origin',cache:'no-store'})"
+          ".then(function(r){"
+          "var end=parseInt(r.headers.get('X-Log-End-Offset')||String(dbgOffset));"
+          "return r.text().then(function(t){return{t:t,end:end};});"
+          "}).then(function(res){"
+          "if(res.t&&res.t.length>0){"
+          "dbgFull+=res.t;dbgOffset=res.end;"
+          "dbgLog.textContent=dbgFull;"
+          "var as=document.getElementById('dbg-autoscroll');"
+          "if(as&&as.checked&&dbgTerminal){dbgTerminal.scrollTop=dbgTerminal.scrollHeight;}"
+          "}"
+          "if(dbgStatus)dbgStatus.textContent='Last update: '+new Date().toLocaleTimeString();"
+          "}).catch(function(){if(dbgStatus)dbgStatus.textContent='Polling error';});"
+          "}";
+  html += "setInterval(dbgPoll,1500);dbgPoll();";
+  html += "var dlBtn=document.getElementById('dbg-download-btn');";
+  html += "if(dlBtn){dlBtn.addEventListener('click',function(){"
+          "var blob=new Blob([dbgFull],{type:'text/plain'});"
+          "var url=URL.createObjectURL(blob);"
+          "var a=document.createElement('a');a.href=url;"
+          "a.download='printsphere_debug_log.txt';"
+          "document.body.appendChild(a);a.click();"
+          "document.body.removeChild(a);URL.revokeObjectURL(url);"
+          "});}";
+  html += "var clrBtn=document.getElementById('dbg-clear-btn');";
+  html += "if(clrBtn){clrBtn.addEventListener('click',function(){"
+          "dbgFull='';if(dbgLog)dbgLog.textContent='';"
+          "if(dbgStatus)dbgStatus.textContent='Cleared';"
+          "});}";
+  html += "})();";
+  html += "</script>";
+#endif
   html += "</main></body></html>";
 
   httpd_resp_set_type(request, "text/html");
@@ -4037,5 +4116,42 @@ void SetupPortal::ota_url_task(void* context) {
   }
   vTaskDelete(nullptr);
 }
+
+#ifdef PRINTSPHERE_DEBUG_BUILD
+esp_err_t SetupPortal::handle_debug_log(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  // Parse optional ?offset=N query parameter.
+  size_t from_offset = 0;
+  char query_buf[64] = {};
+  if (httpd_req_get_url_query_str(request, query_buf, sizeof(query_buf)) == ESP_OK) {
+    char val[24] = {};
+    if (httpd_query_key_value(query_buf, "offset", val, sizeof(val)) == ESP_OK) {
+      from_offset = static_cast<size_t>(strtoul(val, nullptr, 10));
+    }
+  }
+
+  size_t end_offset = 0;
+  std::string log_text = debug_log_fetch(from_offset, &end_offset);
+
+  char end_hdr[24];
+  snprintf(end_hdr, sizeof(end_hdr), "%zu", end_offset);
+  httpd_resp_set_hdr(request, "X-Log-End-Offset", end_hdr);
+  httpd_resp_set_hdr(request, "Access-Control-Expose-Headers", "X-Log-End-Offset");
+  httpd_resp_set_type(request, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+
+  if (log_text.empty()) {
+    return httpd_resp_sendstr(request, "");
+  }
+  return httpd_resp_send(request, log_text.data(), static_cast<ssize_t>(log_text.size()));
+}
+#endif  // PRINTSPHERE_DEBUG_BUILD
 
 }  // namespace printsphere

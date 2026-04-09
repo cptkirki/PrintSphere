@@ -16,6 +16,7 @@ idf_component_register(
         "src/p1s_camera_client.cpp"
         "src/printer_client.cpp"
         "src/printer_state.cpp"
+        "src/debug_log_buffer.cpp"
         "src/setup_portal.cpp"
         "src/status_resolver.cpp"
         "src/ui.cpp"
@@ -50,4 +51,8 @@ idf_component_register(
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     PRINTSPHERE_RELEASE_VERSION="${PRINTSPHERE_RELEASE_VERSION}"
 )
+string(FIND "${PRINTSPHERE_RELEASE_VERSION}" "_debug" _debug_pos)
+if(_debug_pos GREATER -1)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE PRINTSPHERE_DEBUG_BUILD=1)
+endif()
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)

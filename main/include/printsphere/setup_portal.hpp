@@ -73,6 +73,9 @@ class SetupPortal {
   static esp_err_t handle_ota_upload(httpd_req_t* request);
   static esp_err_t handle_ota_url(httpd_req_t* request);
   static esp_err_t handle_ota_status(httpd_req_t* request);
+#ifdef PRINTSPHERE_DEBUG_BUILD
+  static esp_err_t handle_debug_log(httpd_req_t* request);
+#endif
   static void ota_url_task(void* context);
   static void reboot_task(void* context);
   bool is_provisioning_complete() const;
