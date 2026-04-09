@@ -1642,7 +1642,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
 
   begin_collapsible_section(
       "Energy",
-      "Controls display power during battery operation. Touch always wakes the display. Changes apply after restart.",
+      "Controls display dim/off behaviour. On battery this is always active. For USB-powered use, enable the USB option below. Touch always wakes the display. Changes apply after restart.",
       bat_badge_value, bat_badge_class, false);
 
   // Dim on/off
@@ -1698,7 +1698,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += "\"";
       if (bat_policy.dim_timeout_active_s == v) html += " selected";
       html += ">";
-      html += (v < 60 ? std::to_string(v) + " s" : std::to_string(v / 60) + " min");
+      const uint32_t mins = v / 60, secs = v % 60;
+      if (v < 60) html += std::to_string(v) + " s";
+      else if (secs) html += std::to_string(mins) + " min " + std::to_string(secs) + " s";
+      else html += std::to_string(mins) + " min";
       html += "</option>";
     }
   }
@@ -1727,7 +1730,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += "\"";
       if (bat_policy.off_timeout_idle_s == v) html += " selected";
       html += ">";
-      html += (v < 60 ? std::to_string(v) + " s" : std::to_string(v / 60) + " min");
+      const uint32_t mins = v / 60, secs = v % 60;
+      if (v < 60) html += std::to_string(v) + " s";
+      else if (secs) html += std::to_string(mins) + " min " + std::to_string(secs) + " s";
+      else html += std::to_string(mins) + " min";
       html += "</option>";
     }
   }
@@ -1753,6 +1759,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   }
   html += "</select></div>";
   html += "</div>"; // bat-off-options-group
+
+  // USB power save
+  html += "<div class=\"field\"><label for=\"bat_usb_ps\">Also apply when USB-powered</label>"
+          "<select id=\"bat_usb_ps\">";
+  html += "<option value=\"true\"";
+  if (bat_policy.usb_power_save_enabled) html += " selected";
+  html += ">Yes: dim and turn off display on USB too</option>";
+  html += "<option value=\"false\"";
+  if (!bat_policy.usb_power_save_enabled) html += " selected";
+  html += ">No: keep display always on when USB-powered</option></select></div>";
 
   // Live battery info (if PMU available)
   if (power.available && power.battery_present) {
@@ -2159,6 +2175,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += std::to_string(bat_policy.off_timeout_idle_s);
   html += ",bat_off_timeout_active:";
   html += std::to_string(bat_policy.off_timeout_active_s);
+  html += ",bat_usb_ps:";
+  html += bat_policy.usb_power_save_enabled ? "true" : "false";
   html += "};";
   html += "function setStatus(line,detail,lockMs){statusEl.textContent=line||'';statusDetailEl.textContent=detail||'';"
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
@@ -2319,13 +2337,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const diActNow=batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:String(savedConfig.bat_dim_timeout_active||30);"
           "const ofIdleNow=batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:String(savedConfig.bat_off_timeout_idle||60);"
           "const ofActNow=batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:String(savedConfig.bat_off_timeout_active||120);"
+          "const usbPsEl=document.getElementById('bat_usb_ps');"
+          "const usbPsNow=usbPsEl?usbPsEl.value==='true':savedConfig.bat_usb_ps===true;"
           "const changed=dimNow!==(savedConfig.bat_dim_enabled!==false)"
               "||pctNow!==String(savedConfig.bat_dim_brightness||'0')"
               "||offNow!==(savedConfig.bat_off_enabled!==false)"
               "||diIdleNow!==String(savedConfig.bat_dim_timeout_idle||20)"
               "||diActNow!==String(savedConfig.bat_dim_timeout_active||30)"
               "||ofIdleNow!==String(savedConfig.bat_off_timeout_idle||60)"
-              "||ofActNow!==String(savedConfig.bat_off_timeout_active||120);"
+              "||ofActNow!==String(savedConfig.bat_off_timeout_active||120)"
+              "||usbPsNow!==(savedConfig.bat_usb_ps===true);"
           "batDisplayApplyButton.classList.toggle('hidden',!changed);"
           "batDisplayApplyHint.classList.toggle('hidden',!changed);"
           "if(!changed){batDisplayApplyButton.disabled=false;}}";
@@ -2416,12 +2437,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "const bat_dim_timeout_active=Number(batDimTimeoutActiveSelect?batDimTimeoutActiveSelect.value:savedConfig.bat_dim_timeout_active||30);"
           "const bat_off_timeout_idle=Number(batOffTimeoutIdleSelect?batOffTimeoutIdleSelect.value:savedConfig.bat_off_timeout_idle||60);"
           "const bat_off_timeout_active=Number(batOffTimeoutActiveSelect?batOffTimeoutActiveSelect.value:savedConfig.bat_off_timeout_active||120);"
+          "const usbPsEl2=document.getElementById('bat_usb_ps');"
+          "const bat_usb_ps=usbPsEl2?usbPsEl2.value==='true':savedConfig.bat_usb_ps===true;"
           "batDisplayApplyButton.disabled=true;setStatus('Applying energy settings...','Saving settings and restarting the ESP now.',15000);"
-          "try{const response=await fetch('/api/battery-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bat_dim_enabled,bat_dim_brightness,bat_off_enabled,bat_dim_timeout_idle,bat_dim_timeout_active,bat_off_timeout_idle,bat_off_timeout_active})});"
+          "try{const response=await fetch('/api/battery-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bat_dim_enabled,bat_dim_brightness,bat_off_enabled,bat_dim_timeout_idle,bat_dim_timeout_active,bat_off_timeout_idle,bat_off_timeout_active,bat_usb_ps})});"
           "const body=await response.json().catch(()=>({}));"
           "if(response.ok){savedConfig.bat_dim_enabled=bat_dim_enabled;savedConfig.bat_dim_brightness=bat_dim_brightness;savedConfig.bat_off_enabled=bat_off_enabled;"
               "savedConfig.bat_dim_timeout_idle=bat_dim_timeout_idle;savedConfig.bat_dim_timeout_active=bat_dim_timeout_active;"
               "savedConfig.bat_off_timeout_idle=bat_off_timeout_idle;savedConfig.bat_off_timeout_active=bat_off_timeout_active;"
+              "savedConfig.bat_usb_ps=bat_usb_ps;"
               "updateBatDisplayControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Energy settings change failed',body.detail||'The energy settings could not be saved.',8000);batDisplayApplyButton.disabled=false;updateBatDisplayControls();}}"
           "catch(error){setStatus('Energy settings change failed','The request to the ESP could not be completed.',8000);batDisplayApplyButton.disabled=false;updateBatDisplayControls();}})}";  html += "if(sourceModeSelect){sourceModeSelect.addEventListener('change',updateSourceModeControls);}";
@@ -3007,6 +3031,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
     bat_policy_post.dim_timeout_active_s = read_bu("bat_dim_timeout_active", stored_bat_policy.dim_timeout_active_s);
     bat_policy_post.off_timeout_idle_s   = read_bu("bat_off_timeout_idle",   stored_bat_policy.off_timeout_idle_s);
     bat_policy_post.off_timeout_active_s = read_bu("bat_off_timeout_active", stored_bat_policy.off_timeout_active_s);
+    bat_policy_post.usb_power_save_enabled = read_bool_field(root, "bat_usb_ps", stored_bat_policy.usb_power_save_enabled);
   }
 
   cJSON_Delete(root);
@@ -3230,13 +3255,15 @@ esp_err_t SetupPortal::handle_battery_display_post(httpd_req_t* request) {
   policy.dim_timeout_active_s = read_bat_uint("bat_dim_timeout_active", stored.dim_timeout_active_s);
   policy.off_timeout_idle_s   = read_bat_uint("bat_off_timeout_idle",   stored.off_timeout_idle_s);
   policy.off_timeout_active_s = read_bat_uint("bat_off_timeout_active", stored.off_timeout_active_s);
+  policy.usb_power_save_enabled = read_bool_field(root, "bat_usb_ps", stored.usb_power_save_enabled);
   cJSON_Delete(root);
 
-  ESP_LOGI(kTag, "Saving energy policy: dim=%s pct=%d dim_idle=%us dim_act=%us off=%s off_idle=%us off_act=%us",
+  ESP_LOGI(kTag, "Saving energy policy: dim=%s pct=%d dim_idle=%us dim_act=%us off=%s off_idle=%us off_act=%us usb_ps=%s",
            policy.dim_enabled ? "yes" : "no", policy.dim_brightness_percent,
            policy.dim_timeout_idle_s, policy.dim_timeout_active_s,
            policy.screen_off_enabled ? "yes" : "no",
-           policy.off_timeout_idle_s, policy.off_timeout_active_s);
+           policy.off_timeout_idle_s, policy.off_timeout_active_s,
+           policy.usb_power_save_enabled ? "yes" : "no");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_battery_display_policy(policy), kTag,
                       "save battery display policy failed");
 

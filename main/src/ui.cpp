@@ -806,7 +806,7 @@ std::string remaining_text(const PrinterSnapshot& snapshot) {
 
 std::string preview_note_text(const PrinterSnapshot& snapshot) {
   if (snapshot.preview_blob && !snapshot.preview_blob->empty()) {
-    return "Cloud cover loaded";
+    return {};  // note hidden when cover is loaded — title takes over
   }
   if (!snapshot.preview_url.empty()) {
     return "Loading cloud cover";
@@ -855,7 +855,7 @@ std::string preview_subnote_text(const PrinterSnapshot& snapshot) {
 
 std::string camera_note_text(const PrinterSnapshot& snapshot) {
   if (snapshot.camera_blob && !snapshot.camera_blob->empty()) {
-    return "Camera snapshot";
+    return {};  // note hidden when snapshot is loaded — title/subnote takes over
   }
   if (snapshot.connection == PrinterConnectionState::kWaitingForCredentials) {
     return "Set up printer";
@@ -1631,15 +1631,18 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
 
   if (preview_text_image_mode_ != has_page2_image) {
     if (has_page2_image) {
-      lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, kPage2NoteWithImageY);
-      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2SubnoteWithImageY);
+      // Note is hidden when cover is loaded; subnote (title) moves to former note position.
+      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2NoteWithImageY);
     } else {
       lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, 0);
       lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 28);
     }
     preview_text_image_mode_ = has_page2_image;
   }
-  set_label_text_if_changed(page2_note_, preview_note);
+  set_hidden(page2_note_, preview_note.empty());
+  if (!preview_note.empty()) {
+    set_label_text_if_changed(page2_note_, preview_note);
+  }
   set_hidden(page2_subnote_, preview_subnote.empty());
   if (!preview_subnote.empty()) {
     set_label_text_if_changed(page2_subnote_, preview_subnote);
@@ -1700,15 +1703,18 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
 
   if (camera_text_image_mode_ != has_camera_image) {
     if (has_camera_image) {
-      lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, kPage3NoteWithImageY);
-      lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3SubnoteWithImageY);
+      // Note is hidden when snapshot is loaded; subnote moves to former note position.
+      lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3NoteWithImageY);
     } else {
       lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, 0);
       lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, 28);
     }
     camera_text_image_mode_ = has_camera_image;
   }
-  set_label_text_if_changed(page3_note_, camera_note);
+  set_hidden(page3_note_, camera_note.empty());
+  if (!camera_note.empty()) {
+    set_label_text_if_changed(page3_note_, camera_note);
+  }
   set_hidden(page3_subnote_, camera_subnote.empty());
   if (!camera_subnote.empty()) {
     set_label_text_if_changed(page3_subnote_, camera_subnote);
@@ -2608,7 +2614,7 @@ void Ui::update_power_save(bool on_battery, bool print_active) {
       : battery_display_policy_.off_timeout_idle_s) * 1000U;
 
   ScreenPowerMode target_mode = ScreenPowerMode::kAwake;
-  if (on_battery) {
+  if (on_battery || battery_display_policy_.usb_power_save_enabled) {
     if (battery_display_policy_.screen_off_enabled && idle_ms >= off_timeout) {
       target_mode = ScreenPowerMode::kOff;
     } else if (battery_display_policy_.dim_enabled && idle_ms >= dim_timeout) {

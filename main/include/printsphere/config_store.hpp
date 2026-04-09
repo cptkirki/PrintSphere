@@ -91,6 +91,8 @@ struct BatteryDisplayPolicy {
   uint32_t dim_timeout_active_s = 30;
   uint32_t off_timeout_idle_s = 60;
   uint32_t off_timeout_active_s = 120;
+  // Also apply dim/off timeouts when running on USB power without a battery.
+  bool usb_power_save_enabled = false;
 };
 
 struct ArcColorScheme {

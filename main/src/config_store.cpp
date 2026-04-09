@@ -238,6 +238,7 @@ BatteryDisplayPolicy ConfigStore::load_battery_display_policy() const {
   policy.dim_timeout_active_s = load_timeout("bat_dim_act",  30);
   policy.off_timeout_idle_s   = load_timeout("bat_off_idle", 60);
   policy.off_timeout_active_s = load_timeout("bat_off_act",  120);
+  policy.usb_power_save_enabled = parse_bool_or_default(load_string("bat_usb_ps"), false);
 
   return policy;
 }
@@ -325,7 +326,9 @@ esp_err_t ConfigStore::save_battery_display_policy(const BatteryDisplayPolicy& p
                       kTag, "save bat_dim_act failed");
   ESP_RETURN_ON_ERROR(save_string("bat_off_idle", std::to_string(policy.off_timeout_idle_s)),
                       kTag, "save bat_off_idle failed");
-  return save_string("bat_off_act",  std::to_string(policy.off_timeout_active_s));
+  ESP_RETURN_ON_ERROR(save_string("bat_off_act", std::to_string(policy.off_timeout_active_s)),
+                      kTag, "save bat_off_act failed");
+  return save_string("bat_usb_ps", policy.usb_power_save_enabled ? "1" : "0");
 }
 
 esp_err_t ConfigStore::save_string(const char* key, const std::string& value) const {

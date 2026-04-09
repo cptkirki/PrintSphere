@@ -896,8 +896,14 @@ std::string resolved_stage_from_payload(const std::string& effective_gcode_state
   }
 
   if (effective_gcode_state == "PAUSE" || effective_gcode_state == "PAUSED") {
-    if (stage_id == -1 || stage_id == 255 || is_placeholder_stage_name(payload_stage_name) ||
-        lower_copy(payload_stage_name) == "idle") {
+    // Only return a generic "Paused" if we have no meaningful stage info.
+    // Printers like A1/P1S omit the stage-name object and only provide stg_cur.
+    // Without this guard, stage_id 4/22/24 (filament change/load/unload) would be
+    // discarded because the empty payload_stage_name looks like a placeholder.
+    const std::string id_label = bambu_stage_label_from_id(stage_id);
+    const bool has_meaningful_id = stage_id != -1 && stage_id != 255 && !id_label.empty();
+    if (!has_meaningful_id &&
+        (is_placeholder_stage_name(payload_stage_name) || lower_copy(payload_stage_name) == "idle")) {
       return "Paused";
     }
   }
@@ -1349,6 +1355,14 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
                               : json_int(print, "stg_cur", -1);
     const std::string stage_name =
         cJSON_IsObject(stage) ? json_string(stage, "name", json_string(stage, "stage", {})) : "";
+    // A1 / printers without a named stage object report filament-change state via ams_status
+    // (high byte 0x01 = AMS_STATUS_MAIN_FILAMENT_CHANGE) while stg_cur stays at 0 (printing).
+    // Synthesize stg_cur=4 (changing_filament) in that case so the animation triggers.
+    const int raw_ams_status = json_int(print, "ams_status", -1);
+    const int ams_status_main = (raw_ams_status >= 0) ? ((raw_ams_status >> 8) & 0xFF) : -1;
+    const bool ams_filament_change = ams_status_main == 0x01;
+    const bool stage_id_generic = (stage_id == 0 || stage_id == -1 || stage_id == 255);
+    const int effective_stage_id = (ams_filament_change && stage_id_generic) ? 4 : stage_id;
     const cJSON* print_error_item = cJSON_GetObjectItemCaseSensitive(print, "print_error");
     const bool has_print_error_update = print_error_item != nullptr;
     const int print_error_code =
@@ -1363,13 +1377,14 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const bool has_hms_alert = !parsed_hms_codes.empty() || hms_count > 0;
     const bool has_concrete_error = print_error_code != 0;
     const std::string resolved_stage =
-        resolved_stage_from_payload(effective_gcode_state, stage_name, stage_id, has_concrete_error);
+        resolved_stage_from_payload(effective_gcode_state, stage_name, effective_stage_id,
+                                    has_concrete_error);
     const bool paused_state = is_paused_gcode_state(effective_gcode_state);
     const bool fault_pause_signal = paused_state &&
                                     (has_concrete_error || is_fault_pause_stage(resolved_stage) ||
                                      is_fault_pause_stage(stage_name));
     const bool paused_fault_latched = paused_state && (fault_pause_signal || previous_pause_fault);
-    const bool stage_idle_placeholder = is_idle_stage_marker(stage_id, stage_name);
+    const bool stage_idle_placeholder = is_idle_stage_marker(effective_stage_id, stage_name);
     const bool has_status_update = !gcode_state.empty();
     const bool has_stage_update = !resolved_stage.empty();
 
