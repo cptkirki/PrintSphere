@@ -4,7 +4,7 @@ set(IDF_TARGET "esp32s3")
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(PRINTSPHERE_RELEASE_VERSION "v1.4.1_debug")
+set(PRINTSPHERE_RELEASE_VERSION "v1.4.1_debug-001")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(printsphere_idf)

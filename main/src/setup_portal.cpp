@@ -962,7 +962,7 @@ esp_err_t SetupPortal::start() {
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  config.stack_size = 8192;
+  config.stack_size = 12288;  // 8192 was too small — handle_root builds ~40KB HTML on the stack
   // Leave some headroom for portal endpoints so feature additions do not silently exhaust slots.
   config.max_uri_handlers = 28;
   config.recv_wait_timeout = 30;
@@ -1353,17 +1353,23 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     *html += "</span></div>";
   };
   const auto add_summary_pill = [](std::string* html, const std::string& value,
-                                   const char* state_class) {
+                                   const char* state_class, const char* id = nullptr) {
     *html += "<span class=\"summary-pill ";
     *html += state_class;
-    *html += "\">";
+    *html += "\"";
+    if (id != nullptr && id[0] != '\0') {
+      *html += " id=\"";
+      *html += id;
+      *html += "\"";
+    }
+    *html += ">";
     *html += json_escape(value);
     *html += "</span>";
   };
   const auto begin_collapsible_section =
       [&html, &add_summary_pill](const char* title, const char* detail,
                                  const std::string& badge_value, const char* badge_class,
-                                 bool open) {
+                                 bool open, const char* pill_id = nullptr) {
         html += "<details class=\"section\"";
         if (open) {
           html += " open";
@@ -1373,7 +1379,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         html += "</h2><p>";
         html += detail;
         html += "</p></div><div class=\"section-summary-side\">";
-        add_summary_pill(&html, badge_value, badge_class);
+        add_summary_pill(&html, badge_value, badge_class, pill_id);
         html += "<span class=\"section-toggle-icon\" aria-hidden=\"true\"></span></div></summary><div class=\"section-body\">";
       };
   const auto end_collapsible_section = [&html]() { html += "</div></details>"; };
@@ -1518,7 +1524,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     begin_collapsible_section(
         "Bambu Cloud",
         "Primary source for cloud monitoring, cover image, project metadata and cloud lifecycle. Use Connect to start the login immediately. If Bambu asks for an email code or 2FA code, you can complete that step here.",
-        cloud_badge_value, cloud_badge_class, cloud_section_open);
+        cloud_badge_value, cloud_badge_class, cloud_section_open, "cloud-section-pill");
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email</label><input id=\"cloud_email\" value=\"";
     html += json_escape(cloud.email);
@@ -1569,7 +1575,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     begin_collapsible_section(
         "Local Printer Path",
         "The local MQTT path provides live status, layers, temperatures and also powers camera snapshots on page 3.",
-        local_badge_value, local_badge_class, local_section_open);
+        local_badge_value, local_badge_class, local_section_open, "local-section-pill");
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"printer_host\">Printer IP or Hostname</label><input id=\"printer_host\" value=\"";
     html += json_escape(printer.host);
@@ -2218,7 +2224,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "catch(error){if(wifiScanDetail){wifiScanDetail.textContent='Wi-Fi scan request failed.';}}"
           "finally{wifiScanInFlight=false;if(wifiScanButton){wifiScanButton.disabled=false;}}}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
-          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}"; 
+          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}"
+          "function setPill(id,value,stateClass){const p=document.getElementById(id);if(!p)return;"
+          "p.className='summary-pill '+stateClass;p.textContent=value;}"; 
   html += "function renderCloudStatus(body){"
           "var cv='Not configured',cs='idle';"
           "if(body&&body.cloud_badge_value){cv=body.cloud_badge_value;cs=body.cloud_badge_state||'ok';}"
@@ -2233,6 +2241,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else if(Date.now()<cloudFollowupUntil){cv='Finishing login';cs='info';}"
           "else if((body&&body.cloud_configured)||(!!trimmedValue('cloud_email')&&(!!savedConfig.cloud_password_saved||!!valueOf('cloud_password')))){cv='Configured';cs='info';}}"
           "setBadge('cloud-badge','Cloud',cv,cs);"
+          "setPill('cloud-section-pill',cv,cs);"
           "var cd=document.getElementById('cloud-detail');"
           "if(cd){"
           "var dt=body&&(body.cloud_status_detail||body.cloud_detail||body.detail);"
@@ -2286,6 +2295,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else if(Date.now()<localFollowupUntil){localValue='Connecting';localState='info';}"
           "else if(body&&body.local_configured){localValue='Configured';localState='info';}"
           "setBadge('local-badge','Local Path',localValue,localState);"
+          "setPill('local-section-pill',localValue,localState);"
           "const localDetail=document.getElementById('local-detail');"
           "if(localDetail){"
           "if(body&&body.local_detail){localDetail.textContent=body.local_detail;}"

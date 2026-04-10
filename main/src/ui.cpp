@@ -1440,7 +1440,7 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
     return;
   }
 
-  LvglLockGuard lock(200);
+  LvglLockGuard lock(500);
   if (!lock.locked()) {
     return;
   }
