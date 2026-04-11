@@ -50,7 +50,8 @@
 - Place the Qi charging coil into its dedicated pocket in the printed part.
 - Route the cable through the intended channel
 - be careful with the thin copper wires
-- secure the charging coil with the printed circle
+- make sure to tape the round black/grey ferrit shield sticker on top of the coil to prevent the electric field from heating the battery too much! this is very important!
+- - secure the charging coil with the printed circle
 
 ### 8. Install The Battery
 
