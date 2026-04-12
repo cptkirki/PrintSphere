@@ -40,7 +40,7 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 
 ## Setup Flow
 
-1. Flash [`release/initial/printsphere_full.bin`](printsphere_full.bin).
+1. Flash [`https://github.com/cptkirki/PrintSphere/blob/main/release/initial/printsphere_full.bin`](printsphere_full.bin)
 2. On first boot, the device starts a setup AP:
    - SSID: `PrintSphere-Setup`
    - password: `printsphere`
