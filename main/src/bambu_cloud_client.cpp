@@ -784,6 +784,10 @@ void append_unique_hms_code(std::vector<uint64_t>* codes, uint64_t hms_code) {
   if (codes == nullptr || hms_code == 0) {
     return;
   }
+  // Filter out specific suppressed HMS codes at extraction level.
+  if (printsphere::is_hms_suppressed(hms_code)) {
+    return;
+  }
   if (std::find(codes->begin(), codes->end(), hms_code) == codes->end()) {
     codes->push_back(hms_code);
   }
@@ -1651,7 +1655,7 @@ esp_err_t BambuCloudClient::start() {
   }
 
   const BaseType_t result =
-      xTaskCreate(&BambuCloudClient::task_entry, "bambu_cloud", 10240, this, 4, &task_handle_);
+      xTaskCreate(&BambuCloudClient::task_entry, "bambu_cloud", 16384, this, 4, &task_handle_);
   return result == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
@@ -2107,10 +2111,12 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       delayed_start_sent_ = false;
       initial_sync_tick_ = 0;
       {
+        // Grace period: preserve last-known state. Only mark disconnected, not failed.
+        // The cloud reconnect loop will handle retries transparently.
         CloudLiveRuntimeState runtime = live_runtime_copy();
         runtime.configured = credentials_.can_password_login() || !access_token_.empty();
         runtime.connected = false;
-        runtime.setup_stage = CloudSetupStage::kFailed;
+        runtime.setup_stage = CloudSetupStage::kIdle;
         store_live_runtime(std::move(runtime), true);
       }
       ESP_LOGW(kTag, "Cloud MQTT transport error");
@@ -2320,6 +2326,14 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     std::string stage_text;
     extract_live_stage_text(print, &stage_text);
     const bool has_status_update = !status_text.empty() || !stage_text.empty();
+
+    // [DIAG] Log every incoming cloud MQTT print payload summary.
+    if (has_status_update) {
+      ESP_LOGI(kTag, "[DIAG] cloud mqtt: status=%s stage=%s prev_lifecycle=%s",
+               status_text.empty() ? "(-)" : status_text.c_str(),
+               stage_text.empty() ? "(-)" : stage_text.c_str(),
+               to_string(previous_lifecycle));
+    }
     const PrintLifecycleState lifecycle = cloud_lifecycle_from_status(status_text);
     if (!status_text.empty()) {
       copy_text(&runtime.raw_status, status_text);
@@ -2459,6 +2473,15 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.detail, "Connected to Bambu Cloud");
     }
 
+    // [DIAG] Log resolved cloud state on change.
+    if (runtime.lifecycle != previous_lifecycle || has_status_update) {
+      ESP_LOGI(kTag, "[DIAG] cloud resolved: status=%s stage=%s lifecycle=%s detail=%.60s",
+               text_string(runtime.raw_status).c_str(),
+               text_string(runtime.raw_stage).empty() ? "(-)" : text_string(runtime.raw_stage).c_str(),
+               to_string(runtime.lifecycle),
+               text_string(runtime.detail).c_str());
+    }
+
     store_live_runtime(std::move(runtime), true);
     cJSON_Delete(root);
     return;
@@ -2525,6 +2548,15 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       initial_sync_sent_ = false;
       delayed_start_sent_ = false;
       initial_sync_tick_ = 0;
+      // Clear stale HMS/error state so it does not persist across reconnects.
+      {
+        CloudLiveRuntimeState runtime = live_runtime_copy();
+        runtime.hms_codes.clear();
+        runtime.hms_alert_count = 0;
+        runtime.print_error_code = 0;
+        runtime.has_error = false;
+        store_live_runtime(std::move(runtime), false);
+      }
       request_initial_sync();
     } else if (!event_type.empty()) {
       ESP_LOGD(kTag, "Cloud event: unknown event type '%s'", event_type.c_str());

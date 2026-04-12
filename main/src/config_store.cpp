@@ -195,6 +195,14 @@ bool ConfigStore::load_portal_lock_enabled() const {
   return parse_bool_or_default(load_string("portal_lock"), true);
 }
 
+bool ConfigStore::load_filament_wake_enabled() const {
+  return parse_bool_or_default(load_string("fil_wake"), false);
+}
+
+bool ConfigStore::load_filament_anim_enabled() const {
+  return parse_bool_or_default(load_string("fil_anim"), true);
+}
+
 ArcColorScheme ConfigStore::load_arc_color_scheme() const {
   ArcColorScheme colors;
   colors.printing = parse_color_or_default(load_string("arc_print"), colors.printing);
@@ -283,6 +291,14 @@ esp_err_t ConfigStore::save_display_rotation(DisplayRotation rotation) const {
 
 esp_err_t ConfigStore::save_portal_lock_enabled(bool enabled) const {
   return save_string("portal_lock", enabled ? "1" : "0");
+}
+
+esp_err_t ConfigStore::save_filament_wake_enabled(bool enabled) const {
+  return save_string("fil_wake", enabled ? "1" : "0");
+}
+
+esp_err_t ConfigStore::save_filament_anim_enabled(bool enabled) const {
+  return save_string("fil_anim", enabled ? "1" : "0");
 }
 
 esp_err_t ConfigStore::save_arc_color_scheme(const ArcColorScheme& colors) const {

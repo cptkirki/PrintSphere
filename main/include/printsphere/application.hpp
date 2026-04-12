@@ -37,6 +37,8 @@ class Application {
   bool hybrid_cloud_gate_open_ = false;
   TickType_t hybrid_cloud_gate_deadline_ = 0;
   TickType_t hybrid_camera_cooldown_deadline_ = 0;
+  bool filament_wake_enabled_ = false;
+  bool filament_anim_enabled_ = true;
   bool chamber_light_override_active_ = false;
   bool chamber_light_override_on_ = false;
   uint64_t chamber_light_override_until_ms_ = 0;

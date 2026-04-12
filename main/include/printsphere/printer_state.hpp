@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -59,6 +60,30 @@ struct SourceCapabilities {
   bool camera_jpeg_socket = false;
   bool camera_rtsp = false;
   bool developer_mode_required = false;
+};
+
+static constexpr int kMaxAmsTrays = 4;
+static constexpr int kMaxAmsUnits = 4;
+
+struct AmsTrayInfo {
+  bool present = false;
+  bool active = false;
+  std::string material_type;   // e.g. "PLA", "PETG", "ASA"
+  std::string material_name;   // Bambu filament name from tray_sub_brands
+  uint32_t color_rgba = 0;     // RRGGBBAA from tray_color
+  int remain_pct = -1;         // Filament remaining 0-100%, -1 = unknown
+};
+
+struct AmsUnitInfo {
+  bool present = false;
+  int humidity_pct = -1;       // 0-100% relative humidity, -1 = unknown
+  float temperature_c = 0.0f;
+  std::array<AmsTrayInfo, kMaxAmsTrays> trays{};
+};
+
+struct AmsSnapshot {
+  uint8_t count = 0;
+  std::array<AmsUnitInfo, kMaxAmsUnits> units{};
 };
 
 struct PrinterSnapshot {
@@ -134,6 +159,10 @@ struct PrinterSnapshot {
   FieldSource camera_source = FieldSource::kNone;
   bool non_error_stop = false;
   bool show_stop_banner = false;
+  int hw_switch_state = -1;
+  int tray_now = -1;
+  int tray_tar = -1;
+  std::shared_ptr<AmsSnapshot> ams;
 };
 
 class PrinterStateStore {

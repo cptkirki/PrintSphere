@@ -329,6 +329,10 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
   }
 
   for (int frame_index = 0; frame_index < 3; ++frame_index) {
+    if (frame_index > 0 && !enabled_.load()) {
+      ESP_LOGD(kTag, "Camera disabled mid-fetch, aborting");
+      return false;
+    }
     uint8_t header[kFrameHeaderBytes] = {};
     if (!read_exact(tls_, header, sizeof(header))) {
       ESP_LOGW(kTag, "Camera frame header read failed");
@@ -380,9 +384,9 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
                        std::move(rgb565_frame), width, height);
     const size_t free_dma_heap = heap_caps_get_free_size(MALLOC_CAP_DMA);
     const size_t largest_dma_block = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-    ESP_LOGI(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
+    ESP_LOGD(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
              static_cast<unsigned>(height));
-    ESP_LOGI(kTag, "DMA heap after snapshot: free=%u largest=%u",
+    ESP_LOGD(kTag, "DMA heap after snapshot: free=%u largest=%u",
              static_cast<unsigned>(free_dma_heap),
              static_cast<unsigned>(largest_dma_block));
     return true;

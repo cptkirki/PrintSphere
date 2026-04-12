@@ -13,6 +13,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "png.h"
 #include "printsphere/board_config.hpp"
 
@@ -36,7 +37,7 @@ constexpr int kRingStrokeWidth = 22;
 constexpr int kRemainingRowY = 172;
 constexpr int kPage2PreviewSize = 320;
 constexpr int kPage2PreviewYOffset = -12;
-constexpr int kPage2NoteWithImageY = 156;
+constexpr int kPage2NoteWithImageY = 138;
 constexpr int kPage2SubnoteWithImageY = 188;
 constexpr int kPage3CameraWidth = 400;
 constexpr int kPage3CameraHeight = 224;
@@ -96,16 +97,37 @@ constexpr char kMdiBattery100[] = "\xF3\xB0\x81\xB9";
 
 class LvglLockGuard {
  public:
-  explicit LvglLockGuard(uint32_t timeout_ms) : locked_(bsp_display_lock(timeout_ms) == ESP_OK) {}
+  explicit LvglLockGuard(uint32_t timeout_ms, const char* caller = "?")
+      : caller_(caller) {
+    const uint32_t before = esp_log_timestamp();
+    locked_ = bsp_display_lock(timeout_ms) == ESP_OK;
+    const uint32_t wait_ms = esp_log_timestamp() - before;
+    if (!locked_) {
+      ESP_LOGW(kTag, "LVGL lock FAILED after %lums (timeout=%lu, caller=%s)",
+               (unsigned long)wait_ms, (unsigned long)timeout_ms, caller_);
+    } else if (wait_ms > 150) {
+      ESP_LOGW(kTag, "LVGL lock waited %lums (caller=%s)",
+               (unsigned long)wait_ms, caller_);
+    }
+    acquired_ts_ = esp_log_timestamp();
+  }
+
   ~LvglLockGuard() {
     if (locked_) {
+      const uint32_t held_ms = esp_log_timestamp() - acquired_ts_;
       bsp_display_unlock();
+      if (held_ms > 80) {
+        ESP_LOGW(kTag, "LVGL lock held %lums (caller=%s)",
+                 (unsigned long)held_ms, caller_);
+      }
     }
   }
 
   bool locked() const { return locked_; }
 
  private:
+  const char* caller_ = "?";
+  uint32_t acquired_ts_ = 0;
   bool locked_ = false;
 };
 
@@ -370,34 +392,26 @@ uint32_t scale_color(uint32_t color, uint16_t scale_0_to_255) {
   return (static_cast<uint32_t>(sr) << 16) | (static_cast<uint32_t>(sg) << 8) | sb;
 }
 
-uint32_t pulse_between(uint32_t base_color, uint32_t period_ms, uint8_t pulse_depth_percent) {
-  if (period_ms == 0U) {
-    return base_color;
-  }
+// pulse_between() removed — color pulses are now driven by lv_anim_t
+// in apply_ring_visual_locked() via pulse_anim_exec_cb.
 
-  const uint32_t phase = lv_tick_get() % period_ms;
-  const uint32_t half = std::max<uint32_t>(period_ms / 2U, 1U);
-  uint16_t wave = 0U;
-  if (phase < half) {
-    wave = static_cast<uint16_t>((phase * 255U) / half);
-  } else {
-    const uint32_t down_phase = std::min<uint32_t>(phase - half, half);
-    wave = static_cast<uint16_t>(255U - ((down_phase * 255U) / half));
-  }
-
-  const uint16_t depth = static_cast<uint16_t>(
-      std::min<uint32_t>(pulse_depth_percent, 100U) * 255U / 100U);
-  const uint16_t min_scale = static_cast<uint16_t>(255U > depth ? 255U - depth : 0U);
-  const uint16_t scale = static_cast<uint16_t>(
-      min_scale + ((static_cast<uint32_t>(255U - min_scale) * wave + 127U) / 255U));
-  return scale_color(base_color, scale);
-}
+enum class RingAnimKind : uint8_t {
+  kNone,           // Static — no animation
+  kFilamentLoad,   // Arc value sweeps 0→100, repeat
+  kFilamentUnload, // Arc value sweeps 100→0, repeat
+  kPulseBoth,      // Both MAIN & INDICATOR color pulse
+  kPulseIndicator, // Only INDICATOR color pulses
+  kAmbientSweep,   // Slow rotation (printing state)
+};
 
 struct RingVisual {
   uint32_t main_hex = kRingBaseDark;
   uint32_t indicator_hex = 0xFFFFFF;
   int value_override = -1;
-  bool animated = false;
+  RingAnimKind anim_kind = RingAnimKind::kNone;
+  uint32_t pulse_base_hex = 0;    // Base color for pulse animations
+  uint32_t pulse_period_ms = 0;   // Period for pulse animations
+  bool animated() const { return anim_kind != RingAnimKind::kNone; }
 };
 
 RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColorScheme& colors) {
@@ -417,22 +431,11 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
   RingVisual visual = {};
 
   if (is_filament) {
-    const uint32_t cycle = 2300U;
-    const uint32_t t = lv_tick_get() % cycle;
     const bool is_loading =
         stage_contains(stage, "filament_loading") || stage_contains(stage, "changing_filament");
-    int value = 0;
-    if (t < 2000U) {
-      const float f = static_cast<float>(t) / 2000.0f;
-      value = is_loading ? static_cast<int>(std::lround(f * 100.0f))
-                         : static_cast<int>(std::lround((1.0f - f) * 100.0f));
-    } else {
-      value = is_loading ? 100 : 0;
-    }
     visual.main_hex = kRingBaseDark;
     visual.indicator_hex = colors.filament;
-    visual.value_override = value;
-    visual.animated = true;
+    visual.anim_kind = is_loading ? RingAnimKind::kFilamentLoad : RingAnimKind::kFilamentUnload;
     return visual;
   }
 
@@ -443,10 +446,11 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
   }
   if (snapshot.connection == PrinterConnectionState::kError || snapshot.has_error ||
       snapshot.lifecycle == PrintLifecycleState::kError) {
-    const uint32_t c = pulse_between(colors.error, 1600U, kRingPulseDepthPercent);
-    visual.main_hex = c;
-    visual.indicator_hex = c;
-    visual.animated = true;
+    visual.main_hex = colors.error;
+    visual.indicator_hex = colors.error;
+    visual.anim_kind = RingAnimKind::kPulseBoth;
+    visual.pulse_base_hex = colors.error;
+    visual.pulse_period_ms = 1600U;
     return visual;
   }
   if (!snapshot.wifi_connected) {
@@ -463,8 +467,10 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
 
   if (is_download) {
     visual.main_hex = kRingBaseDark;
-    visual.indicator_hex = pulse_between(colors.preheat, 1400U, kRingPulseDepthPercent);
-    visual.animated = true;
+    visual.indicator_hex = colors.preheat;
+    visual.anim_kind = RingAnimKind::kPulseIndicator;
+    visual.pulse_base_hex = colors.preheat;
+    visual.pulse_period_ms = 1400U;
     return visual;
   }
 
@@ -475,29 +481,32 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
       status == "prepare" || snapshot.ui_status == "preparing" ||
       snapshot.ui_status == "preheating" ||
       snapshot.lifecycle == PrintLifecycleState::kPreparing) {
-    const uint32_t c = pulse_between(colors.preheat, 1400U, kRingPulseDepthPercent);
-    visual.main_hex = c;
-    visual.indicator_hex = c;
-    visual.animated = true;
+    visual.main_hex = colors.preheat;
+    visual.indicator_hex = colors.preheat;
+    visual.anim_kind = RingAnimKind::kPulseBoth;
+    visual.pulse_base_hex = colors.preheat;
+    visual.pulse_period_ms = 1400U;
     return visual;
   }
 
   if (stage_contains(stage, "cleaning_nozzle_tip") || stage_contains(stage, "clean") ||
       snapshot.ui_status == "clean nozzle") {
-    const uint32_t c = pulse_between(colors.clean, 1200U, kRingPulseDepthPercent);
-    visual.main_hex = c;
-    visual.indicator_hex = c;
-    visual.animated = true;
+    visual.main_hex = colors.clean;
+    visual.indicator_hex = colors.clean;
+    visual.anim_kind = RingAnimKind::kPulseBoth;
+    visual.pulse_base_hex = colors.clean;
+    visual.pulse_period_ms = 1200U;
     return visual;
   }
 
   if (stage_contains(stage, "auto_bed_leveling") || stage_contains(stage, "bed_level") ||
       stage_contains(stage, "level") || stage_contains(stage, "measuring_surface") ||
       snapshot.ui_status == "bed level") {
-    const uint32_t c = pulse_between(colors.level, 1400U, kRingPulseDepthPercent);
-    visual.main_hex = c;
-    visual.indicator_hex = c;
-    visual.animated = true;
+    visual.main_hex = colors.level;
+    visual.indicator_hex = colors.level;
+    visual.anim_kind = RingAnimKind::kPulseBoth;
+    visual.pulse_base_hex = colors.level;
+    visual.pulse_period_ms = 1400U;
     return visual;
   }
 
@@ -536,7 +545,7 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     case PrintLifecycleState::kPaused:
       visual.main_hex = kRingBaseDark;
       visual.indicator_hex = colors.printing;
-      visual.animated = true;  // enable ambient sweep rotation in handle_ring_timer
+      visual.anim_kind = RingAnimKind::kAmbientSweep;
       return visual;
     case PrintLifecycleState::kPreparing:
       visual.main_hex = colors.preheat;
@@ -664,9 +673,8 @@ uint32_t stable_status_text_hex(const PrinterSnapshot& snapshot, const ArcColorS
   return colors.unknown;
 }
 
-bool ring_visual_is_animated(const PrinterSnapshot& snapshot, const ArcColorScheme& colors) {
-  return lifecycle_ring_visual(snapshot, colors).animated;
-}
+// ring_visual_is_animated() removed — animation state is now tracked
+// via active_ring_anim_kind_ in apply_ring_visual_locked().
 
 std::string lifecycle_label(const PrinterSnapshot& snapshot) {
   if (snapshot.connection == PrinterConnectionState::kWaitingForCredentials) {
@@ -1052,6 +1060,7 @@ esp_err_t Ui::initialize() {
   }
 
   ring_anim_timer_ = lv_timer_create(&Ui::ring_timer_cb, kRingAnimationTickMs, this);
+  lv_timer_pause(ring_anim_timer_);  // Starts paused; resumed only for ambient sweep.
 
   initialized_ = true;
   ESP_LOGI(kTag, "UI ready with YAML-style pager layout (rotation=%s)",
@@ -1065,7 +1074,7 @@ void Ui::set_arc_color_scheme(const ArcColorScheme& colors) {
     return;
   }
 
-  LvglLockGuard lock(200);
+  LvglLockGuard lock(200, "set_arc_color");
   if (!lock.locked()) {
     return;
   }
@@ -1101,11 +1110,9 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
     return;
   }
 
-  LvglLockGuard lock(200);
-  if (!lock.locked()) {
-    return;
-  }
-
+  // Store portal data without LVGL lock.  The actual text computation and
+  // visual update happen inside apply_snapshot_locked() which already holds
+  // the lock.  This eliminates a separate lock acquisition per tick.
   portal_lock_enabled_ = lock_enabled;
   portal_request_authorized_ = request_authorized;
   portal_session_active_ = session_active;
@@ -1113,6 +1120,9 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
   portal_pin_code_ = pin_code;
   portal_pin_remaining_s_ = pin_remaining_s;
   portal_session_remaining_s_ = session_remaining_s;
+}
+
+void Ui::compute_portal_texts_locked() {
   const bool provisioning_context =
       last_snapshot_.setup_ap_active ||
       last_snapshot_.connection == PrinterConnectionState::kWaitingForCredentials;
@@ -1120,8 +1130,8 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
       !last_snapshot_.setup_ap_active && last_snapshot_.wifi_connected && !last_snapshot_.wifi_ip.empty();
 
   if (portal_pin_active_) {
-    portal_hint_text_ = request_authorized ? "Web Config PIN active on the display"
-                                           : "Enter the PIN shown on the display";
+    portal_hint_text_ = portal_request_authorized_ ? "Web Config PIN active on the display"
+                                                   : "Enter the PIN shown on the display";
     portal_overlay_title_text_ = "WEB CONFIG PIN";
     portal_overlay_value_text_ = portal_pin_code_;
     portal_overlay_detail_text_ =
@@ -1131,7 +1141,7 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
     portal_overlay_title_text_.clear();
     portal_overlay_value_text_.clear();
     portal_overlay_detail_text_.clear();
-    if (portal_session_active_ && request_authorized) {
+    if (portal_session_active_ && portal_request_authorized_) {
       portal_hint_text_ =
           "Web Config unlocked for " +
           short_duration_text(std::max<uint32_t>(portal_session_remaining_s_, 1U));
@@ -1264,7 +1274,7 @@ void Ui::update_printer_cards(const std::vector<PrinterCardInfo>& cards) {
   }
   last_printer_cards_ = cards;
 
-  LvglLockGuard lock(200);
+  LvglLockGuard lock(200, "update_cards");
   if (!lock.locked()) {
     return;
   }
@@ -1440,13 +1450,31 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
     return;
   }
 
-  LvglLockGuard lock(500);
+  // Pre-decode preview PNG outside LVGL lock.  decode_preview_png() is pure
+  // computation (heap alloc + libpng) that can block the CPU for 200-500 ms
+  // on a typical cover image.  Holding the LVGL mutex that long starves the
+  // LVGL worker and eventually freezes the display.
+  std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw;
+  lv_image_dsc_t pre_decoded_dsc{};
+  const bool preview_blob_changed =
+      snapshot.preview_blob && !snapshot.preview_blob->empty() &&
+      last_preview_blob_.get() != snapshot.preview_blob.get();
+  // Also pre-decode when the blob exists but hasn't been decoded yet (e.g.
+  // blob arrived while another page was active, then user scrolled to preview).
+  const bool needs_first_decode =
+      !preview_blob_changed && snapshot.preview_blob &&
+      !snapshot.preview_blob->empty() &&
+      (!last_preview_raw_ || last_preview_raw_->empty());
+  if (preview_blob_changed || needs_first_decode) {
+    decode_preview_png(snapshot.preview_blob, &pre_decoded_raw, &pre_decoded_dsc);
+  }
+
+  LvglLockGuard lock(500, "apply_snapshot");
   if (!lock.locked()) {
     return;
   }
 
   const PrinterSnapshot previous_snapshot = last_snapshot_;
-  const bool was_animated = ring_animation_active_;
   last_snapshot_ = snapshot;
   if (scrolling_) {
     deferred_snapshot_ = snapshot;
@@ -1454,52 +1482,145 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
     return;
   }
 
-  const bool animation_state_changed =
-      ring_visual_is_animated(snapshot, arc_colors_) != was_animated ||
-      snapshot.raw_status != previous_snapshot.raw_status ||
-      snapshot.raw_stage != previous_snapshot.raw_stage ||
-      snapshot.connection != previous_snapshot.connection ||
-      snapshot.lifecycle != previous_snapshot.lifecycle ||
-      snapshot.has_error != previous_snapshot.has_error ||
-      snapshot.wifi_connected != previous_snapshot.wifi_connected ||
-      snapshot.ui_status != previous_snapshot.ui_status ||
-      std::lround(snapshot.progress_percent) != std::lround(previous_snapshot.progress_percent);
-
-  apply_snapshot_locked(snapshot, animation_state_changed);
+  apply_snapshot_locked(snapshot, false,
+                        std::move(pre_decoded_raw), &pre_decoded_dsc);
 }
 
 void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
   const int progress = std::clamp(static_cast<int>(snapshot.progress_percent + 0.5f), 0, 100);
   const RingVisual ring = lifecycle_ring_visual(snapshot, arc_colors_);
   const uint32_t text_hex = stable_status_text_hex(snapshot, arc_colors_);
-  const int displayed_value = (ring.value_override >= 0) ? ring.value_override : progress;
 
-  if (lv_arc_get_value(status_arc_) != displayed_value) {
-    lv_arc_set_value(status_arc_, displayed_value);
+  // --- Manage lv_anim transitions ---
+  const auto anim_kind_u8 = static_cast<uint8_t>(ring.anim_kind);
+  if (anim_kind_u8 != active_ring_anim_kind_) {
+    // Stop any running ring animations.
+    stop_ring_animations_locked();
+
+    active_ring_anim_kind_ = anim_kind_u8;
+
+    switch (ring.anim_kind) {
+      case RingAnimKind::kFilamentLoad:
+      case RingAnimKind::kFilamentUnload: {
+        const bool loading = (ring.anim_kind == RingAnimKind::kFilamentLoad);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, status_arc_);
+        lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) {
+          lv_arc_set_value(static_cast<lv_obj_t*>(obj), v);
+        });
+        lv_anim_set_values(&a, loading ? 0 : 100, loading ? 100 : 0);
+        lv_anim_set_duration(&a, 2000);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_repeat_delay(&a, 300);
+        lv_anim_set_path_cb(&a, lv_anim_path_linear);
+        lv_anim_start(&a);
+        break;
+      }
+      case RingAnimKind::kPulseBoth:
+      case RingAnimKind::kPulseIndicator: {
+        const uint16_t depth = static_cast<uint16_t>(
+            std::min<uint32_t>(kRingPulseDepthPercent, 100U) * 255U / 100U);
+        const int32_t min_scale = static_cast<int32_t>(255 > depth ? 255 - depth : 0);
+        pulse_base_hex_ = ring.pulse_base_hex;
+        pulse_both_parts_ = (ring.anim_kind == RingAnimKind::kPulseBoth);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, this);
+        lv_anim_set_exec_cb(&a, pulse_anim_exec_cb);
+        lv_anim_set_values(&a, min_scale, 255);
+        lv_anim_set_duration(&a, ring.pulse_period_ms / 2);
+        lv_anim_set_reverse_duration(&a, ring.pulse_period_ms / 2);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_linear);
+        lv_anim_start(&a);
+        break;
+      }
+      case RingAnimKind::kAmbientSweep:
+        // Future: slow rotation animation. For now just static.
+        break;
+      case RingAnimKind::kNone:
+        break;
+    }
+  } else if (ring.anim_kind == RingAnimKind::kPulseBoth ||
+             ring.anim_kind == RingAnimKind::kPulseIndicator) {
+    // Same animation kind but base color might have changed (e.g. color scheme switch).
+    pulse_base_hex_ = ring.pulse_base_hex;
+    pulse_both_parts_ = (ring.anim_kind == RingAnimKind::kPulseBoth);
   }
 
-  if (last_ring_main_hex_ != ring.main_hex) {
-    lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.main_hex), LV_PART_MAIN);
-    last_ring_main_hex_ = ring.main_hex;
+  // --- Apply static properties ---
+  // For non-filament states, set the arc value from progress.
+  if (ring.anim_kind != RingAnimKind::kFilamentLoad &&
+      ring.anim_kind != RingAnimKind::kFilamentUnload) {
+    const int displayed_value = (ring.value_override >= 0) ? ring.value_override : progress;
+    if (lv_arc_get_value(status_arc_) != displayed_value) {
+      lv_arc_set_value(status_arc_, displayed_value);
+    }
   }
-  if (last_ring_indicator_hex_ != ring.indicator_hex) {
-    lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.indicator_hex), LV_PART_INDICATOR);
-    last_ring_indicator_hex_ = ring.indicator_hex;
+
+  // Set colors for non-pulse states (pulse callback handles colors itself).
+  if (ring.anim_kind != RingAnimKind::kPulseBoth &&
+      ring.anim_kind != RingAnimKind::kPulseIndicator) {
+    if (last_ring_main_hex_ != ring.main_hex) {
+      lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.main_hex), LV_PART_MAIN);
+      last_ring_main_hex_ = ring.main_hex;
+    }
+    if (last_ring_indicator_hex_ != ring.indicator_hex) {
+      lv_obj_set_style_arc_color(status_arc_, lv_color_hex(ring.indicator_hex), LV_PART_INDICATOR);
+      last_ring_indicator_hex_ = ring.indicator_hex;
+    }
   }
+
   if (last_ring_text_hex_ != text_hex) {
     const lv_color_t text_color = lv_color_hex(text_hex);
     lv_obj_set_style_text_color(progress_label_, text_color, 0);
     lv_obj_set_style_text_color(status_label_, text_color, 0);
     last_ring_text_hex_ = text_hex;
   }
-  // Reset arc rotation to top (270°) for static states so ambient sweep
-  // is only active when the ring timer is running (ring.animated == true).
-  if (!ring.animated) {
+  // Reset arc rotation to top (270°) for non-sweep states.
+  if (ring.anim_kind != RingAnimKind::kAmbientSweep) {
     lv_arc_set_rotation(status_arc_, 270);
+  }
+
+  // Resume/pause the ring timer — only needed for ambient sweep rotation.
+  if (ring_anim_timer_ != nullptr) {
+    if (ring.anim_kind == RingAnimKind::kAmbientSweep) {
+      lv_timer_resume(ring_anim_timer_);
+    } else {
+      lv_timer_pause(ring_anim_timer_);
+    }
   }
 }
 
-bool Ui::ensure_preview_image_loaded_locked(bool force_reload) {
+void Ui::stop_ring_animations_locked() {
+  // Stop filament value animation (var = status_arc_).
+  lv_anim_delete(status_arc_, nullptr);
+  // Stop pulse color animation (var = this).
+  lv_anim_delete(this, pulse_anim_exec_cb);
+  active_ring_anim_kind_ = static_cast<uint8_t>(RingAnimKind::kNone);
+}
+
+void Ui::pulse_anim_exec_cb(void* var, int32_t scale) {
+  auto* ui = static_cast<Ui*>(var);
+  if (ui == nullptr || ui->status_arc_ == nullptr) return;
+  const uint32_t hex = scale_color(ui->pulse_base_hex_, static_cast<uint16_t>(scale));
+  if (ui->pulse_both_parts_) {
+    if (ui->last_ring_main_hex_ != hex) {
+      lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_MAIN);
+      ui->last_ring_main_hex_ = hex;
+    }
+  }
+  if (ui->last_ring_indicator_hex_ != hex) {
+    lv_obj_set_style_arc_color(ui->status_arc_, lv_color_hex(hex), LV_PART_INDICATOR);
+    ui->last_ring_indicator_hex_ = hex;
+  }
+}
+
+bool Ui::ensure_preview_image_loaded_locked(
+    bool force_reload,
+    std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw,
+    const lv_image_dsc_t* pre_decoded_dsc) {
   if (force_reload) {
     release_preview_image_locked();
   }
@@ -1509,18 +1630,18 @@ bool Ui::ensure_preview_image_loaded_locked(bool force_reload) {
     return true;
   }
 
-  if (!last_preview_blob_ || last_preview_blob_->empty()) {
-    return false;
+  // Use pre-decoded data when available (decoded outside LVGL lock).
+  if (pre_decoded_raw && !pre_decoded_raw->empty() && pre_decoded_dsc != nullptr) {
+    last_preview_raw_ = std::move(pre_decoded_raw);
+    preview_image_dsc_ = *pre_decoded_dsc;
+    lv_image_set_src(page2_image_, &preview_image_dsc_);
+    return true;
   }
 
-  if (!decode_preview_png(last_preview_blob_, &last_preview_raw_, &preview_image_dsc_)) {
-    std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
-    last_preview_raw_.reset();
-    return false;
-  }
-
-  lv_image_set_src(page2_image_, &preview_image_dsc_);
-  return true;
+  // No fallback decode under lock — pre-decode happens outside the LVGL
+  // lock in apply_snapshot().  If we reach here without decoded data the
+  // image will appear on the next snapshot tick (~500 ms).
+  return false;
 }
 
 void Ui::release_preview_image_locked() {
@@ -1532,29 +1653,50 @@ void Ui::release_preview_image_locked() {
   std::memset(&preview_image_dsc_, 0, sizeof(preview_image_dsc_));
 }
 
-void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh) {
+void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh,
+                               std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw,
+                               const lv_image_dsc_t* pre_decoded_dsc) {
   deferred_snapshot_pending_ = false;
   update_page_availability_locked(snapshot);
 
-  if (!snapshot.ui_status.empty() &&
-      (snapshot.ui_status != last_ui_status_ || snapshot.print_active != last_print_active_)) {
-    note_activity(true);
+  bool wake_due_to_state_change = false;
+  if (!snapshot.ui_status.empty() && snapshot.ui_status != last_ui_status_) {
+    wake_due_to_state_change = true;
     last_ui_status_ = snapshot.ui_status;
+  }
+  if (snapshot.print_active != last_print_active_) {
+    wake_due_to_state_change = true;
     last_print_active_ = snapshot.print_active;
   }
-
-  ring_animation_active_ = ring_visual_is_animated(snapshot, arc_colors_);
-  const int progress = std::clamp(static_cast<int>(snapshot.progress_percent + 0.5f), 0, 100);
-  if (!ring_animation_active_ || force_ring_refresh) {
-    apply_ring_visual_locked(snapshot);
+  if (wake_due_to_state_change) {
+    note_activity(true);
   }
+
+  const int progress = std::clamp(static_cast<int>(snapshot.progress_percent + 0.5f), 0, 100);
+
+  // Always apply ring visual — it manages lv_anim transitions internally
+  // and only restarts animations when the kind actually changes.
+  apply_ring_visual_locked(snapshot);
 
   char progress_buffer[8] = {};
   std::snprintf(progress_buffer, sizeof(progress_buffer), "%d%%", progress);
   set_label_text_if_changed(progress_label_, progress_buffer);
-  set_label_text_if_changed(status_label_, lifecycle_label(snapshot));
+  const std::string status_text = lifecycle_label(snapshot);
+  set_label_text_if_changed(status_label_, status_text);
 
   const std::string detail = detail_text(snapshot);
+
+  // [DIAG] Log what the display is actually showing — on change only.
+  if (status_text != last_diag_status_ || detail != last_diag_detail_ ||
+      snapshot.stage != last_diag_stage_) {
+    last_diag_status_ = status_text;
+    last_diag_detail_ = detail;
+    last_diag_stage_ = snapshot.stage;
+    ESP_LOGI(kTag, "[DIAG] display: status=%s stage=%s detail=%.60s lifecycle=%s",
+             status_text.c_str(), snapshot.stage.c_str(),
+             detail.empty() ? "(-)" : detail.c_str(),
+             to_string(snapshot.lifecycle));
+  }
   detail_visible_ = !detail.empty();
   if (detail_visible_) {
     const lv_label_long_mode_t desired_mode =
@@ -1607,6 +1749,97 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   set_label_text_if_changed(battery_icon_label_, show_battery ? battery_icon : "");
   set_label_text_if_changed(battery_pct_label_, show_battery ? battery_pct : "");
 
+  // --- AMS page rendering ---
+  const uint8_t ams_count = snapshot.ams ? snapshot.ams->count : 0;
+  if (ams_page_available_ && ams_count > 0) {
+    const AmsUnitInfo& unit = snapshot.ams->units[0];
+
+    for (int i = 0; i < kMaxAmsTrays; ++i) {
+      const AmsTrayInfo& tray = unit.trays[i];
+      if (tray.present) {
+        const uint32_t rgba = tray.color_rgba;
+        const uint32_t rgb = (rgba >> 8) & 0x00FFFFFF;
+        lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(rgb), 0);
+        lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
+        // Active tray: 2px black border + 2px white outline (double ring)
+        if (tray.active) {
+          lv_obj_set_style_border_width(ams_tray_rect_[i], 2, 0);
+          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x000000), 0);
+          lv_obj_set_style_outline_width(ams_tray_rect_[i], 2, 0);
+          lv_obj_set_style_outline_color(ams_tray_rect_[i], lv_color_hex(0xFFFFFF), 0);
+          lv_obj_set_style_outline_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
+          lv_obj_set_style_outline_pad(ams_tray_rect_[i], 0, 0);
+        } else {
+          lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
+          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
+          lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
+        }
+        set_label_text_if_changed(ams_tray_type_[i],
+                                  tray.material_type.empty() ? "--" : tray.material_type);
+        // Slot label contrast: light text on dark fill, dark text on light fill
+        const bool is_dark = ((rgb >> 16) & 0xFF) * 299 +
+                             ((rgb >> 8) & 0xFF) * 587 +
+                             (rgb & 0xFF) * 114 < 128000;
+        lv_obj_set_style_text_color(ams_tray_type_[i],
+            lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
+
+        // Filament remaining fill level
+        if (tray.remain_pct >= 0) {
+          const int rect_h = 140;
+          const int empty_h = rect_h - (rect_h * tray.remain_pct / 100);
+          lv_obj_set_height(ams_tray_fill_[i], empty_h);
+          lv_obj_align(ams_tray_fill_[i], LV_ALIGN_TOP_MID, 0, 0);
+          lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
+          char pct_buf[8];
+          std::snprintf(pct_buf, sizeof(pct_buf), "%d%%", tray.remain_pct);
+          set_label_text_if_changed(ams_tray_pct_[i], pct_buf);
+          lv_obj_set_style_text_color(ams_tray_pct_[i],
+              lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
+          lv_obj_clear_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_align_to(ams_tray_pct_[i], ams_tray_rect_[i],
+                          LV_ALIGN_BOTTOM_MID, 0, -10);
+        } else {
+          lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+      } else {
+        lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(0x333333), 0);
+        lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
+        lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
+        lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
+        set_label_text_if_changed(ams_tray_type_[i], "Empty");
+        lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+
+    // Humidity: direct percentage from printer
+    char hum_buf[16] = {};
+    if (unit.humidity_pct >= 0) {
+      std::snprintf(hum_buf, sizeof(hum_buf), "%d%%", unit.humidity_pct);
+    } else {
+      std::snprintf(hum_buf, sizeof(hum_buf), "--%% ");
+    }
+    set_label_text_if_changed(ams_humidity_label_, hum_buf);
+
+    char temp_buf[24] = {};
+    if (unit.temperature_c > 0.0f) {
+      std::snprintf(temp_buf, sizeof(temp_buf), "%.0f%s", unit.temperature_c, kDegreeC);
+    } else {
+      std::snprintf(temp_buf, sizeof(temp_buf), "--%s", kDegreeC);
+    }
+    set_label_text_if_changed(ams_temp_label_, temp_buf);
+
+    set_hidden(ams_tray_row_, false);
+    set_hidden(ams_note_, true);
+  } else if (!ams_page_available_) {
+    // Page is hidden, nothing to do.
+  } else {
+    set_hidden(ams_tray_row_, true);
+    set_hidden(ams_note_, false);
+  }
+
   const std::string preview_note = preview_note_text(snapshot);
   const std::string preview_subnote = preview_subnote_text(snapshot);
   const std::string camera_note = camera_note_text(snapshot);
@@ -1615,8 +1848,9 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   if (snapshot.preview_blob && !snapshot.preview_blob->empty()) {
     const bool preview_blob_changed = last_preview_blob_.get() != snapshot.preview_blob.get();
     last_preview_blob_ = snapshot.preview_blob;
-    if (active_page_ == 2) {
-      has_preview_image = ensure_preview_image_loaded_locked(preview_blob_changed);
+    if (active_page_ == 3) {
+      has_preview_image = ensure_preview_image_loaded_locked(
+          preview_blob_changed, std::move(pre_decoded_raw), pre_decoded_dsc);
     } else if (preview_blob_changed) {
       release_preview_image_locked();
     }
@@ -1634,8 +1868,8 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
       // Note is hidden when cover is loaded; subnote (title) moves to former note position.
       lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2NoteWithImageY);
     } else {
-      lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, 0);
-      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 28);
+      lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, -14);
+      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 18);
     }
     preview_text_image_mode_ = has_page2_image;
   }
@@ -1742,6 +1976,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     logo_recolor_enabled_ = logo_recolor_enabled;
     logo_recolor_hex_ = logo_recolor_hex;
   }
+  compute_portal_texts_locked();
   apply_page_visibility();
 }
 
@@ -1759,16 +1994,23 @@ void Ui::ring_timer_cb(lv_timer_t* timer) {
 }
 
 void Ui::handle_ring_timer() {
-  if (!initialized_ || !ring_animation_active_ || status_arc_ == nullptr ||
+  // With lv_anim_t driving all animations, this timer is only needed for
+  // the ambient sweep rotation during printing.  For all other states the
+  // timer is paused by apply_ring_visual_locked().
+  if (!initialized_ || status_arc_ == nullptr ||
       screen_power_mode_ == ScreenPowerMode::kOff || scrolling_) {
     return;
   }
 
-  apply_ring_visual_locked(last_snapshot_);
+  if (active_ring_anim_kind_ == static_cast<uint8_t>(RingAnimKind::kAmbientSweep)) {
+    const uint32_t phase = lv_tick_get() % kPrintRotPeriodMs;
+    const int32_t angle = 270 + static_cast<int32_t>((phase * 360U) / kPrintRotPeriodMs);
+    lv_arc_set_rotation(status_arc_, angle % 360);
+  }
 }
 
 esp_err_t Ui::build_dashboard() {
-  LvglLockGuard lock(3000);
+  LvglLockGuard lock(3000, "build_dashboard");
   if (!lock.locked()) {
     return ESP_ERR_TIMEOUT;
   }
@@ -1810,10 +2052,12 @@ esp_err_t Ui::build_dashboard() {
   };
 
   page0_ = create_page(pager_);
+  ams_page_ = create_page(pager_);
   page1_ = create_page(pager_);
   page2_ = create_page(pager_);
   page3_ = create_page(pager_);
   enable_touch_bubble(page0_);
+  enable_touch_bubble(ams_page_);
   enable_touch_bubble(page1_);
   enable_touch_bubble(page2_);
   enable_touch_bubble(page3_);
@@ -1848,6 +2092,170 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_color(page0_empty_note_, lv_color_hex(0x666666), 0);
   lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, 20);
   lv_obj_add_flag(page0_empty_note_, LV_OBJ_FLAG_HIDDEN);
+
+  // --- AMS page (page index 1) ---
+  // Pure LVGL spool visualization (no bitmap image).
+  // Layout: gray shelf + dark base background, 4 pill-shaped spool rects,
+  //         humidity pill indicator below.
+
+  // Gray shelf background (behind upper half of pills)
+  lv_obj_t* ams_shelf = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_shelf, 359, 110);
+  lv_obj_set_style_radius(ams_shelf, 20, 0);
+  lv_obj_set_style_bg_color(ams_shelf, lv_color_hex(0x565656), 0);
+  lv_obj_set_style_bg_opa(ams_shelf, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_shelf, 0, 0);
+  lv_obj_align(ams_shelf, LV_ALIGN_CENTER, 0, -47);
+  lv_obj_clear_flag(ams_shelf, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_shelf, LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_shelf);
+
+  // Dark base behind lower half of pills (solid, hides shelf's bottom corners)
+  lv_obj_t* ams_base = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_base, 385, 103);
+  lv_obj_set_style_radius(ams_base, 0, 0);
+  lv_obj_set_style_bg_color(ams_base, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_set_style_bg_opa(ams_base, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_base, 0, 0);
+  lv_obj_align(ams_base, LV_ALIGN_CENTER, 0, 38);
+  lv_obj_clear_flag(ams_base, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_base, LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_base);
+
+  ams_tray_row_ = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
+  make_transparent(ams_tray_row_);
+  lv_obj_set_flex_flow(ams_tray_row_, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(ams_tray_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(ams_tray_row_, 6, 0);
+  lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -19);
+  lv_obj_clear_flag(ams_tray_row_, LV_OBJ_FLAG_SCROLLABLE);
+  enable_touch_bubble(ams_tray_row_);
+
+  for (int i = 0; i < kMaxAmsTrays; ++i) {
+    // Column: type label on top, colored rect, color name below
+    ams_tray_col_[i] = lv_obj_create(ams_tray_row_);
+    lv_obj_set_size(ams_tray_col_[i], 76, LV_SIZE_CONTENT);
+    make_transparent(ams_tray_col_[i]);
+    lv_obj_set_flex_flow(ams_tray_col_[i], LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ams_tray_col_[i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ams_tray_col_[i], 4, 0);
+    lv_obj_set_style_pad_all(ams_tray_col_[i], 0, 0);
+    lv_obj_clear_flag(ams_tray_col_[i], LV_OBJ_FLAG_SCROLLABLE);
+
+    // Pill-shaped spool rectangle
+    ams_tray_rect_[i] = lv_obj_create(ams_tray_col_[i]);
+    lv_obj_set_size(ams_tray_rect_[i], 72, 140);
+    lv_obj_set_style_radius(ams_tray_rect_[i], 40, 0);
+    lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
+    lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
+    lv_obj_set_style_border_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
+    lv_obj_set_style_pad_all(ams_tray_rect_[i], 0, 0);
+    lv_obj_set_style_clip_corner(ams_tray_rect_[i], true, 0);
+    lv_obj_clear_flag(ams_tray_rect_[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_rect_[i], LV_OBJ_FLAG_CLICKABLE);
+
+    // Material type label inside pill upper area (e.g. "PLA")
+    ams_tray_type_[i] = lv_label_create(ams_tray_rect_[i]);
+    set_label_text_if_changed(ams_tray_type_[i], "--");
+    lv_obj_set_width(ams_tray_type_[i], 68);
+    lv_label_set_long_mode(ams_tray_type_[i], LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(ams_tray_type_[i], LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(ams_tray_type_[i], dosis20, 0);
+    lv_obj_set_style_text_color(ams_tray_type_[i], lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(ams_tray_type_[i], LV_ALIGN_TOP_MID, 0, 10);
+
+    // Dark overlay covering the empty portion from top (fill level indicator)
+    ams_tray_fill_[i] = lv_obj_create(ams_tray_rect_[i]);
+    lv_obj_set_size(ams_tray_fill_[i], 72, 0);
+    lv_obj_set_style_radius(ams_tray_fill_[i], 0, 0);
+    lv_obj_set_style_bg_color(ams_tray_fill_[i], lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ams_tray_fill_[i], LV_OPA_40, 0);
+    lv_obj_set_style_border_width(ams_tray_fill_[i], 0, 0);
+    lv_obj_align(ams_tray_fill_[i], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // Dark overlay on top of pills (opa 160) — creates "rolls inside box" effect
+  lv_obj_t* ams_overlay = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_overlay, 385, 103);
+  lv_obj_set_style_radius(ams_overlay, 0, 0);
+  lv_obj_set_style_bg_color(ams_overlay, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_set_style_bg_opa(ams_overlay, 160, 0);
+  lv_obj_set_style_border_width(ams_overlay, 0, 0);
+  lv_obj_align(ams_overlay, LV_ALIGN_CENTER, 0, 38);
+  lv_obj_clear_flag(ams_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(ams_overlay, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+  // Percentage labels on topmost layer (above overlay)
+  for (int i = 0; i < kMaxAmsTrays; ++i) {
+    ams_tray_pct_[i] = lv_label_create(ams_page_);
+    set_label_text_if_changed(ams_tray_pct_[i], "");
+    lv_obj_set_style_text_font(ams_tray_pct_[i], info20, 0);
+    lv_obj_set_style_text_color(ams_tray_pct_[i], lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_IGNORE_LAYOUT);
+  }
+
+  // Humidity indicator in a pill-shaped bordered container
+  lv_obj_t* hum_pill = lv_obj_create(ams_page_);
+  lv_obj_set_size(hum_pill, 139, 50);
+  lv_obj_set_style_radius(hum_pill, 25, 0);
+  lv_obj_set_style_bg_opa(hum_pill, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(hum_pill, lv_color_hex(0x9B9B9B), 0);
+  lv_obj_set_style_border_opa(hum_pill, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hum_pill, 1, 0);
+  lv_obj_set_style_pad_all(hum_pill, 0, 0);
+  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 154);
+  lv_obj_clear_flag(hum_pill, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(hum_pill, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hum_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(hum_pill, 8, 0);
+
+  // Water drop icon (simple circle as placeholder)
+  ams_humidity_drop_ = lv_obj_create(hum_pill);
+  lv_obj_set_size(ams_humidity_drop_, 14, 14);
+  lv_obj_set_style_radius(ams_humidity_drop_, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(ams_humidity_drop_, lv_color_hex(0x4A90D9), 0);
+  lv_obj_set_style_bg_opa(ams_humidity_drop_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_humidity_drop_, 0, 0);
+  lv_obj_clear_flag(ams_humidity_drop_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_humidity_drop_, LV_OBJ_FLAG_CLICKABLE);
+
+  ams_humidity_label_ = lv_label_create(hum_pill);
+  set_label_text_if_changed(ams_humidity_label_, "--");
+  lv_obj_set_style_text_font(ams_humidity_label_, dosis20, 0);
+  lv_obj_set_style_text_color(ams_humidity_label_, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_align(ams_humidity_label_, LV_TEXT_ALIGN_CENTER, 0);
+
+  ams_temp_label_ = lv_label_create(hum_pill);
+  set_label_text_if_changed(ams_temp_label_, "--\xC2\xB0""C");
+  lv_obj_set_style_text_font(ams_temp_label_, dosis20, 0);
+  lv_obj_set_style_text_color(ams_temp_label_, lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_align(ams_temp_label_, LV_TEXT_ALIGN_CENTER, 0);
+
+  ams_note_ = lv_label_create(ams_page_);
+  set_label_text_if_changed(ams_note_, "No AMS connected");
+  lv_obj_set_width(ams_note_, 280);
+  lv_label_set_long_mode(ams_note_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(ams_note_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(ams_note_, dosis20, 0);
+  lv_obj_set_style_text_color(ams_note_, lv_color_hex(0x666666), 0);
+  lv_obj_align(ams_note_, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(ams_note_, LV_OBJ_FLAG_HIDDEN);
+
+  // AMS page starts hidden until data says there's an AMS
+  lv_obj_add_flag(ams_page_, LV_OBJ_FLAG_HIDDEN);
+  ams_page_available_ = false;
 
   fixed_overlay_ = lv_obj_create(screen_);
   lv_obj_set_size(fixed_overlay_, board::kDisplayWidth, board::kDisplayHeight);
@@ -2116,17 +2524,17 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_align(page2_note_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page2_note_, dosis20, 0);
   lv_obj_set_style_text_color(page2_note_, lv_color_hex(0x888888), 0);
-  lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, -14);
   enable_touch_bubble(page2_note_);
 
   page2_subnote_ = lv_label_create(page2_);
   set_label_text_if_changed(page2_subnote_, "");
   lv_obj_set_width(page2_subnote_, 320);
-  lv_label_set_long_mode(page2_subnote_, LV_LABEL_LONG_WRAP);
+  lv_label_set_long_mode(page2_subnote_, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_align(page2_subnote_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page2_subnote_, info20, 0);
   lv_obj_set_style_text_color(page2_subnote_, lv_color_hex(0x888888), 0);
-  lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 28);
+  lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 18);
   lv_obj_add_flag(page2_subnote_, LV_OBJ_FLAG_HIDDEN);
   enable_touch_bubble(page2_subnote_);
 
@@ -2161,9 +2569,10 @@ esp_err_t Ui::build_dashboard() {
   enable_touch_bubble(page3_subnote_);
 
   lv_obj_add_event_cb(screen_, &Ui::screen_event_cb, LV_EVENT_ALL, this);
-  lv_obj_scroll_to_x(pager_, board::kDisplayWidth, LV_ANIM_OFF);
+  lv_obj_update_layout(pager_);
+  lv_obj_scroll_to_view(page1_, LV_ANIM_OFF);
 
-  active_page_ = 1;
+  active_page_ = 2;
   scrolling_ = false;
   deferred_snapshot_pending_ = false;
   detail_visible_ = true;
@@ -2177,32 +2586,40 @@ esp_err_t Ui::build_dashboard() {
 }
 
 void Ui::apply_page_visibility() {
-  const bool settled_page1 = !scrolling_ && active_page_ == 1;
-  const bool settled_page2 = !scrolling_ && active_page_ == 2;
-  const bool settled_page3 = !scrolling_ && active_page_ == 3;
+  // Page content labels are children of their respective page objects which live
+  // inside the horizontally-scrolling pager.  LVGL clips children that are
+  // outside the visible viewport, so we do NOT need to hide page-1/2/3 content
+  // during a scroll gesture.  Keeping them visible produces a smooth gallery-
+  // like swipe transition where the departing and arriving pages render side by
+  // side while the user's finger drags.
+  const bool on_page1 = !scrolling_ ? (active_page_ == 2) : true;
+  const bool on_page2 = !scrolling_ ? (active_page_ == 3) : true;
+  const bool on_page3 = !scrolling_ ? (active_page_ == 4) : true;
+  const bool settled_page1 = !scrolling_ && active_page_ == 2;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_portal_hint =
       settled_page1 && !portal_hint_text_.empty() &&
       (portal_hint_has_priority || !detail_visible_);
 
+  set_hidden(ams_page_, !ams_page_available_);
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
 
-  // Page 1 detail labels — show only when settled on page 1
-  set_hidden(status_label_, !settled_page1);
-  set_hidden(detail_label_, !settled_page1 || !detail_visible_ || show_portal_hint);
-  set_hidden(layer_label_, !settled_page1);
-  set_hidden(nozzle_prefix_label_, !settled_page1);
-  set_hidden(nozzle_value_label_, !settled_page1);
-  set_hidden(nozzle_aux_label_, !settled_page1 || !nozzle_aux_visible_);
-  set_hidden(bed_prefix_label_, !settled_page1);
-  set_hidden(bed_value_label_, !settled_page1);
-  set_hidden(bed_aux_label_, !settled_page1 || !bed_aux_visible_);
-  set_hidden(remaining_row_, !settled_page1);
-  set_hidden(badge_slot_, !settled_page1);
+  // Page 1 detail labels
+  set_hidden(status_label_, !on_page1);
+  set_hidden(detail_label_, !on_page1 || !detail_visible_ || show_portal_hint);
+  set_hidden(layer_label_, !on_page1);
+  set_hidden(nozzle_prefix_label_, !on_page1);
+  set_hidden(nozzle_value_label_, !on_page1);
+  set_hidden(nozzle_aux_label_, !on_page1 || !nozzle_aux_visible_);
+  set_hidden(bed_prefix_label_, !on_page1);
+  set_hidden(bed_value_label_, !on_page1);
+  set_hidden(bed_aux_label_, !on_page1 || !bed_aux_visible_);
+  set_hidden(remaining_row_, !on_page1);
+  set_hidden(badge_slot_, !on_page1);
   set_hidden(portal_hint_label_, !show_portal_hint);
-  set_hidden(page2_image_, !settled_page2 || !preview_image_visible_);
-  set_hidden(page3_image_, !settled_page3 || !camera_image_visible_);
+  set_hidden(page2_image_, !on_page2 || !preview_image_visible_);
+  set_hidden(page3_image_, !on_page3 || !camera_image_visible_);
 
   // Overlay + page0 opacity are driven by apply_page0_parallax.
   // When not scrolling, snap to final state.
@@ -2215,7 +2632,8 @@ void Ui::apply_page_visibility() {
 }
 
 void Ui::apply_logo_visibility() {
-  const bool show_badge_slot = !scrolling_ && active_page_ == 1;
+  // badge_slot_ is a child of page1_ so it clips naturally during scroll.
+  const bool show_badge_slot = scrolling_ || active_page_ == 2;
   if (!show_badge_slot) {
     set_hidden(logo_badge_, true);
     set_hidden(sync_spinner_, true);
@@ -2231,16 +2649,20 @@ void Ui::apply_logo_visibility() {
 void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   const bool preview_available = snapshot.preview_page_available;
   const bool camera_available = snapshot.camera_page_available;
+  const bool ams_available = snapshot.ams && snapshot.ams->count > 0;
   const bool availability_changed =
-      preview_page_available_ != preview_available || camera_page_available_ != camera_available;
+      preview_page_available_ != preview_available || camera_page_available_ != camera_available ||
+      ams_page_available_ != ams_available;
 
   preview_page_available_ = preview_available;
   camera_page_available_ = camera_available;
+  ams_page_available_ = ams_available;
 
   if (!availability_changed) {
     return;
   }
 
+  set_hidden(ams_page_, !ams_page_available_);
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
 
@@ -2273,9 +2695,7 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   }
   scrolling_ = false;
   apply_page0_parallax();
-  if (ring_anim_timer_ != nullptr) {
-    lv_timer_resume(ring_anim_timer_);
-  }
+  // Ring timer resume is handled by apply_ring_visual_locked via apply_snapshot.
 }
 
 bool Ui::page_enabled(int page) const {
@@ -2283,10 +2703,12 @@ bool Ui::page_enabled(int page) const {
     case 0:
       return true;
     case 1:
-      return true;
+      return ams_page_available_;
     case 2:
-      return preview_page_available_;
+      return true;
     case 3:
+      return preview_page_available_;
+    case 4:
       return camera_page_available_;
     default:
       return false;
@@ -2298,10 +2720,12 @@ lv_obj_t* Ui::page_object(int page) const {
     case 0:
       return page0_;
     case 1:
-      return page1_;
+      return ams_page_;
     case 2:
-      return page2_;
+      return page1_;
     case 3:
+      return page2_;
+    case 4:
       return page3_;
     default:
       return nullptr;
@@ -2310,7 +2734,7 @@ lv_obj_t* Ui::page_object(int page) const {
 
 int Ui::next_enabled_page(int page, int direction) const {
   int candidate = page + direction;
-  while (candidate >= 0 && candidate <= 3) {
+  while (candidate >= 0 && candidate <= 4) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -2324,7 +2748,7 @@ int Ui::clamp_enabled_page(int page) const {
     return page;
   }
 
-  for (int candidate = 0; candidate <= 3; ++candidate) {
+  for (int candidate = 0; candidate <= 4; ++candidate) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -2347,7 +2771,7 @@ int Ui::nearest_enabled_page_for_scroll() const {
   int best_page = clamp_enabled_page(active_page_);
   int best_distance = INT32_MAX;
 
-  for (int page = 0; page <= 3; ++page) {
+  for (int page = 0; page <= 4; ++page) {
     if (!page_enabled(page)) {
       continue;
     }
@@ -2378,7 +2802,7 @@ void Ui::set_active_page(int page) {
     // final position instantly in one frame.
     lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
   }
-  if (previous_page == 2 && clamped_page != 2) {
+  if (previous_page == 3 && clamped_page != 3) {
     release_preview_image_locked();
     preview_image_visible_ = false;
   }
@@ -2386,14 +2810,12 @@ void Ui::set_active_page(int page) {
   if (clamped_page == 0 && previous_page != 0) {
     replay_card_animations_locked();
   }
-  if (active_page_ == 2) {
+  if (active_page_ == 3) {
     preview_image_visible_ = ensure_preview_image_loaded_locked(false);
   }
   scrolling_ = false;
   apply_page0_parallax();
-  if (ring_anim_timer_ != nullptr) {
-    lv_timer_resume(ring_anim_timer_);
-  }
+  // Ring timer resume is handled by apply_ring_visual_locked below.
   apply_page_visibility();
   if (deferred_snapshot_pending_) {
     apply_snapshot_locked(deferred_snapshot_, true);
@@ -2419,6 +2841,21 @@ void Ui::handle_pager_event(lv_event_t* event) {
     if (ring_anim_timer_ != nullptr) {
       lv_timer_pause(ring_anim_timer_);
     }
+
+    // Eagerly load images for adjacent pages so they are visible during the
+    // scroll transition.  ensure_preview_image_loaded_locked() uses the cached
+    // decoded buffer when available (fast pointer assignment), or falls back to
+    // decoding under lock for the first load.
+    if (preview_page_available_ && !preview_image_visible_) {
+      preview_image_visible_ = ensure_preview_image_loaded_locked(false);
+      if (preview_image_visible_ && !preview_text_image_mode_) {
+        // Reposition text so the title doesn't sit on top of the image.
+        set_hidden(page2_note_, true);
+        lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2NoteWithImageY);
+        preview_text_image_mode_ = true;
+      }
+    }
+
     apply_page_visibility();
     return;
   }
@@ -2448,6 +2885,15 @@ void Ui::handle_screen_event(lv_event_t* event) {
   lv_indev_get_point(indev, &point);
 
   if (code == LV_EVENT_PRESSED) {
+    if (screen_power_mode_ == ScreenPowerMode::kOff) {
+      // First touch wakes the screen; a second touch performs UI actions.
+      note_activity(true);
+      gesture_active_ = false;
+      swipe_switched_ = false;
+      overlay_visible_ = false;
+      return;
+    }
+
     note_activity(false);
     gesture_active_ = true;
     swipe_switched_ = false;
@@ -2509,7 +2955,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
     // Horizontal page swiping is handled by the LVGL pager (flex-row +
     // LV_SCROLL_SNAP_NONE → handle_pager_event snaps to nearest page on SCROLL_END).
     // Only handle taps here (camera refresh on page 3).
-    if (active_page_ == 3 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
+    if (active_page_ == 4 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
       std::lock_guard<std::mutex> lock(camera_refresh_mutex_);
       camera_refresh_requested_ = true;
     }
@@ -2517,7 +2963,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 }
 
 void Ui::update_portal_access_visuals_locked() {
-  const bool show_page1 = !scrolling_ && active_page_ == 1;
+  const bool show_page1 = !scrolling_ && active_page_ == 2;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_hint = portal_hint_label_ != nullptr && show_page1 && !portal_hint_text_.empty() &&
                          (portal_hint_has_priority || !detail_visible_);
@@ -2575,8 +3021,16 @@ void Ui::wake_display() {
     return;
   }
 
+  const bool was_off = screen_power_mode_ == ScreenPowerMode::kOff;
   screen_power_mode_ = ScreenPowerMode::kAwake;
   apply_brightness_policy();
+  if (was_off) {
+    esp_lv_adapter_resume();
+  }
+}
+
+void Ui::request_wake_display() {
+  wake_display();
 }
 
 void Ui::set_battery_display_policy(const BatteryDisplayPolicy& policy) {
@@ -2606,6 +3060,16 @@ void Ui::apply_brightness_policy() {
 void Ui::update_power_save(bool on_battery, bool print_active) {
   const uint32_t now = lv_tick_get();
   const uint32_t idle_ms = now - last_activity_tick_ms_.load();
+
+  // While the LVGL worker is paused (screen off), LVGL touch events are not
+  // processed.  Poll the raw touch-interrupt GPIO so a finger press can still
+  // wake the display.  CST9217 pulls INT (GPIO 11) low on contact.
+  if (screen_power_mode_ == ScreenPowerMode::kOff &&
+      gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
+    note_activity(true);  // updates last_activity_tick_ms_ + calls wake_display()
+    return;               // re-evaluate on next call with fresh idle_ms
+  }
+
   const uint32_t dim_timeout = (print_active
       ? battery_display_policy_.dim_timeout_active_s
       : battery_display_policy_.dim_timeout_idle_s) * 1000U;
@@ -2623,8 +3087,20 @@ void Ui::update_power_save(bool on_battery, bool print_active) {
   }
 
   if (screen_power_mode_ != target_mode) {
+    const bool was_off = screen_power_mode_ == ScreenPowerMode::kOff;
+    const bool going_off = target_mode == ScreenPowerMode::kOff;
     screen_power_mode_ = target_mode;
     apply_brightness_policy();
+
+    // Pause the LVGL worker when the screen is off so lv_timer_handler() does
+    // not run.  This prevents the flush path from blocking indefinitely on a TE
+    // signal (GPIO13 edge via portMAX_DELAY semaphore) while the display panel
+    // may have stopped producing TE edges at brightness 0.
+    if (going_off && !was_off) {
+      esp_lv_adapter_pause(1000);
+    } else if (was_off && !going_off) {
+      esp_lv_adapter_resume();
+    }
   }
 }
 

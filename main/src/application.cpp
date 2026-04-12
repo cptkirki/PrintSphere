@@ -3,6 +3,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,6 +19,20 @@ constexpr TickType_t kHybridCloudFallbackDelayLocalFirst = pdMS_TO_TICKS(35000);
 constexpr TickType_t kHybridCloudFallbackDelayCloudFirst = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
 constexpr uint64_t kChamberLightOverrideMs = 6000;
+
+esp_err_t configure_power_management() {
+#if CONFIG_PM_ENABLE
+  esp_pm_config_t pm_config = {};
+  pm_config.max_freq_mhz = 240;
+  pm_config.min_freq_mhz = 80;
+  pm_config.light_sleep_enable = false;
+  ESP_RETURN_ON_ERROR(esp_pm_configure(&pm_config), kTag, "esp_pm_configure failed");
+  ESP_LOGI(kTag, "Power management enabled: DFS 80-240 MHz, light sleep off");
+#else
+  ESP_LOGI(kTag, "Power management disabled in sdkconfig (CONFIG_PM_ENABLE=n)");
+#endif
+  return ESP_OK;
+}
 
 bool local_print_is_live(const PrinterSnapshot& snapshot) {
   return snapshot.print_active || snapshot.lifecycle == PrintLifecycleState::kPreparing ||
@@ -84,6 +99,7 @@ void Application::run() {
   ESP_LOGI(kTag, "Bootstrapping native PrintSphere project");
 
   ESP_ERROR_CHECK(config_store_.initialize());
+  ESP_ERROR_CHECK(configure_power_management());
   ESP_ERROR_CHECK(wifi_manager_.initialize_network_stack());
   ESP_ERROR_CHECK(wifi_manager_.start_setup_access_point(config_store_.load_device_name()));
 
@@ -103,6 +119,8 @@ void Application::run() {
   ui_.set_arc_color_scheme(config_store_.load_arc_color_scheme());
   ui_.set_display_rotation(config_store_.load_display_rotation());
   ui_.set_battery_display_policy(config_store_.load_battery_display_policy());
+  filament_wake_enabled_ = config_store_.load_filament_wake_enabled();
+  filament_anim_enabled_ = config_store_.load_filament_anim_enabled();
   ESP_ERROR_CHECK(ui_.initialize());
   if (!initialize_error_lookup_storage()) {
     ESP_LOGW(kTag, "Embedded error lookup unavailable; falling back to generic error text");
@@ -166,9 +184,11 @@ void Application::run() {
     printer_client_.set_network_ready(local_network_ready);
     camera_client_.set_network_ready(local_network_ready);
     local_printer_enabled_ = printer_client_.is_configured();
+    const bool camera_page_visible = ui_.is_camera_page_visible();
     const bool camera_enabled =
         source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
-        camera_page_active && ui_.screen_power_mode() != ScreenPowerMode::kOff;
+        (camera_page_active || (page_transition_active && camera_page_visible)) &&
+        ui_.screen_power_mode() != ScreenPowerMode::kOff;
     camera_client_.set_enabled(camera_enabled);
     if (ui_.consume_camera_refresh_request()) {
       camera_client_.request_refresh();
@@ -194,10 +214,10 @@ void Application::run() {
     const bool source_mode_changed = source_mode_ != last_source_mode_;
     const bool wifi_reconnected = wifi_connected && !last_wifi_connected_;
     const bool wifi_lost = !wifi_connected && last_wifi_connected_;
-    if (source_mode_ == SourceMode::kHybrid && last_camera_page_active_ && !camera_page_active &&
+    if (source_mode_ == SourceMode::kHybrid && last_camera_page_active_ && !camera_page_visible &&
         wifi_connected) {
       hybrid_camera_cooldown_deadline_ = now_tick + kHybridCameraCloudCooldown;
-      ESP_LOGI(kTag, "Hybrid mode: delaying cloud path briefly after camera activity");
+      ESP_LOGD(kTag, "Hybrid mode: delaying cloud path briefly after camera activity");
     }
     if (source_mode_changed || wifi_lost) {
       hybrid_cloud_gate_open_ = false;
@@ -400,12 +420,27 @@ void Application::run() {
       }
     }
 
+    // Detect filament stage before resolve_ui_state for animation suppression and wake logic.
+    const bool is_filament_stage = snapshot.stage.find("filament_loading") != std::string::npos ||
+                                    snapshot.stage.find("filament_unloading") != std::string::npos ||
+                                    snapshot.stage.find("changing_filament") != std::string::npos;
+    const bool is_external_spool = snapshot.tray_tar == 254;
+
+    // When filament animation is disabled, suppress the loading/unloading stage for AMS auto
+    // changes so resolve_ui_state treats it as normal printing (no arc animation).
+    if (!filament_anim_enabled_ && is_filament_stage && !is_external_spool) {
+      snapshot.stage.clear();
+      snapshot.raw_stage.clear();
+    }
+
     resolve_ui_state(snapshot);
-    ui_.apply_snapshot(snapshot);
+    // Store portal state first (lock-free), then apply_snapshot uses it
+    // inside the same LVGL lock section — eliminates a separate lock acquisition.
     ui_.set_portal_access_state(portal_access.lock_enabled,
                                 portal_access.request_authorized, portal_access.session_active,
                                 portal_access.pin_active, portal_access.pin_code,
                                 portal_access.pin_remaining_s, portal_access.session_remaining_s);
+    ui_.apply_snapshot(snapshot);
     last_local_print_live_ = local_print_is_live(local_snapshot);
     last_cloud_print_live_ = cloud_print_is_live(cloud_snapshot);
 
@@ -414,7 +449,16 @@ void Application::run() {
         source_mode_ == SourceMode::kCloudOnly || preview_page_active;
     cloud_client_.set_preview_fetch_enabled(source_mode_ != SourceMode::kLocalOnly &&
                                             preview_pipeline_enabled);
-    const bool keep_screen_awake = snapshot.print_active || camera_page_active || page_transition_active;
+    bool keep_screen_awake;
+    if (filament_wake_enabled_ && is_filament_stage && !is_external_spool) {
+      // AMS auto filament change: suppress wake, let display sleep
+      keep_screen_awake = camera_page_active || page_transition_active;
+    } else {
+      keep_screen_awake = snapshot.print_active || camera_page_active || page_transition_active;
+    }
+    if (filament_wake_enabled_ && is_filament_stage && is_external_spool) {
+      ui_.request_wake_display();
+    }
     ui_.update_power_save(on_battery, keep_screen_awake);
 
     cloud_client_.set_low_power_mode(camera_page_active || page_transition_active ||
@@ -428,7 +472,7 @@ void Application::run() {
             : pdMS_TO_TICKS(1500);
     last_source_mode_ = source_mode_;
     last_wifi_connected_ = wifi_connected;
-    last_camera_page_active_ = camera_page_active;
+    last_camera_page_active_ = camera_page_visible;
     vTaskDelay(loop_delay);
   }
 }

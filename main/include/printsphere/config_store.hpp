@@ -122,6 +122,8 @@ class ConfigStore {
   SourceMode load_source_mode() const;
   DisplayRotation load_display_rotation() const;
   bool load_portal_lock_enabled() const;
+  bool load_filament_wake_enabled() const;
+  bool load_filament_anim_enabled() const;
   ArcColorScheme load_arc_color_scheme() const;
   BatteryDisplayPolicy load_battery_display_policy() const;
 
@@ -132,6 +134,8 @@ class ConfigStore {
   esp_err_t save_source_mode(SourceMode mode) const;
   esp_err_t save_display_rotation(DisplayRotation rotation) const;
   esp_err_t save_portal_lock_enabled(bool enabled) const;
+  esp_err_t save_filament_wake_enabled(bool enabled) const;
+  esp_err_t save_filament_anim_enabled(bool enabled) const;
   std::vector<PrinterProfile> load_printer_profiles() const;
   esp_err_t save_printer_profile(const PrinterProfile& profile) const;
   esp_err_t delete_printer_profile(uint8_t index) const;

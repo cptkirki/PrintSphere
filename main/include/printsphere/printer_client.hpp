@@ -62,6 +62,11 @@ class PrinterClient {
     std::array<char, 96> job_name{};
     std::array<char, 128> gcode_file{};
     std::array<char, 96> camera_rtsp_url{};
+    int hw_switch_state = -1;
+    int tray_now = -1;
+    int tray_tar = -1;
+    bool ams_filament_change_latched = false;
+    std::shared_ptr<AmsSnapshot> ams;
   };
 
  private:

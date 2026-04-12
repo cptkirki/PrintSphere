@@ -10,6 +10,8 @@ idf_component_register(
         "include/font/dosis_32.c"
         "include/font/dosis_40.c"
         "include/img/bambuicon.c"
+        "include/img/AMS_2_280x126.c"
+        "include/img/ams_lite_140x160.c"
         "include/font/mdi_30.c"
         "include/font/mdi_40.c"
         "src/pmu.cpp"

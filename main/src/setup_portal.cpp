@@ -1072,6 +1072,14 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &portal_access_uri), kTag,
                       "portal access handler failed");
 
+  httpd_uri_t ams_display_uri = {};
+  ams_display_uri.uri = "/api/ams-display";
+  ams_display_uri.method = HTTP_POST;
+  ams_display_uri.handler = &SetupPortal::handle_ams_display_post;
+  ams_display_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ams_display_uri), kTag,
+                      "ams display handler failed");
+
   httpd_uri_t cloud_connect_uri = {};
   cloud_connect_uri.uri = "/api/cloud/connect";
   cloud_connect_uri.method = HTTP_POST;
@@ -1196,6 +1204,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const SourceMode source_mode = portal->config_store_.load_source_mode();
   const DisplayRotation display_rotation = portal->config_store_.load_display_rotation();
   const bool portal_lock_enabled = portal->config_store_.load_portal_lock_enabled();
+  const bool filament_wake = portal->config_store_.load_filament_wake_enabled();
+  const bool filament_anim = portal->config_store_.load_filament_anim_enabled();
   const PrinterProfile active_profile = portal->config_store_.load_active_printer_profile();
   const PrinterConnection printer = active_profile.to_connection();
   const ArcColorScheme arc_colors = portal->config_store_.load_arc_color_scheme();
@@ -1432,7 +1442,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           ".badge-value{font-size:15px;font-weight:700;line-height:1.35;color:var(--text);}"
           ".badge.ok{border-color:#22614c;background:#10231d;} .badge.warn{border-color:#7d6222;background:#241c0e;}"
           ".badge.info{border-color:#31557d;background:#111b29;} .badge.idle{border-color:#334456;background:#121a23;}";
-  html += ".grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}"
+  html += ".grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:14px;}"
           ".grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}"
           ".field{display:grid;gap:8px;} .actions{display:flex;flex-wrap:wrap;gap:12px;align-items:center;}"
           ".actions .micro{min-width:220px;} .color-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}"
@@ -1797,7 +1807,38 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"bat-display-apply-button\">Apply + Restart</button>";
   html += "<div class=\"micro hidden\" id=\"bat-display-apply-hint\">Energy settings apply after the ESP restarts.</div></div>";
   end_collapsible_section();
-  } // wifi_configured (Screen Rotation + Energy)
+
+  begin_collapsible_section(
+      "AMS Display",
+      "AMS page display settings: screen wake behavior and animation during filament changes.",
+      filament_wake || !filament_anim ? "On" : "Off",
+      filament_wake || !filament_anim ? "info" : "idle", false);
+  html += "<div class=\"field\"><label for=\"filament_wake\">Filament Change Wake</label><select id=\"filament_wake\">";
+  html += "<option value=\"true\"";
+  if (filament_wake) {
+    html += " selected";
+  }
+  html += ">Enabled: allow screen to sleep during AMS changes, wake for external spool</option>";
+  html += "<option value=\"false\"";
+  if (!filament_wake) {
+    html += " selected";
+  }
+  html += ">Disabled: screen stays on during all filament changes while printing</option></select></div>";
+  html += "<div class=\"field\"><label for=\"filament_anim\">Filament Change Animation</label><select id=\"filament_anim\">";
+  html += "<option value=\"true\"";
+  if (filament_anim) {
+    html += " selected";
+  }
+  html += ">Enabled: show loading / unloading arc animation</option>";
+  html += "<option value=\"false\"";
+  if (!filament_anim) {
+    html += " selected";
+  }
+  html += ">Disabled: show 'printing' during automatic AMS filament changes</option></select></div>";
+  html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"ams-display-apply-button\">Apply + Restart</button>";
+  html += "<div class=\"micro hidden\" id=\"ams-display-apply-hint\">AMS display settings apply after the ESP restarts.</div></div>";
+  end_collapsible_section();
+  } // wifi_configured (Screen Rotation + Energy + AMS Display)
 
   if (show_connection_steps) {
     html += "</div>";
@@ -2113,6 +2154,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "const batOffTimeoutActiveSelect=document.getElementById('bat_off_timeout_active');";
   html += "const batDisplayApplyButton=document.getElementById('bat-display-apply-button');";
   html += "const batDisplayApplyHint=document.getElementById('bat-display-apply-hint');";
+  html += "const amsDisplayApplyButton=document.getElementById('ams-display-apply-button');";
+  html += "const amsDisplayApplyHint=document.getElementById('ams-display-apply-hint');";
   html += "const cloudConnectButton=document.getElementById('cloud-connect-button');";
   html += "const localConnectButton=document.getElementById('local-connect-button');";
   html += "const verifyButton=document.getElementById('verify-button');";
@@ -2183,6 +2226,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += std::to_string(bat_policy.off_timeout_active_s);
   html += ",bat_usb_ps:";
   html += bat_policy.usb_power_save_enabled ? "true" : "false";
+  html += ",filament_wake:";
+  html += filament_wake ? "true" : "false";
+  html += ",filament_anim:";
+  html += filament_anim ? "true" : "false";
   html += "};";
   html += "function setStatus(line,detail,lockMs){statusEl.textContent=line||'';statusDetailEl.textContent=detail||'';"
           "statusLockUntil=lockMs?Date.now()+lockMs:0;}";
@@ -2336,6 +2383,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "portalAccessApplyButton.classList.toggle('hidden',!changed);"
           "portalAccessApplyHint.classList.toggle('hidden',!changed);"
           "if(!changed){portalAccessApplyButton.disabled=false;}}";
+  html += "function updateAmsDisplayControls(){"
+          "if(!amsDisplayApplyButton||!amsDisplayApplyHint)return;"
+          "const wakeNow=document.getElementById('filament_wake')?valueOf('filament_wake')==='true':savedConfig.filament_wake===true;"
+          "const animNow=document.getElementById('filament_anim')?valueOf('filament_anim')==='true':savedConfig.filament_anim!==false;"
+          "const changed=wakeNow!==(savedConfig.filament_wake===true)"
+              "||animNow!==(savedConfig.filament_anim!==false);"
+          "amsDisplayApplyButton.classList.toggle('hidden',!changed);"
+          "amsDisplayApplyHint.classList.toggle('hidden',!changed);"
+          "if(!changed){amsDisplayApplyButton.disabled=false;}}";
   html += "function updateBatDisplayControls(){"
           "if(batDimSelect&&batDimOptionsGroup){batDimOptionsGroup.style.display=batDimSelect.value==='true'?'':'none';}"
           "if(batOffSelect&&batOffOptionsGroup){batOffOptionsGroup.style.display=batOffSelect.value==='true'?'':'none';}"
@@ -2386,6 +2442,8 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "cloud_password:(document.getElementById('cloud_password')?valueOf('cloud_password'):''),"
           "display_rotation:(document.getElementById('display_rotation')?valueOf('display_rotation'):savedConfig.display_rotation)||'0',"
           "portal_lock_enabled:(document.getElementById('portal_lock_enabled')?valueOf('portal_lock_enabled')==='true':savedConfig.portal_lock_enabled!==false),"
+          "filament_wake:(document.getElementById('filament_wake')?valueOf('filament_wake')==='true':savedConfig.filament_wake===true),"
+          "filament_anim:(document.getElementById('filament_anim')?valueOf('filament_anim')==='true':savedConfig.filament_anim!==false),"
           "source_mode:(document.getElementById('source_mode')?valueOf('source_mode'):savedConfig.source_mode)||'hybrid',"
           "printer_host:(document.getElementById('printer_host')?trimmedValue('printer_host'):savedConfig.printer_host),"
           "printer_serial:(document.getElementById('printer_serial')?trimmedValue('printer_serial'):savedConfig.printer_serial),"
@@ -2432,6 +2490,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(response.ok){savedConfig.portal_lock_enabled=portal_lock_enabled;updatePortalAccessControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
           "else{setStatus(body.error||'Portal access change failed',body.detail||'The new portal access mode could not be saved.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}}"
           "catch(error){setStatus('Portal access change failed','The request to the ESP could not be completed.',8000);portalAccessApplyButton.disabled=false;updatePortalAccessControls();}});}";
+  html += "{const amsIds=['filament_wake','filament_anim'];"
+          "amsIds.forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',updateAmsDisplayControls);});}";  
+  html += "if(amsDisplayApplyButton){amsDisplayApplyButton.addEventListener('click',async()=>{"
+          "const filament_wake=document.getElementById('filament_wake')?valueOf('filament_wake')==='true':savedConfig.filament_wake===true;"
+          "const filament_anim=document.getElementById('filament_anim')?valueOf('filament_anim')==='true':savedConfig.filament_anim!==false;"
+          "amsDisplayApplyButton.disabled=true;setStatus('Applying AMS display settings...','Saving settings and restarting the ESP now.',15000);"
+          "try{const response=await fetch('/api/ams-display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filament_wake,filament_anim})});"
+          "const body=await response.json().catch(()=>({}));"
+          "if(response.ok){savedConfig.filament_wake=filament_wake;savedConfig.filament_anim=filament_anim;"
+              "updateAmsDisplayControls();setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
+          "else{setStatus(body.error||'AMS display change failed',body.detail||'The AMS display settings could not be saved.',8000);amsDisplayApplyButton.disabled=false;updateAmsDisplayControls();}}"
+          "catch(error){setStatus('AMS display change failed','The request to the ESP could not be completed.',8000);amsDisplayApplyButton.disabled=false;updateAmsDisplayControls();}});}";
   html += "if(batDimSelect){batDimSelect.addEventListener('change',updateBatDisplayControls);}";
   html += "if(batDimBrightnessSelect){batDimBrightnessSelect.addEventListener('change',updateBatDisplayControls);}";
   html += "if(batOffSelect){batOffSelect.addEventListener('change',updateBatDisplayControls);}";
@@ -2964,6 +3034,10 @@ esp_err_t SetupPortal::handle_config_get(httpd_req_t* request) {
   body += std::to_string(bat_policy_get.dim_brightness_percent);
   body += ",\"bat_off_enabled\":";
   body += bat_policy_get.screen_off_enabled ? "true" : "false";
+  body += ",\"filament_wake\":";
+  body += portal->config_store_.load_filament_wake_enabled() ? "true" : "false";
+  body += ",\"filament_anim\":";
+  body += portal->config_store_.load_filament_anim_enabled() ? "true" : "false";
   body += "}";
 
   send_json(request, body);
@@ -3005,6 +3079,10 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   const DisplayRotation display_rotation = parse_display_rotation_field(root);
   const bool portal_lock_enabled =
       read_bool_field(root, "portal_lock_enabled", stored_portal_lock_enabled);
+  const bool filament_wake =
+      read_bool_field(root, "filament_wake", portal->config_store_.load_filament_wake_enabled());
+  const bool filament_anim =
+      read_bool_field(root, "filament_anim", portal->config_store_.load_filament_anim_enabled());
 
   const PrinterConnection printer = merge_printer_connection({
       .host = trim_copy(read_string_field(root, "printer_host")),
@@ -3089,6 +3167,10 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
                       "save display rotation failed");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
                       "save portal lock failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_filament_wake_enabled(filament_wake), kTag,
+                      "save filament wake failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_filament_anim_enabled(filament_anim), kTag,
+                      "save filament anim failed");
   // Update active printer profile with form values
   {
     PrinterProfile profile = portal->config_store_.load_active_printer_profile();
@@ -3309,6 +3391,43 @@ esp_err_t SetupPortal::handle_portal_access_post(httpd_req_t* request) {
            portal_lock_enabled ? "lock enabled" : "lock disabled");
   ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
                       "save portal lock failed");
+
+  if (!portal->reboot_requested_) {
+    portal->reboot_requested_ = true;
+    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  }
+
+  send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
+  return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_ams_display_post(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  cJSON* root = nullptr;
+  esp_err_t parse_err = receive_json_body(request, &root);
+  if (parse_err != ESP_OK) {
+    return parse_err;
+  }
+
+  const bool filament_wake = read_bool_field(root, "filament_wake",
+      portal->config_store_.load_filament_wake_enabled());
+  const bool filament_anim = read_bool_field(root, "filament_anim",
+      portal->config_store_.load_filament_anim_enabled());
+  cJSON_Delete(root);
+
+  ESP_LOGI(kTag, "Saving AMS display: wake=%d anim=%d",
+           filament_wake, filament_anim);
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_filament_wake_enabled(filament_wake), kTag,
+                      "save filament wake failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_filament_anim_enabled(filament_anim), kTag,
+                      "save filament anim failed");
 
   if (!portal->reboot_requested_) {
     portal->reboot_requested_ = true;

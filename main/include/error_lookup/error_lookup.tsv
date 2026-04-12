@@ -1255,7 +1255,7 @@ H	0500020000020005	-	Failed to connect to the internet; please check the network
 H	0500020000020006	-	Streaming function error. Please check the network and try again. You can restart or update the printer if the issue persists.
 H	0500020000020007	-	Liveview service login failed; please check your network connection.
 H	0500020000020008	-	Time synchronization failed
-H	050002000003000A	-	MQTT cloud connection lost (idle). Resolves automatically when a print job is sent.
+H	050002000003000A	-	Cloud status notification (informational)
 H	0500030000010001	-	The MC module is malfunctioning; please restart the device or check device cable connection.
 H	0500030000010002	-	The toolhead is malfunctioning. Please restart the device.
 H	0500030000010003	-	The AMS module is malfunctioning. Please restart the device.

@@ -857,6 +857,14 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
     apply_cloud_error_bundle(snapshot, cloud_snapshot);
   }
 
+  // AMS / tray data is local-only (MQTT); forward when local data is fresh.
+  if (local_fresh) {
+    snapshot.hw_switch_state = local_snapshot.hw_switch_state;
+    snapshot.tray_now = local_snapshot.tray_now;
+    snapshot.tray_tar = local_snapshot.tray_tar;
+    snapshot.ams = local_snapshot.ams;
+  }
+
   if (cloud_enabled && cloud_preview_available(cloud_snapshot, now_ms)) {
     snapshot.preview_source = FieldSource::kCloud;
     apply_cloud_preview_bundle(snapshot, cloud_snapshot);

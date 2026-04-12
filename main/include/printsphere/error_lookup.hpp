@@ -19,4 +19,10 @@ std::string format_resolved_error_detail(int print_error_code,
                                          const std::vector<uint64_t>& hms_codes, int hms_count,
                                          PrinterModel model);
 
+/// Returns true for HMS codes that should be suppressed from the error display.
+/// Currently only filters the benign cloud status notification 050002000003000A.
+inline bool is_hms_suppressed(uint64_t hms_code) {
+  return hms_code == 0x050002000003000AULL;
+}
+
 }  // namespace printsphere

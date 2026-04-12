@@ -98,9 +98,14 @@ std::string format_generic_hms_count_detail(int hms_count) {
 
 std::string resolve_primary_hms_detail(const std::vector<uint64_t>& hms_codes, int hms_count,
                                        PrinterModel model) {
+  uint64_t first_displayable = 0;
   for (const uint64_t hms_code : hms_codes) {
-    if (hms_code == 0) {
+    if (hms_code == 0 || is_hms_suppressed(hms_code)) {
       continue;
+    }
+
+    if (first_displayable == 0) {
+      first_displayable = hms_code;
     }
 
     std::string detail = lookup_error_text(ErrorLookupDomain::kDeviceHms, hms_code, model);
@@ -109,8 +114,8 @@ std::string resolve_primary_hms_detail(const std::vector<uint64_t>& hms_codes, i
     }
   }
 
-  if (!hms_codes.empty()) {
-    return format_generic_hms_detail(hms_codes.front());
+  if (first_displayable != 0) {
+    return format_generic_hms_detail(first_displayable);
   }
 
   return format_generic_hms_count_detail(hms_count);

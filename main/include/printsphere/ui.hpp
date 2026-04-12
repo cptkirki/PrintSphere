@@ -31,8 +31,9 @@ class Ui {
   bool is_low_power_mode_active() const;
   ScreenPowerMode screen_power_mode() const { return screen_power_mode_; }
   bool is_config_page_active() const { return !scrolling_ && active_page_ == 0; }
-  bool is_page2_active() const { return !scrolling_ && active_page_ == 2; }
-  bool is_camera_page_active() const { return !scrolling_ && active_page_ == 3; }
+  bool is_page2_active() const { return !scrolling_ && active_page_ == 3; }
+  bool is_camera_page_active() const { return !scrolling_ && active_page_ == 4; }
+  bool is_camera_page_visible() const { return active_page_ == 4; }
   bool is_page_transition_active() const { return scrolling_; }
   void set_portal_access_state(bool lock_enabled, bool request_authorized, bool session_active,
                                bool pin_active, const std::string& pin_code,
@@ -51,12 +52,18 @@ class Ui {
   };
   void update_printer_cards(const std::vector<PrinterCardInfo>& cards);
   int consume_printer_switch_request();
+  void request_wake_display();
 
  private:
   esp_err_t build_dashboard();
   void apply_ring_visual_locked(const PrinterSnapshot& snapshot);
-  void apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh);
-  bool ensure_preview_image_loaded_locked(bool force_reload);
+  void apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh,
+                             std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw = nullptr,
+                             const lv_image_dsc_t* pre_decoded_dsc = nullptr);
+  bool ensure_preview_image_loaded_locked(
+      bool force_reload,
+      std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw = nullptr,
+      const lv_image_dsc_t* pre_decoded_dsc = nullptr);
   void release_preview_image_locked();
   void apply_page_visibility();
   void apply_logo_visibility();
@@ -75,7 +82,10 @@ class Ui {
   void handle_screen_event(lv_event_t* event);
   void handle_logo_event(lv_event_t* event);
   void update_portal_access_visuals_locked();
+  void compute_portal_texts_locked();
   void set_brightness_percent(int brightness_percent);
+  void stop_ring_animations_locked();
+  static void pulse_anim_exec_cb(void* var, int32_t scale);
   static void ring_timer_cb(lv_timer_t* timer);
   static void pager_event_cb(lv_event_t* event);
   static void screen_event_cb(lv_event_t* event);
@@ -107,6 +117,21 @@ class Ui {
   void replay_card_animations_locked();
   void apply_page0_parallax();
   static void printer_card_click_cb(lv_event_t* event);
+
+  // --- AMS page (page index 1) ---
+  lv_obj_t* ams_page_ = nullptr;
+  lv_obj_t* ams_tray_row_ = nullptr;
+  lv_obj_t* ams_tray_col_[kMaxAmsTrays] = {};
+  lv_obj_t* ams_tray_rect_[kMaxAmsTrays] = {};
+  lv_obj_t* ams_tray_fill_[kMaxAmsTrays] = {};   // dark overlay for empty portion
+  lv_obj_t* ams_tray_pct_[kMaxAmsTrays] = {};    // percentage label inside rect
+  lv_obj_t* ams_tray_slot_label_[kMaxAmsTrays] = {};
+  lv_obj_t* ams_tray_type_[kMaxAmsTrays] = {};
+  lv_obj_t* ams_humidity_drop_ = nullptr;
+  lv_obj_t* ams_humidity_label_ = nullptr;
+  lv_obj_t* ams_temp_label_ = nullptr;
+  lv_obj_t* ams_note_ = nullptr;
+  bool ams_page_available_ = false;
 
   lv_obj_t* page1_ = nullptr;
   lv_obj_t* page2_ = nullptr;
@@ -165,6 +190,9 @@ class Ui {
   bool bed_aux_visible_ = false;
   bool ring_animation_active_ = false;
   bool swipe_switched_ = false;
+  uint8_t active_ring_anim_kind_ = 0;
+  uint32_t pulse_base_hex_ = 0;
+  bool pulse_both_parts_ = false;
   lv_coord_t gesture_start_x_ = 0;
   lv_coord_t gesture_start_y_ = 0;
   int gesture_start_brightness_ = 80;
@@ -178,6 +206,9 @@ class Ui {
   ScreenPowerMode screen_power_mode_ = ScreenPowerMode::kAwake;
   std::string last_ui_status_;
   bool last_print_active_ = false;
+  std::string last_diag_status_;
+  std::string last_diag_detail_;
+  std::string last_diag_stage_;
   lv_image_dsc_t preview_image_dsc_{};
   std::shared_ptr<std::vector<uint8_t>> last_preview_blob_{};
   std::shared_ptr<std::vector<uint8_t>> last_preview_raw_{};
