@@ -2183,19 +2183,7 @@ esp_err_t Ui::build_dashboard() {
     lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
   }
 
-  // Dark overlay on top of pills (opa 160) — creates "rolls inside box" effect
-  lv_obj_t* ams_overlay = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_overlay, 385, 103);
-  lv_obj_set_style_radius(ams_overlay, 0, 0);
-  lv_obj_set_style_bg_color(ams_overlay, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_set_style_bg_opa(ams_overlay, 160, 0);
-  lv_obj_set_style_border_width(ams_overlay, 0, 0);
-  lv_obj_align(ams_overlay, LV_ALIGN_CENTER, 0, 38);
-  lv_obj_clear_flag(ams_overlay, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_overlay, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(ams_overlay, LV_OBJ_FLAG_EVENT_BUBBLE);
-
-  // Percentage labels on topmost layer (above overlay)
+  // Percentage labels (above pills, ignore layout so they float)
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     ams_tray_pct_[i] = lv_label_create(ams_page_);
     set_label_text_if_changed(ams_tray_pct_[i], "");
