@@ -32,3 +32,4 @@ release/debug/archive/*
 !release/debug/archive/printsphere_full-v*.bin
 !release/debug/archive/printsphere_ota-v*.bin
 *.pyc
+*.step

@@ -150,16 +150,6 @@ bool cloud_state_has_signal(const BambuCloudSnapshot& snapshot) {
           snapshot.hms_alert_count > 0 || snapshot.non_error_stop);
 }
 
-bool is_filament_stage(const std::string& stage) {
-  return contains_token(stage, "filament_loading") || contains_token(stage, "filament_unloading") ||
-         contains_token(stage, "changing_filament");
-}
-
-bool is_download_stage(const std::string& stage, const std::string& status) {
-  return contains_token(stage, "model_download") || contains_token(stage, "download") ||
-         contains_token(status, "download");
-}
-
 bool is_preheat_stage(const std::string& stage) {
   return contains_token(stage, "heatbed_preheating") || contains_token(stage, "nozzle_preheating") ||
          contains_token(stage, "heating_hotend") || contains_token(stage, "heating_chamber") ||
@@ -415,6 +405,7 @@ void apply_local_status_bundle(PrinterSnapshot& target, const PrinterSnapshot& l
 
 void apply_cloud_metrics_bundle(PrinterSnapshot& target, const BambuCloudSnapshot& cloud_snapshot) {
   target.progress_percent = cloud_snapshot.progress_percent;
+  target.progress_is_download_related = cloud_snapshot.progress_is_download_related;
   if (cloud_snapshot.remaining_seconds > 0U ||
       cloud_snapshot.lifecycle == PrintLifecycleState::kFinished ||
       cloud_snapshot.lifecycle == PrintLifecycleState::kIdle ||
@@ -434,6 +425,7 @@ void apply_cloud_metrics_bundle(PrinterSnapshot& target, const BambuCloudSnapsho
 
 void apply_local_metrics_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.progress_percent = local_snapshot.progress_percent;
+  target.progress_is_download_related = local_snapshot.progress_is_download_related;
   if (local_snapshot.remaining_seconds > 0U ||
       local_snapshot.lifecycle == PrintLifecycleState::kFinished ||
       local_snapshot.lifecycle == PrintLifecycleState::kIdle ||
@@ -607,6 +599,32 @@ PrinterModel effective_model_for_snapshot(const PrinterSnapshot& snapshot) {
 
 }  // namespace
 
+// --- Exported stage classification helpers (case-insensitive) -----------------
+
+bool is_download_stage(const std::string& stage, const std::string& status) {
+  const std::string ls = lower_copy(stage);
+  const std::string lst = lower_copy(status);
+  return contains_token(ls, "model_download") || contains_token(ls, "download") ||
+         contains_token(lst, "download");
+}
+
+bool is_filament_stage(const std::string& stage) {
+  const std::string ls = lower_copy(stage);
+  return contains_token(ls, "filament_loading") || contains_token(ls, "filament_unloading") ||
+         contains_token(ls, "changing_filament");
+}
+
+bool is_post_download_handoff_stage(const std::string& stage, const std::string& status) {
+  if (is_download_stage(stage, status)) {
+    return false;
+  }
+  const std::string ls = lower_copy(stage);
+  return is_preheat_stage(ls) || is_clean_stage(ls) || is_level_stage(ls) ||
+         is_setup_stage(ls) || contains_token(ls, "filament_loading") ||
+         contains_token(ls, "filament_unloading") || contains_token(ls, "changing_filament") ||
+         contains_token(ls, "printing");
+}
+
 void resolve_ui_state(PrinterSnapshot& snapshot) {
   if (is_non_error_stop(snapshot)) {
     // User-cancelled Bambu jobs currently surface as FAILED/FAIL without any concrete
@@ -635,8 +653,16 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
   const std::string status = effective_status(snapshot);
   const std::string stage = effective_stage(snapshot);
   const int progress = std::clamp(static_cast<int>(std::lround(snapshot.progress_percent)), 0, 100);
+  const bool download_stage_by_name = is_download_stage(stage, status);
+  const bool completed_download_handoff =
+      snapshot.progress_is_download_related && progress == 100 &&
+      is_post_download_handoff_stage(stage, status);
+  if (completed_download_handoff) {
+    snapshot.progress_is_download_related = false;
+  }
   const bool filament_stage = is_filament_stage(stage);
-  const bool download_stage = is_download_stage(stage, status);
+  const bool download_stage =
+      snapshot.progress_is_download_related || download_stage_by_name;
   const bool preheat_stage = is_preheat_stage(stage);
   const bool clean_stage = is_clean_stage(stage);
   const bool level_stage = is_level_stage(stage);
@@ -674,7 +700,9 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
     snapshot.print_active = false;
   }
 
-  snapshot.has_error = input_error || ps_failed || err_print;
+  // Bambu uses print_error_code for user-action prompts during filament changes
+  // (e.g. "please feed filament"), not real errors.  Suppress during filament stage.
+  snapshot.has_error = input_error || ps_failed || (err_print && !filament_stage);
   snapshot.warn_hms = err_hms && snapshot.print_active && !snapshot.has_error;
 
   if (snapshot.has_error) {

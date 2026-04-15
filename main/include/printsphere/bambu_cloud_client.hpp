@@ -50,6 +50,7 @@ struct BambuCloudSnapshot {
   std::string raw_stage;
   std::string stage;
   float progress_percent = 0.0f;
+  bool progress_is_download_related = false;
   float nozzle_temp_c = 0.0f;
   uint64_t nozzle_temp_last_update_ms = 0;
   float bed_temp_c = 0.0f;
@@ -102,6 +103,7 @@ class BambuCloudClient {
     CloudSetupStage setup_stage = CloudSetupStage::kIdle;
     PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
     float progress_percent = 0.0f;
+    bool progress_is_download_related = false;
     float nozzle_temp_c = 0.0f;
     uint64_t nozzle_temp_last_update_ms = 0;
     float bed_temp_c = 0.0f;
@@ -128,6 +130,7 @@ class BambuCloudClient {
     uint16_t hms_alert_count = 0;
     bool has_error = false;
     std::array<char, 96> detail{};
+    std::array<char, 96> job_name{};
     std::array<char, 24> resolved_serial{};
     std::array<char, 16> raw_status{};
     std::array<char, 32> raw_stage{};

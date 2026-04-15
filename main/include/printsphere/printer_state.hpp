@@ -84,6 +84,7 @@ struct AmsUnitInfo {
 struct AmsSnapshot {
   uint8_t count = 0;
   std::array<AmsUnitInfo, kMaxAmsUnits> units{};
+  AmsTrayInfo external_spool{};  // vt_tray: external spool info
 };
 
 struct PrinterSnapshot {
@@ -108,6 +109,7 @@ struct PrinterSnapshot {
   uint16_t camera_height = 0;
   std::string cloud_detail;
   float progress_percent = 0.0f;
+  bool progress_is_download_related = false;
   float nozzle_temp_c = 0.0f;
   bool nozzle_temp_known = false;
   float bed_temp_c = 0.0f;

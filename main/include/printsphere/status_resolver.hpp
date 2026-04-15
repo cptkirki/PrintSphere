@@ -8,6 +8,11 @@
 
 namespace printsphere {
 
+// Shared stage classification helpers.  Accept any case (lowercased internally).
+bool is_download_stage(const std::string& stage, const std::string& status);
+bool is_filament_stage(const std::string& stage);
+bool is_post_download_handoff_stage(const std::string& stage, const std::string& status);
+
 void resolve_ui_state(PrinterSnapshot& snapshot);
 
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,

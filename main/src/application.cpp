@@ -445,14 +445,12 @@ void Application::run() {
     }
 
     // Detect filament stage before resolve_ui_state for animation suppression and wake logic.
-    const bool is_filament_stage = snapshot.stage.find("filament_loading") != std::string::npos ||
-                                    snapshot.stage.find("filament_unloading") != std::string::npos ||
-                                    snapshot.stage.find("changing_filament") != std::string::npos;
+    const bool is_filament = is_filament_stage(snapshot.stage);
     const bool is_external_spool = snapshot.tray_tar == 254;
 
     // When filament animation is disabled, suppress the loading/unloading stage for AMS auto
     // changes so resolve_ui_state treats it as normal printing (no arc animation).
-    if (!filament_anim_enabled_ && is_filament_stage && !is_external_spool) {
+    if (!filament_anim_enabled_ && is_filament && !is_external_spool) {
       snapshot.stage.clear();
       snapshot.raw_stage.clear();
     }
@@ -474,13 +472,13 @@ void Application::run() {
     cloud_client_.set_preview_fetch_enabled(source_mode_ != SourceMode::kLocalOnly &&
                                             preview_pipeline_enabled);
     bool keep_screen_awake;
-    if (filament_wake_enabled_ && is_filament_stage && !is_external_spool) {
+    if (filament_wake_enabled_ && is_filament && !is_external_spool) {
       // AMS auto filament change: suppress wake, let display sleep
       keep_screen_awake = camera_page_active || page_transition_active;
     } else {
       keep_screen_awake = snapshot.print_active || camera_page_active || page_transition_active;
     }
-    if (filament_wake_enabled_ && is_filament_stage && is_external_spool) {
+    if (filament_wake_enabled_ && is_filament && is_external_spool) {
       ui_.request_wake_display();
     }
     ui_.update_power_save(on_battery, keep_screen_awake);

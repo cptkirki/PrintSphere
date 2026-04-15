@@ -126,6 +126,13 @@ class Ui {
   lv_obj_t* ams_tray_pct_[kMaxAmsTrays] = {};    // percentage label inside rect
   lv_obj_t* ams_tray_slot_label_[kMaxAmsTrays] = {};
   lv_obj_t* ams_tray_type_[kMaxAmsTrays] = {};
+  lv_obj_t* ams_ext_col_ = nullptr;           // external spool column
+  lv_obj_t* ams_ext_rect_ = nullptr;          // external spool pill rect
+  lv_obj_t* ams_ext_type_ = nullptr;          // "EXT" label at top of ext pill
+  lv_obj_t* ams_ext_mat_ = nullptr;           // material type label (e.g. PLA) below EXT
+  lv_obj_t* ams_shelf_ = nullptr;             // gray shelf behind upper pills
+  lv_obj_t* ams_base_ = nullptr;              // dark base behind lower pills
+  bool ams_ext_spool_shown_ = false;          // tracks current ext spool layout state
   lv_obj_t* ams_humidity_drop_ = nullptr;
   lv_obj_t* ams_humidity_label_ = nullptr;
   lv_obj_t* ams_temp_label_ = nullptr;
