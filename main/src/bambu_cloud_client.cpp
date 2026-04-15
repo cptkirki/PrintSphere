@@ -15,6 +15,7 @@
 #include "cJSON.h"
 #include "printsphere/bambu_status.hpp"
 #include "printsphere/error_lookup.hpp"
+#include "printsphere/status_resolver.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_system.h"
@@ -546,6 +547,27 @@ std::string decode_username_from_access_token(const std::string& token) {
   }
   cJSON_Delete(root);
   return username;
+}
+
+std::string trim_job_name_cloud(const std::string& name) {
+  if (name.empty()) {
+    return {};
+  }
+  std::string trimmed = name;
+  const size_t slash = trimmed.find_last_of("/\\");
+  if (slash != std::string::npos) {
+    trimmed = trimmed.substr(slash + 1);
+  }
+  const char* suffixes[] = {".gcode.3mf", ".3mf", ".gcode"};
+  for (const char* suffix : suffixes) {
+    const size_t suffix_len = std::strlen(suffix);
+    if (trimmed.size() >= suffix_len &&
+        trimmed.compare(trimmed.size() - suffix_len, suffix_len, suffix) == 0) {
+      trimmed.resize(trimmed.size() - suffix_len);
+      break;
+    }
+  }
+  return trimmed;
 }
 
 std::string json_string_local(const cJSON* object, const char* key,
@@ -1148,25 +1170,25 @@ bool extract_live_stage_text(const cJSON* item, std::string* value) {
   return false;
 }
 
-bool extract_live_progress_percent(const cJSON* item, float* value) {
+struct CloudLiveProgressPercent {
+  bool has_value = false;
+  float value = 0.0f;
+  bool is_download_related = false;
+};
+
+bool read_progress_percent_candidate_cloud(const cJSON* item, const char* const* keys,
+                                           size_t key_count, float* value) {
   if (item == nullptr || value == nullptr) {
     return false;
   }
 
   const cJSON* item_print = child_object_local(item, "print");
-  const char* keys[] = {"progress", "percent", "mc_percent", "task_progress", "taskProgress",
-                        "print_progress", "printPercent",
-                        "gcode_file_prepare_percent", "gcodeFilePreparePercent",
-                        "prepare_percent", "preparePercent",
-                        "gcode_prepare_percent", "gcodePreparePercent",
-                        "download_progress", "downloadProgress",
-                        "model_download_progress", "modelDownloadProgress"};
   for (const cJSON* source : {item, item_print}) {
     if (source == nullptr) {
       continue;
     }
-    for (const char* key : keys) {
-      const float candidate = json_number_local(source, key, -1.0f);
+    for (size_t index = 0; index < key_count; ++index) {
+      const float candidate = json_number_local(source, keys[index], -1.0f);
       if (candidate < 0.0f) {
         continue;
       }
@@ -1176,6 +1198,47 @@ bool extract_live_progress_percent(const cJSON* item, float* value) {
   }
 
   return false;
+}
+
+CloudLiveProgressPercent extract_live_progress_percent(const cJSON* item,
+                                                       bool prefer_download_related) {
+  static const char* const kGenericKeys[] = {
+      "progress", "percent", "mc_percent", "task_progress", "taskProgress",
+      "print_progress", "printPercent"};
+  static const char* const kDownloadKeys[] = {
+      "gcode_file_prepare_percent", "gcodeFilePreparePercent",
+      "prepare_percent", "preparePercent",
+      "gcode_prepare_percent", "gcodePreparePercent",
+      "download_progress", "downloadProgress",
+      "model_download_progress", "modelDownloadProgress"};
+
+  CloudLiveProgressPercent result = {};
+  const auto set_result = [&](bool download_related, float candidate) {
+    result.has_value = true;
+    result.value = candidate;
+    result.is_download_related = download_related;
+  };
+
+  float candidate = 0.0f;
+  if (prefer_download_related &&
+      read_progress_percent_candidate_cloud(item, kDownloadKeys,
+                                            sizeof(kDownloadKeys) / sizeof(kDownloadKeys[0]),
+                                            &candidate)) {
+    set_result(true, candidate);
+    return result;
+  }
+  if (read_progress_percent_candidate_cloud(item, kGenericKeys,
+                                            sizeof(kGenericKeys) / sizeof(kGenericKeys[0]),
+                                            &candidate)) {
+    set_result(false, candidate);
+    return result;
+  }
+  if (read_progress_percent_candidate_cloud(item, kDownloadKeys,
+                                            sizeof(kDownloadKeys) / sizeof(kDownloadKeys[0]),
+                                            &candidate)) {
+    set_result(true, candidate);
+  }
+  return result;
 }
 
 bool extract_live_remaining_seconds(const cJSON* item, uint32_t* value) {
@@ -1530,8 +1593,8 @@ ParsedHmsAlertState extract_live_hms_state(const cJSON* item) {
 
     if (const cJSON* direct = find_direct_hms_container(source); direct != nullptr) {
       parsed.present = true;
-      parsed.count = count_hms_entries(direct);
       parsed.codes = extract_hms_codes_from_node(direct);
+      parsed.count = static_cast<int>(parsed.codes.size());
       return parsed;
     }
 
@@ -1550,8 +1613,8 @@ ParsedHmsAlertState extract_live_hms_state(const cJSON* item) {
     if (device != nullptr) {
       if (const cJSON* device_hms = find_direct_hms_container(device); device_hms != nullptr) {
         parsed.present = true;
-        parsed.count = count_hms_entries(device_hms);
         parsed.codes = extract_hms_codes_from_node(device_hms);
+        parsed.count = static_cast<int>(parsed.codes.size());
         return parsed;
       }
 
@@ -1840,6 +1903,7 @@ void BambuCloudClient::apply_cloud_session_state(bool configured, bool connected
     live.live_data_last_update_ms = 0;
     live.lifecycle = PrintLifecycleState::kUnknown;
     live.progress_percent = 0.0f;
+    live.progress_is_download_related = false;
     live.nozzle_temp_c = 0.0f;
     live.nozzle_temp_last_update_ms = 0;
     live.bed_temp_c = 0.0f;
@@ -1862,6 +1926,7 @@ void BambuCloudClient::apply_cloud_session_state(bool configured, bool connected
     live.has_error = false;
     live.chamber_light_pending = false;
     live.chamber_light_pending_since_ms = 0;
+    copy_text(&live.job_name, "");
     copy_text(&live.raw_status, "");
     copy_text(&live.raw_stage, "");
     copy_text(&live.stage, "");
@@ -1915,6 +1980,9 @@ void BambuCloudClient::publish_combined_snapshot() {
   current.preview_url = rest.preview_url;
   current.preview_blob = rest.preview_blob;
   current.preview_title = rest.preview_title;
+  if (current.preview_title.empty() && has_text(live.job_name)) {
+    current.preview_title = text_string(live.job_name);
+  }
   current.print_error_code = 0;
   current.hms_codes.clear();
   current.hms_alert_count = 0;
@@ -1959,6 +2027,7 @@ void BambuCloudClient::publish_combined_snapshot() {
       live.lifecycle == PrintLifecycleState::kIdle ||
       live.lifecycle == PrintLifecycleState::kError)) {
     current.progress_percent = live.progress_percent;
+    current.progress_is_download_related = live.progress_is_download_related;
     current.remaining_seconds = live.remaining_seconds;
     current.current_layer = live.current_layer;
     current.total_layers = live.total_layers;
@@ -2495,25 +2564,44 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.stage, stage_text);
     }
 
+    const std::string subtask_name = trim_job_name_cloud(
+        json_string(print, "subtask_name",
+                    json_string(print, "gcode_file", text_string(runtime.job_name))));
+    if (!subtask_name.empty()) {
+      copy_text(&runtime.job_name, subtask_name);
+    }
+
     const bool active_lifecycle =
         lifecycle == PrintLifecycleState::kPreparing || lifecycle == PrintLifecycleState::kPrinting;
     const bool lifecycle_reset =
         has_status_update && active_lifecycle && lifecycle != previous_lifecycle;
     if (lifecycle_reset) {
       runtime.progress_percent = 0.0f;
+      runtime.progress_is_download_related = false;
       runtime.remaining_seconds = 0;
       runtime.current_layer = 0;
       runtime.total_layers = 0;
     }
 
-    float progress = 0.0f;
-    const bool has_progress = extract_live_progress_percent(print, &progress);
+    const bool payload_download_stage =
+        is_download_stage(!stage_text.empty() ? stage_text : text_string(runtime.stage),
+                          status_text);
+    const bool prefer_download_progress =
+        payload_download_stage ||
+        lifecycle == PrintLifecycleState::kPreparing || runtime.progress_is_download_related;
+    const CloudLiveProgressPercent progress_update =
+        extract_live_progress_percent(print, prefer_download_progress);
+    float progress = progress_update.value;
+    const bool has_progress = progress_update.has_value;
     if (lifecycle == PrintLifecycleState::kFinished && (!has_progress || progress < 100.0f)) {
       progress = 100.0f;
     }
     if (has_progress || lifecycle == PrintLifecycleState::kFinished ||
         lifecycle == PrintLifecycleState::kIdle || lifecycle == PrintLifecycleState::kError) {
       runtime.progress_percent = progress;
+      runtime.progress_is_download_related = progress_update.is_download_related;
+    } else if (lifecycle != PrintLifecycleState::kPreparing) {
+      runtime.progress_is_download_related = false;
     }
 
     uint32_t remaining_seconds = 0U;
@@ -2692,6 +2780,35 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       }
     }
 
+    // Parse vt_tray (external spool) from cloud MQTT.
+    // Some printers place vt_tray inside "ams", others as sibling under "print".
+    {
+      const cJSON* vt_tray = (ams_obj != nullptr)
+          ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
+      if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
+        vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
+      }
+      if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
+        if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+        AmsTrayInfo& ext = runtime.ams->external_spool;
+        const int field_count = cJSON_GetArraySize(vt_tray);
+        if (field_count > 1) {
+          ext.present = true;
+          const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
+          if (!tray_type.empty()) ext.material_type = tray_type;
+          const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
+          if (!sub_brands.empty()) ext.material_name = sub_brands;
+          const std::string color_str = json_string(vt_tray, "tray_color", "");
+          if (color_str.size() >= 6) {
+            char* end = nullptr;
+            const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+            if (end != color_str.c_str()) ext.color_rgba = rgba;
+          }
+        }
+        ext.active = (runtime.tray_now == 254);
+      }
+    }
+
     // When a healthy (non-error) status update arrives, clear stale error indicators that
     // were carried over from previous payloads via the fallback mechanism.  Cloud MQTT sends
     // partial updates—if a fragment omits hms/print_error the extract helpers return the
@@ -2715,9 +2832,12 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
     if (has_status_update) {
       runtime.non_error_stop = cloud_status_is_non_error_stop(status_text, runtime.print_error_code,
                                                               runtime.hms_alert_count);
+      // During filament stages Bambu reuses print_error_code for user-action
+      // prompts — suppress it from has_error (same as local client path).
+      const bool fil_stage = is_filament_stage(text_string(runtime.raw_stage));
       runtime.has_error =
           (!runtime.non_error_stop && runtime.lifecycle == PrintLifecycleState::kError) ||
-          runtime.print_error_code != 0;
+          (runtime.print_error_code != 0 && !fil_stage);
     } else {
       // Cloud push_status often arrives as partial updates. If a packet has no status/stage,
       // preserve the last known lifecycle/error interpretation instead of re-arming a stale FAIL.

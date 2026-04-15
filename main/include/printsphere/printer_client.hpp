@@ -32,6 +32,7 @@ class PrinterClient {
     PrinterModel local_model = PrinterModel::kUnknown;
     SourceCapabilities local_capabilities{};
     float progress_percent = 0.0f;
+    bool progress_is_download_related = false;
     float nozzle_temp_c = 0.0f;
     float bed_temp_c = 0.0f;
     float chamber_temp_c = 0.0f;

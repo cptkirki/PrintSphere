@@ -1262,7 +1262,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     local_badge_value = "Configured";
     local_badge_class = "info";
   }
+  const bool setup_fully_complete = show_connection_steps &&
+      (cloud_snapshot.configured || local_configured) &&
+      (!cloud_snapshot.configured || cloud_portal.ready ||
+       (!cloud_snapshot.verification_required && !cloud_snapshot.tfa_required &&
+        cloud_snapshot.setup_stage != CloudSetupStage::kFailed)) &&
+      (!local_configured || local_snapshot.connection != PrinterConnectionState::kError);
   const std::string initial_status_line =
+      setup_fully_complete ? std::string{} :
       show_connection_steps
           ? (cloud_portal.ready || cloud_snapshot.verification_required ||
                      cloud_snapshot.setup_stage == CloudSetupStage::kLoggingIn ||
@@ -1271,6 +1278,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
                  : "Connect Bambu Cloud")
           : "Save Wi-Fi";
   const std::string initial_status_detail =
+      setup_fully_complete ? std::string{} :
       show_connection_steps
           ? (cloud_portal.ready || cloud_snapshot.verification_required ||
                      cloud_snapshot.setup_stage == CloudSetupStage::kLoggingIn ||
@@ -1469,11 +1477,11 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           ".badge.info{border-color:#31557d;background:#111b29;} .badge.idle{border-color:#334456;background:#121a23;}";
   html += ".settings-accordion{display:grid;gap:12px;} .settings-panel{border:1px solid var(--line);border-radius:20px;"
           "background:#0f1721;overflow:hidden;} .settings-panel[open]{border-color:#365064;background:#111b29;}"
-          ".settings-panel-summary{display:grid;grid-template-columns:1fr auto;gap:10px 14px;align-items:center;"
+          ".settings-panel-summary{display:grid;grid-template-columns:1fr auto;gap:10px 14px;align-items:start;"
           "padding:16px 18px;cursor:pointer;list-style:none;} .settings-panel-summary::-webkit-details-marker{display:none;}"
           ".settings-panel-copy{display:grid;gap:4px;} .settings-panel-copy h3{font-size:17px;line-height:1.2;}"
           ".settings-panel-copy p{font-size:13px;line-height:1.45;color:var(--muted);} .settings-panel-side{display:flex;"
-          "align-items:center;gap:10px;} .settings-panel-icon{width:28px;height:28px;border-radius:999px;border:1px solid #365064;"
+          "align-items:center;gap:10px;padding-top:2px;} .settings-panel-icon{width:28px;height:28px;border-radius:999px;border:1px solid #365064;"
           "background:#0c131b;display:grid;place-items:center;flex:0 0 auto;} .settings-panel-icon::before{content:'+';"
           "font-size:18px;line-height:1;color:#cfe0f1;} details[open]>.settings-panel-summary .settings-panel-icon::before{content:'-';}"
           ".settings-panel-body{padding:0 18px 18px;display:grid;gap:14px;}";
@@ -2342,7 +2350,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "setBadge('source-badge','Source',sourceValue,'info');"
           "renderLocalStatus(body);"
           "if(Date.now()>statusLockUntil){"
-          "if(body.wifi_connected){if(body.cloud_status_line){setStatus(body.cloud_status_line,body.cloud_status_detail||body.cloud_detail||body.detail||'',0);}"
+          "if(body.wifi_connected){const setupDone=(body.cloud_configured||body.local_configured)&&(!body.cloud_configured||body.cloud_portal_ready||(!body.cloud_verification_required&&!body.cloud_tfa_required&&cloudSetupStage(body)!=='failed'))&&(!body.local_configured||!body.local_error);if(setupDone){setStatus('','',0);}else if(body.cloud_status_line){setStatus(body.cloud_status_line,body.cloud_status_detail||body.cloud_detail||body.detail||'',0);}"
           "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
           "else{setStatus('Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
           "syncPortalTimer(body.portal_open_remaining_s||0);"

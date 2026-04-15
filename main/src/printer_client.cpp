@@ -12,6 +12,7 @@
 #include "cJSON.h"
 #include "printsphere/bambu_status.hpp"
 #include "printsphere/error_lookup.hpp"
+#include "printsphere/status_resolver.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -1040,10 +1041,6 @@ std::string lower_copy(std::string value) {
   return value;
 }
 
-bool contains_token(const std::string& value, const char* token) {
-  return token != nullptr && value.find(token) != std::string::npos;
-}
-
 bool is_placeholder_stage_name(const std::string& stage_name) {
   if (stage_name.empty()) {
     return true;
@@ -1083,14 +1080,6 @@ bool is_filament_change_stage(const std::string& stage_name) {
   const std::string lower = lower_copy(stage_name);
   return lower == "changing_filament" || lower == "filament_loading" ||
          lower == "filament_unloading";
-}
-
-bool is_download_stage_local(const std::string& stage_name, const std::string& gcode_state) {
-  const std::string lower_stage = lower_copy(stage_name);
-  const std::string lower_status = lower_copy(gcode_state);
-  return contains_token(lower_stage, "model_download") ||
-         contains_token(lower_stage, "download") ||
-         contains_token(lower_status, "download");
 }
 
 bool is_paused_gcode_state(const std::string& gcode_state) {
@@ -1281,6 +1270,7 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.preview_hint = preview_hint_for(snapshot.gcode_file);
   snapshot.camera_rtsp_url = text_string(runtime.camera_rtsp_url);
   snapshot.progress_percent = runtime.progress_percent;
+  snapshot.progress_is_download_related = runtime.progress_is_download_related;
   snapshot.nozzle_temp_c = runtime.nozzle_temp_c;
   snapshot.nozzle_temp_known = runtime.nozzle_temp_c > 0.0f;
   snapshot.bed_temp_c = runtime.bed_temp_c;
@@ -1636,7 +1626,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
         has_hms_update ? count_hms_entries_local(hms) : static_cast<int>(runtime.hms_alert_count);
     const std::vector<uint64_t> parsed_hms_codes =
         has_hms_update ? extract_hms_codes_local(hms) : runtime.hms_codes;
-    const bool has_hms_alert = !parsed_hms_codes.empty() || hms_count > 0;
+    const bool has_hms_alert = !parsed_hms_codes.empty();
     const bool has_concrete_error = print_error_code != 0;
     const std::string resolved_stage =
         resolved_stage_from_payload(effective_gcode_state, stage_name, effective_stage_id,
@@ -1674,14 +1664,19 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
     runtime.connection = PrinterConnectionState::kOnline;
     const bool payload_download_stage =
-        is_download_stage_local(!resolved_stage.empty() ? resolved_stage : stage_name,
-                                effective_gcode_state);
+        is_download_stage(!resolved_stage.empty() ? resolved_stage : stage_name,
+                          effective_gcode_state);
+    const bool prefer_download_progress =
+        payload_download_stage ||
+        previous_lifecycle == PrintLifecycleState::kPreparing ||
+        runtime.progress_is_download_related;
     const LocalProgressPercent progress_update =
-        extract_progress_percent_local(print, payload_download_stage);
+        extract_progress_percent_local(print, prefer_download_progress);
     const bool has_progress_update = progress_update.has_value;
     const bool progress_is_download_related = progress_update.is_download_related;
     if (has_progress_update) {
       runtime.progress_percent = progress_update.value;
+      runtime.progress_is_download_related = progress_is_download_related;
     }
     const NozzleTemperatureBundle nozzle_temps =
         extract_nozzle_temperature_bundle(print, runtime.nozzle_temp_c,
@@ -1842,6 +1837,51 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
           }
         }
       }
+
+    }
+
+    // Parse vt_tray (external / virtual tray) for external spool info.
+    // Some printers place vt_tray inside the "ams" object, others as a
+    // sibling of "ams" directly under "print".  Check both locations.
+    {
+      const cJSON* vt_tray = (ams_obj != nullptr)
+          ? cJSON_GetObjectItemCaseSensitive(ams_obj, "vt_tray") : nullptr;
+      if (vt_tray == nullptr || !cJSON_IsObject(vt_tray)) {
+        vt_tray = cJSON_GetObjectItemCaseSensitive(print, "vt_tray");
+      }
+      if (vt_tray != nullptr && cJSON_IsObject(vt_tray)) {
+        if (!runtime.ams) runtime.ams = std::make_shared<AmsSnapshot>();
+        AmsTrayInfo& ext = runtime.ams->external_spool;
+        const int field_count = cJSON_GetArraySize(vt_tray);
+        if (field_count > 1) {
+          ext.present = true;
+          const std::string tray_type = json_string(vt_tray, "tray_type", ext.material_type);
+          if (!tray_type.empty()) ext.material_type = tray_type;
+          const std::string sub_brands = json_string(vt_tray, "tray_sub_brands", ext.material_name);
+          if (!sub_brands.empty()) ext.material_name = sub_brands;
+          if (ext.material_name.empty()) {
+            const std::string tray_idx = json_string(vt_tray, "tray_info_idx", "");
+            if (!tray_idx.empty()) {
+              const char* resolved = resolve_filament_name(tray_idx.c_str());
+              if (resolved) ext.material_name = resolved;
+            }
+          }
+          const std::string color_str = json_string(vt_tray, "tray_color", "");
+          if (color_str.size() >= 6) {
+            char* end = nullptr;
+            const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
+            if (end != color_str.c_str()) ext.color_rgba = rgba;
+          }
+          ESP_LOGI(kTag, "[DIAG] vt_tray: fields=%d type=%s name=%s color=0x%08X",
+                   field_count,
+                   ext.material_type.empty() ? "(-)" : ext.material_type.c_str(),
+                   ext.material_name.empty() ? "(-)" : ext.material_name.c_str(),
+                   (unsigned)ext.color_rgba);
+        } else {
+          ESP_LOGD(kTag, "[DIAG] vt_tray: only %d field(s), skipped", field_count);
+        }
+        ext.active = (runtime.tray_now == 254);
+      }
     }
 
     const uint32_t remaining_seconds = extract_remaining_seconds(print);
@@ -1901,7 +1941,11 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
           // No filament in extruder.
           const bool tray_arrived = runtime.tray_now >= 0 && runtime.tray_tar >= 0 &&
                                     runtime.tray_now == runtime.tray_tar;
-          copy_text(&runtime.raw_stage, tray_arrived ? "filament_loading" : "filament_unloading");
+          // External spool (tray_tar==254): printer waits for the user to
+          // feed filament, so this is a loading prompt, not unloading.
+          const bool ext_spool_target = runtime.tray_tar == 254;
+          copy_text(&runtime.raw_stage,
+                    (tray_arrived || ext_spool_target) ? "filament_loading" : "filament_unloading");
         } else if (runtime.hw_switch_state == 1 &&
                    runtime.tray_now >= 0 && runtime.tray_tar >= 0 &&
                    runtime.tray_now != runtime.tray_tar) {
@@ -1914,18 +1958,21 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     }
     runtime.print_error_code = print_error_code;
     if (has_hms_update) {
-      runtime.hms_alert_count = static_cast<uint16_t>(std::max(hms_count, 0));
-      if (!parsed_hms_codes.empty() || hms_count == 0) {
-        runtime.hms_codes = parsed_hms_codes;
-      }
+      runtime.hms_codes = parsed_hms_codes;
+      runtime.hms_alert_count = static_cast<uint16_t>(parsed_hms_codes.size());
     }
-    runtime.has_error = has_concrete_error || paused_fault_latched;
+    // During filament stages Bambu reuses print_error_code for user-action
+    // prompts (e.g. 0x07FFC006 "insert filament").  Suppress that from
+    // has_error so the downstream resolver sees the correct state.
+    const bool filament_stage_now = is_filament_stage(text_string(runtime.raw_stage));
+    runtime.has_error = (has_concrete_error && !filament_stage_now) || paused_fault_latched;
     runtime.warn_hms = false;
     runtime.non_error_stop = text_string(runtime.raw_status) == "FAILED" && !has_concrete_error &&
                              !has_hms_alert;
     runtime.show_stop_banner = false;
     runtime.print_active = false;
-    runtime.lifecycle = lifecycle_from_state(text_string(runtime.raw_status), has_concrete_error);
+    runtime.lifecycle = lifecycle_from_state(text_string(runtime.raw_status),
+                                            has_concrete_error && !filament_stage_now);
     if (paused_fault_latched) {
       runtime.lifecycle = PrintLifecycleState::kError;
     }
@@ -1951,14 +1998,19 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const std::string previous_stage_for_progress =
         !previous_raw_stage.empty() ? previous_raw_stage : previous_stage;
     const bool current_download_phase =
-        is_download_stage_local(current_stage_for_progress, text_string(runtime.raw_status));
+        is_download_stage(current_stage_for_progress, text_string(runtime.raw_status));
+    const bool current_specific_non_download_stage =
+        !current_download_phase &&
+        is_post_download_handoff_stage(current_stage_for_progress, text_string(runtime.raw_status));
+    const bool download_progress_complete =
+        runtime.progress_is_download_related && runtime.progress_percent >= 99.5f;
     const bool current_prepare_phase =
         current_download_phase || runtime.lifecycle == PrintLifecycleState::kPreparing;
     const bool entering_new_active_cycle =
         has_status_update && is_active_gcode_state(text_string(runtime.raw_status)) &&
         !is_active_gcode_state(previous_raw_status);
     const bool leaving_download_phase =
-        is_download_stage_local(previous_stage_for_progress, previous_raw_status) &&
+        is_download_stage(previous_stage_for_progress, previous_raw_status) &&
         !current_download_phase;
     const bool should_reset_progress_for_new_cycle =
         ((entering_new_active_cycle && current_prepare_phase &&
@@ -1967,12 +2019,23 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
            previous_lifecycle == PrintLifecycleState::kUnknown ||
            previous_lifecycle == PrintLifecycleState::kError) &&
           (!has_progress_update || !current_download_phase || !progress_is_download_related))) ||
-        (leaving_download_phase && (!has_progress_update || progress_is_download_related));
+        (leaving_download_phase && download_progress_complete &&
+         (!has_progress_update || progress_is_download_related));
     if (should_reset_progress_for_new_cycle) {
       runtime.progress_percent = 0.0f;
+      runtime.progress_is_download_related = current_download_phase;
       runtime.remaining_seconds = 0U;
       runtime.current_layer = 0U;
       runtime.total_layers = 0U;
+    } else if (current_specific_non_download_stage && download_progress_complete) {
+      runtime.progress_percent = 0.0f;
+      runtime.progress_is_download_related = false;
+    } else if (leaving_download_phase && !has_progress_update) {
+      // Download phase ended — clear stale download progress regardless of
+      // whether it reached 100%.  The previous >=99.5 threshold missed cases
+      // where the printer's last download report was 99%.
+      runtime.progress_percent = 0.0f;
+      runtime.progress_is_download_related = false;
     }
 
     const std::string error_detail =

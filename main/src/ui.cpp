@@ -302,12 +302,6 @@ std::string optional_temperature_text(const char* label, float temperature_c, bo
   return buffer;
 }
 
-std::string lower_copy(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(),
-                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return value;
-}
-
 bool decode_preview_png(const std::shared_ptr<std::vector<uint8_t>>& encoded_blob,
                         std::shared_ptr<std::vector<uint8_t>>* decoded_blob,
                         lv_image_dsc_t* image_dsc) {
@@ -371,33 +365,6 @@ bool configure_camera_rgb565(const std::shared_ptr<std::vector<uint8_t>>& decode
   return true;
 }
 
-bool stage_contains(const std::string& stage, const char* needle) {
-  return stage.find(needle) != std::string::npos;
-}
-
-bool contains_token(const std::string& value, const char* token) {
-  return value.find(token) != std::string::npos;
-}
-
-std::string effective_status(const PrinterSnapshot& snapshot) {
-  if (!snapshot.raw_status.empty()) {
-    return lower_copy(snapshot.raw_status);
-  }
-  return {};
-}
-
-std::string effective_stage(const PrinterSnapshot& snapshot) {
-  if (!snapshot.raw_stage.empty()) {
-    return lower_copy(snapshot.raw_stage);
-  }
-  return lower_copy(snapshot.stage);
-}
-
-bool is_finished_status(const std::string& status) {
-  return status == "finish" || status == "finished" || contains_token(status, "finish") ||
-         contains_token(status, "success") || contains_token(status, "complete");
-}
-
 uint32_t scale_color(uint32_t color, uint16_t scale_0_to_255) {
   const uint8_t r = static_cast<uint8_t>((color >> 16) & 0xFF);
   const uint8_t g = static_cast<uint8_t>((color >> 8) & 0xFF);
@@ -434,30 +401,19 @@ struct RingVisual {
 };
 
 RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColorScheme& colors) {
-  const std::string stage = effective_stage(snapshot);
-  const std::string status = effective_status(snapshot);
   const int progress = std::clamp(static_cast<int>(std::lround(snapshot.progress_percent)), 0, 100);
-  const bool is_filament = stage_contains(stage, "filament_loading") ||
-                           stage_contains(stage, "filament_unloading") ||
-                           stage_contains(stage, "changing_filament") ||
-                           stage_contains(stage, "loading") || stage_contains(stage, "unloading");
-  const bool is_download = stage_contains(stage, "model_download") || stage_contains(stage, "download") ||
-                           contains_token(status, "download") || snapshot.ui_status == "downloading";
-  const bool done_strict =
-      snapshot.ui_status == "done" || snapshot.lifecycle == PrintLifecycleState::kFinished ||
-      (is_finished_status(status) && stage_contains(stage, "idle") && progress == 100);
-
   RingVisual visual = {};
 
-  if (is_filament) {
-    const bool is_loading =
-        stage_contains(stage, "filament_loading") || stage_contains(stage, "changing_filament");
+  // Filament load/unload animation — direction derived from resolver's ui_status.
+  if (snapshot.ui_status == "loading" || snapshot.ui_status == "unloading") {
     visual.main_hex = kRingBaseDark;
     visual.indicator_hex = colors.filament;
-    visual.anim_kind = is_loading ? RingAnimKind::kFilamentLoad : RingAnimKind::kFilamentUnload;
+    visual.anim_kind = (snapshot.ui_status == "loading") ? RingAnimKind::kFilamentLoad
+                                                         : RingAnimKind::kFilamentUnload;
     return visual;
   }
 
+  // Connection-level states (independent of print status).
   if (snapshot.connection == PrinterConnectionState::kWaitingForCredentials) {
     visual.main_hex = colors.setup;
     visual.indicator_hex = colors.setup;
@@ -478,27 +434,21 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     return visual;
   }
 
-  if (done_strict) {
+  // All remaining classifications come from the resolver (ui_status / lifecycle).
+  if (snapshot.ui_status == "done" || snapshot.lifecycle == PrintLifecycleState::kFinished) {
     visual.main_hex = colors.done;
     visual.indicator_hex = colors.done;
     return visual;
   }
 
-  if (is_download) {
+  if (snapshot.ui_status == "downloading") {
     visual.main_hex = kRingBaseDark;
     visual.indicator_hex = colors.preheat;
-    visual.anim_kind = RingAnimKind::kPulseIndicator;
-    visual.pulse_base_hex = colors.preheat;
-    visual.pulse_period_ms = 1400U;
+    visual.value_override = progress;
     return visual;
   }
 
-  if (stage_contains(stage, "heatbed_preheating") || stage_contains(stage, "nozzle_preheating") ||
-      stage_contains(stage, "heating_hotend") || stage_contains(stage, "heating_chamber") ||
-      stage_contains(stage, "waiting_for_heatbed_temperature") ||
-      stage_contains(stage, "thermal_preconditioning") || stage_contains(stage, "preheat") ||
-      status == "prepare" || snapshot.ui_status == "preparing" ||
-      snapshot.ui_status == "preheating" ||
+  if (snapshot.ui_status == "preheating" || snapshot.ui_status == "preparing" ||
       snapshot.lifecycle == PrintLifecycleState::kPreparing) {
     visual.main_hex = colors.preheat;
     visual.indicator_hex = colors.preheat;
@@ -508,8 +458,7 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     return visual;
   }
 
-  if (stage_contains(stage, "cleaning_nozzle_tip") || stage_contains(stage, "clean") ||
-      snapshot.ui_status == "clean nozzle") {
+  if (snapshot.ui_status == "clean nozzle") {
     visual.main_hex = colors.clean;
     visual.indicator_hex = colors.clean;
     visual.anim_kind = RingAnimKind::kPulseBoth;
@@ -518,9 +467,7 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     return visual;
   }
 
-  if (stage_contains(stage, "auto_bed_leveling") || stage_contains(stage, "bed_level") ||
-      stage_contains(stage, "level") || stage_contains(stage, "measuring_surface") ||
-      snapshot.ui_status == "bed level") {
+  if (snapshot.ui_status == "bed level") {
     visual.main_hex = colors.level;
     visual.indicator_hex = colors.level;
     visual.anim_kind = RingAnimKind::kPulseBoth;
@@ -529,53 +476,37 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
     return visual;
   }
 
-  if (stage_contains(stage, "cool") || stage_contains(stage, "heated_bedcooling")) {
+  if (snapshot.ui_status == "cooling") {
     visual.main_hex = colors.cool;
     visual.indicator_hex = colors.cool;
     return visual;
   }
 
-  const bool idleish = snapshot.lifecycle == PrintLifecycleState::kIdle ||
-                       stage_contains(stage, "idle") || stage_contains(stage, "offline");
-  if (idleish) {
-    if (stage_contains(stage, "offline") || status == "offline" || snapshot.ui_status == "offline") {
-      visual.main_hex = colors.offline;
-      visual.indicator_hex = colors.offline;
-      return visual;
-    }
-    const bool active_job = snapshot.print_active ||
-                            (snapshot.progress_percent > 0.0f && snapshot.progress_percent < 100.0f) ||
-                            status == "running" || status == "prepare" ||
-                            snapshot.lifecycle == PrintLifecycleState::kPrinting ||
-                            snapshot.lifecycle == PrintLifecycleState::kPaused ||
-                            snapshot.lifecycle == PrintLifecycleState::kPreparing;
-    if (active_job) {
-      visual.main_hex = kRingBaseDark;
-      visual.indicator_hex = colors.idle_active;
-    } else {
-      visual.main_hex = colors.idle;
-      visual.indicator_hex = colors.idle;
-    }
+  if (snapshot.ui_status == "offline") {
+    visual.main_hex = colors.offline;
+    visual.indicator_hex = colors.offline;
     return visual;
   }
 
+  // Lifecycle-based fallback for states where ui_status is a free-form string.
   switch (snapshot.lifecycle) {
     case PrintLifecycleState::kPrinting:
     case PrintLifecycleState::kPaused:
       visual.main_hex = kRingBaseDark;
       visual.indicator_hex = colors.printing;
       return visual;
-    case PrintLifecycleState::kPreparing:
-      visual.main_hex = colors.preheat;
-      visual.indicator_hex = colors.preheat;
-      return visual;
     case PrintLifecycleState::kFinished:
       visual.main_hex = colors.done;
       visual.indicator_hex = colors.done;
       return visual;
     case PrintLifecycleState::kIdle:
-      visual.main_hex = colors.idle;
-      visual.indicator_hex = colors.idle;
+      if (snapshot.print_active) {
+        visual.main_hex = kRingBaseDark;
+        visual.indicator_hex = colors.idle_active;
+      } else {
+        visual.main_hex = colors.idle;
+        visual.indicator_hex = colors.idle;
+      }
       return visual;
     case PrintLifecycleState::kUnknown:
     default:
@@ -596,22 +527,12 @@ RingVisual lifecycle_ring_visual(const PrinterSnapshot& snapshot, const ArcColor
 }
 
 uint32_t stable_status_text_hex(const PrinterSnapshot& snapshot, const ArcColorScheme& colors) {
-  const std::string stage = effective_stage(snapshot);
-  const std::string status = effective_status(snapshot);
-  const int progress = std::clamp(static_cast<int>(std::lround(snapshot.progress_percent)), 0, 100);
-  const bool is_filament = stage_contains(stage, "filament_loading") ||
-                           stage_contains(stage, "filament_unloading") ||
-                           stage_contains(stage, "changing_filament") ||
-                           stage_contains(stage, "loading") || stage_contains(stage, "unloading");
-  const bool is_download = stage_contains(stage, "model_download") || stage_contains(stage, "download") ||
-                           contains_token(status, "download") || snapshot.ui_status == "downloading";
-  const bool done_strict =
-      snapshot.ui_status == "done" || snapshot.lifecycle == PrintLifecycleState::kFinished ||
-      (is_finished_status(status) && stage_contains(stage, "idle") && progress == 100);
-
-  if (is_filament) {
+  // Filament
+  if (snapshot.ui_status == "loading" || snapshot.ui_status == "unloading") {
     return colors.filament;
   }
+
+  // Connection-level states
   if (snapshot.connection == PrinterConnectionState::kWaitingForCredentials) {
     return colors.setup;
   }
@@ -622,51 +543,32 @@ uint32_t stable_status_text_hex(const PrinterSnapshot& snapshot, const ArcColorS
   if (!snapshot.wifi_connected) {
     return colors.offline;
   }
-  if (done_strict) {
+
+  // Resolver-classified states
+  if (snapshot.ui_status == "done" || snapshot.lifecycle == PrintLifecycleState::kFinished) {
     return colors.done;
   }
-  if (is_download) {
+  if (snapshot.ui_status == "downloading") {
     return colors.preheat;
   }
-  if (stage_contains(stage, "heatbed_preheating") || stage_contains(stage, "nozzle_preheating") ||
-      stage_contains(stage, "heating_hotend") || stage_contains(stage, "heating_chamber") ||
-      stage_contains(stage, "waiting_for_heatbed_temperature") ||
-      stage_contains(stage, "thermal_preconditioning") || stage_contains(stage, "preheat") ||
-      status == "prepare" || snapshot.ui_status == "preparing" ||
-      snapshot.ui_status == "preheating" ||
+  if (snapshot.ui_status == "preheating" || snapshot.ui_status == "preparing" ||
       snapshot.lifecycle == PrintLifecycleState::kPreparing) {
     return colors.preheat;
   }
-  if (stage_contains(stage, "cleaning_nozzle_tip") || stage_contains(stage, "clean") ||
-      snapshot.ui_status == "clean nozzle") {
+  if (snapshot.ui_status == "clean nozzle") {
     return colors.clean;
   }
-  if (stage_contains(stage, "auto_bed_leveling") || stage_contains(stage, "bed_level") ||
-      stage_contains(stage, "level") || stage_contains(stage, "measuring_surface") ||
-      snapshot.ui_status == "bed level") {
+  if (snapshot.ui_status == "bed level") {
     return colors.level;
   }
-  if (stage_contains(stage, "cool") || stage_contains(stage, "heated_bedcooling")) {
+  if (snapshot.ui_status == "cooling") {
     return colors.cool;
   }
-
-  const bool idleish = snapshot.lifecycle == PrintLifecycleState::kIdle ||
-                       stage_contains(stage, "idle") || stage_contains(stage, "offline");
-  if (idleish) {
-    const bool offline =
-        stage_contains(stage, "offline") || status == "offline" || snapshot.ui_status == "offline";
-    if (offline) {
-      return colors.offline;
-    }
-    const bool active_job = snapshot.print_active ||
-                            (snapshot.progress_percent > 0.0f && snapshot.progress_percent < 100.0f) ||
-                            status == "running" || status == "prepare" ||
-                            snapshot.lifecycle == PrintLifecycleState::kPrinting ||
-                            snapshot.lifecycle == PrintLifecycleState::kPaused ||
-                            snapshot.lifecycle == PrintLifecycleState::kPreparing;
-    return active_job ? colors.idle_active : colors.idle;
+  if (snapshot.ui_status == "offline") {
+    return colors.offline;
   }
 
+  // Lifecycle-based fallback
   switch (snapshot.lifecycle) {
     case PrintLifecycleState::kPrinting:
     case PrintLifecycleState::kPaused:
@@ -676,7 +578,7 @@ uint32_t stable_status_text_hex(const PrinterSnapshot& snapshot, const ArcColorS
     case PrintLifecycleState::kFinished:
       return colors.done;
     case PrintLifecycleState::kIdle:
-      return colors.idle;
+      return snapshot.print_active ? colors.idle_active : colors.idle;
     case PrintLifecycleState::kUnknown:
     default:
       break;
@@ -700,6 +602,11 @@ std::string lifecycle_label(const PrinterSnapshot& snapshot) {
   }
   if (snapshot.connection == PrinterConnectionState::kConnecting && !snapshot.wifi_connected) {
     return "syncing";
+  }
+  // Let filament ui_status (loading/unloading) take priority over has_error,
+  // because Bambu sends user-prompt error codes during filament changes.
+  if (snapshot.ui_status == "loading" || snapshot.ui_status == "unloading") {
+    return snapshot.ui_status;
   }
   if (snapshot.connection == PrinterConnectionState::kError || snapshot.has_error ||
       snapshot.lifecycle == PrintLifecycleState::kError) {
@@ -1725,6 +1632,79 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   const uint8_t ams_count = snapshot.ams ? snapshot.ams->count : 0;
   if (ams_page_available_ && ams_count > 0) {
     const AmsUnitInfo& unit = snapshot.ams->units[0];
+    const bool ext_spool_active = snapshot.tray_now == 254 || snapshot.tray_tar == 254;
+
+    // Dynamic layout: shrink AMS pills and shift right when external spool is active.
+    if (ext_spool_active != ams_ext_spool_shown_) {
+      ams_ext_spool_shown_ = ext_spool_active;
+      if (ext_spool_active) {
+        // Shrink: pills 72×140 → 54×108, columns 76 → 58, radius 40 → 30
+        for (int i = 0; i < kMaxAmsTrays; ++i) {
+          lv_obj_set_size(ams_tray_col_[i], 58, LV_SIZE_CONTENT);
+          lv_obj_set_size(ams_tray_rect_[i], 54, 108);
+          lv_obj_set_style_radius(ams_tray_rect_[i], 30, 0);
+          lv_obj_set_width(ams_tray_type_[i], 50);
+          lv_obj_set_size(ams_tray_fill_[i], 54, 0);
+        }
+        // Shift AMS block right, shrink shelf/base proportionally
+        lv_obj_set_size(ams_shelf_, 275, 85);
+        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 38, -36);
+        lv_obj_set_size(ams_base_, 300, 80);
+        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 38, 38);
+        lv_obj_set_size(ams_tray_row_, 310, LV_SIZE_CONTENT);
+        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 38, -11);
+        // Show ext spool pill on the left
+        lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -11);
+        lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        // Restore original sizes
+        for (int i = 0; i < kMaxAmsTrays; ++i) {
+          lv_obj_set_size(ams_tray_col_[i], 76, LV_SIZE_CONTENT);
+          lv_obj_set_size(ams_tray_rect_[i], 72, 140);
+          lv_obj_set_style_radius(ams_tray_rect_[i], 40, 0);
+          lv_obj_set_width(ams_tray_type_[i], 68);
+          lv_obj_set_size(ams_tray_fill_[i], 72, 0);
+        }
+        lv_obj_set_size(ams_shelf_, 359, 110);
+        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -47);
+        lv_obj_set_size(ams_base_, 385, 103);
+        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 38);
+        lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
+        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -19);
+        lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+
+    // External spool pill styling
+    if (ext_spool_active) {
+      const AmsTrayInfo& ext = snapshot.ams->external_spool;
+      if (ext.color_rgba != 0) {
+        const uint32_t ext_rgb = (ext.color_rgba >> 8) & 0x00FFFFFF;
+        lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(ext_rgb), 0);
+        const bool ext_dark = ((ext_rgb >> 16) & 0xFF) * 299 +
+                              ((ext_rgb >> 8) & 0xFF) * 587 +
+                              (ext_rgb & 0xFF) * 114 < 128000;
+        const lv_color_t txt_col = lv_color_hex(ext_dark ? 0xFFFFFF : 0x000000);
+        lv_obj_set_style_text_color(ams_ext_type_, txt_col, 0);
+        lv_obj_set_style_text_color(ams_ext_mat_, txt_col, 0);
+      } else {
+        lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
+        lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
+      }
+      lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(ams_ext_rect_, 2, 0);
+      lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x000000), 0);
+      lv_obj_set_style_outline_width(ams_ext_rect_, 2, 0);
+      lv_obj_set_style_outline_color(ams_ext_rect_, lv_color_hex(0xFFFFFF), 0);
+      lv_obj_set_style_outline_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+      lv_obj_set_style_outline_pad(ams_ext_rect_, 0, 0);
+      // "EXT" always shown at top; material type below it
+      const char* mat_label = !ext.material_type.empty() ? ext.material_type.c_str() : "";
+      set_label_text_if_changed(ams_ext_mat_, mat_label);
+    }
+
+    const int pill_h = ext_spool_active ? 108 : 140;
 
     for (int i = 0; i < kMaxAmsTrays; ++i) {
       const AmsTrayInfo& tray = unit.trays[i];
@@ -1757,7 +1737,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
 
         // Filament remaining fill level
         if (tray.remain_pct >= 0) {
-          const int rect_h = 140;
+          const int rect_h = pill_h;
           const int empty_h = rect_h - (rect_h * tray.remain_pct / 100);
           lv_obj_set_height(ams_tray_fill_[i], empty_h);
           lv_obj_align(ams_tray_fill_[i], LV_ALIGN_TOP_MID, 0, 0);
@@ -1809,6 +1789,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     // Page is hidden, nothing to do.
   } else {
     set_hidden(ams_tray_row_, true);
+    set_hidden(ams_ext_col_, true);
     set_hidden(ams_note_, false);
   }
 
@@ -2067,28 +2048,28 @@ esp_err_t Ui::build_dashboard() {
   //         humidity pill indicator below.
 
   // Gray shelf background (behind upper half of pills)
-  lv_obj_t* ams_shelf = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_shelf, 359, 110);
-  lv_obj_set_style_radius(ams_shelf, 20, 0);
-  lv_obj_set_style_bg_color(ams_shelf, lv_color_hex(0x565656), 0);
-  lv_obj_set_style_bg_opa(ams_shelf, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_shelf, 0, 0);
-  lv_obj_align(ams_shelf, LV_ALIGN_CENTER, 0, -47);
-  lv_obj_clear_flag(ams_shelf, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_shelf, LV_OBJ_FLAG_CLICKABLE);
-  enable_touch_bubble(ams_shelf);
+  ams_shelf_ = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_shelf_, 359, 110);
+  lv_obj_set_style_radius(ams_shelf_, 20, 0);
+  lv_obj_set_style_bg_color(ams_shelf_, lv_color_hex(0x565656), 0);
+  lv_obj_set_style_bg_opa(ams_shelf_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_shelf_, 0, 0);
+  lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -47);
+  lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_shelf_);
 
   // Dark base behind lower half of pills (solid, hides shelf's bottom corners)
-  lv_obj_t* ams_base = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_base, 385, 103);
-  lv_obj_set_style_radius(ams_base, 0, 0);
-  lv_obj_set_style_bg_color(ams_base, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_set_style_bg_opa(ams_base, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_base, 0, 0);
-  lv_obj_align(ams_base, LV_ALIGN_CENTER, 0, 38);
-  lv_obj_clear_flag(ams_base, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_base, LV_OBJ_FLAG_CLICKABLE);
-  enable_touch_bubble(ams_base);
+  ams_base_ = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_base_, 385, 103);
+  lv_obj_set_style_radius(ams_base_, 0, 0);
+  lv_obj_set_style_bg_color(ams_base_, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_set_style_bg_opa(ams_base_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_base_, 0, 0);
+  lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 38);
+  lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_base_);
 
   ams_tray_row_ = lv_obj_create(ams_page_);
   lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
@@ -2198,6 +2179,52 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(ams_temp_label_, dosis20, 0);
   lv_obj_set_style_text_color(ams_temp_label_, lv_color_hex(0x94A3B8), 0);
   lv_obj_set_style_text_align(ams_temp_label_, LV_TEXT_ALIGN_CENTER, 0);
+
+  // External spool pill (shown when tray_now == 254 or tray_tar == 254)
+  ams_ext_col_ = lv_obj_create(ams_page_);
+  lv_obj_set_size(ams_ext_col_, 56, LV_SIZE_CONTENT);
+  make_transparent(ams_ext_col_);
+  lv_obj_set_flex_flow(ams_ext_col_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(ams_ext_col_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(ams_ext_col_, 4, 0);
+  lv_obj_set_style_pad_all(ams_ext_col_, 0, 0);
+  lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+  lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+
+  ams_ext_rect_ = lv_obj_create(ams_ext_col_);
+  lv_obj_set_size(ams_ext_rect_, 52, 108);
+  lv_obj_set_style_radius(ams_ext_rect_, 32, 0);
+  lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
+  lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
+  lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
+  lv_obj_set_style_border_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+  lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
+  lv_obj_set_style_pad_all(ams_ext_rect_, 0, 0);
+  lv_obj_set_style_clip_corner(ams_ext_rect_, true, 0);
+  lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_CLICKABLE);
+
+  ams_ext_type_ = lv_label_create(ams_ext_rect_);
+  set_label_text_if_changed(ams_ext_type_, "EXT");
+  lv_obj_set_width(ams_ext_type_, 48);
+  lv_label_set_long_mode(ams_ext_type_, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_align(ams_ext_type_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(ams_ext_type_, info20, 0);
+  lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(ams_ext_type_, LV_ALIGN_CENTER, 0, 8);
+
+  ams_ext_mat_ = lv_label_create(ams_ext_rect_);
+  set_label_text_if_changed(ams_ext_mat_, "");
+  lv_obj_set_width(ams_ext_mat_, 48);
+  lv_label_set_long_mode(ams_ext_mat_, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_align(ams_ext_mat_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
+  ams_ext_spool_shown_ = false;
 
   ams_note_ = lv_label_create(ams_page_);
   set_label_text_if_changed(ams_note_, "No AMS connected");
