@@ -37,6 +37,9 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 - chamber light toggle path on supported models
 - battery and USB status with power-aware behavior
 - embedded on-device error text lookup database without a separate storage partition
+- V2 protocol support for P2S and H2 series (`snow`-based spool detection, `vir_slot` filament info)
+- AMS page with individual tray pills and EXT spool indicator
+- OTA firmware update support
 
 ## Setup Flow
 
@@ -85,13 +88,11 @@ Cloud and local credentials can usually be applied live from Web Config without 
 - In `Hybrid`, the current code prefers cloud status for `P2S` and the `H2` family.
 - The current code has local status paths for:
   `A1`, `A1 Mini`, `P1P`, `P1S`, `X1`, `X1C`, `X1E`
-- `P2S` local status is not supported.
+- `P2S` local status works via V2 protocol fields (`snow`, `vir_slot`); some V1 fields may be absent or stale.
 - The `H2` family requires Developer Mode for local status.
-- The local JPEG camera path is currently written for:
-  `A1`, `A1 Mini`, `P1P`, `P1S`
-- RTSP-style camera handling is recognized for:
-  `P2S`, `H2C`, `H2D`, `H2D Pro`, `H2S`, `X1`, `X1C`, `X1E`
-  but that path will not be implemented as the hardware is not capable of displaying video live feeds with more than about 0.5 fps.
+- Camera snapshots are only available on `A1`, `A1 Mini`, `P1P`, and `P1S`.
+  These models expose a local JPEG snapshot endpoint that the ESP32-S3 can handle.
+  Newer models (`P2S`, `H2`, `X1` series) use RTSP video streams only — the ESP32-S3 hardware lacks the memory and processing power to decode these streams. This is a hardware limitation that cannot be worked around with software changes alone.
 - The code currently exposes chamber light control on supported `P1S`, `P2`, `H2`, and `X1` models.
 
 ## UI Overview
@@ -129,9 +130,9 @@ Arc colors are intended to preview live immediately and can be saved without res
 
 ## Current Limitations
 
-- local camera and MJPEG/RTSP work are not fully finished yet
+- **Camera snapshots are limited to `A1`, `A1 Mini`, `P1P`, `P1S` due to ESP32-S3 hardware constraints.** Newer models only offer RTSP streams which the ESP32-S3 cannot decode.
 - cloud/local behavior on newer families still needs broader real-world validation
-- `P2S` local status is not supported in the current code
+- `P2S` local status uses V2 protocol; some legacy fields may behave differently than on older printers
 - `H2` local status requires Developer Mode
 - local MQTT TLS now uses an embedded Bambu CA bundle
 - `Local only` works, but the broadest hands-on validation so far is still in `Hybrid` and `Cloud only`
@@ -139,9 +140,11 @@ Arc colors are intended to preview live immediately and can be saved without res
 
 ## Flashing
 
-[`release/firmware.bin`](release/firmware.bin) is the merged initial-flash image for empty devices.
+[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
 
-The newest merged image stays in `/release/`; older versioned builds can be moved to `/release/archive/`.
+For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere_ota.bin).
+
+Versioned builds are archived in the `archive/` subfolder of each release directory.
 
 ### Web Flashers
 
@@ -151,17 +154,17 @@ The newest merged image stays in `/release/`; older versioned builds can be move
 - connect USB
 - choose the COM port
 - do not use "Prepare for first use"
-- install `firmware.bin` directly
+- install `printsphere_full.bin` directly
 
 `espboards.dev`
 `https://www.espboards.dev/tools/program/`
 
-- write `firmware.bin` to address `0x0`
+- write `printsphere_full.bin` to address `0x0`
 
 `esptool-js`
 `https://espressif.github.io/esptool-js/`
 
-- write `firmware.bin` to address `0x0`
+- write `printsphere_full.bin` to address `0x0`
 
 The bootloader is already included in the merged image.
 
@@ -176,5 +179,5 @@ idf.py -p PORT flash
 Alternatively, write the merged image directly with `esptool`:
 
 ```bash
-esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/firmware.bin
+esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/initial/printsphere_full.bin
 ```
