@@ -112,6 +112,10 @@ esp_err_t WifiManager::connect_station(const WifiCredentials& credentials) {
   sta_disconnect_retries_ = 0;
   sta_ip_.clear();
 
+  ESP_RETURN_ON_ERROR(ensure_wifi_started(), kTag, "ensure_wifi_started failed");
+
+  // Scan for the strongest AP broadcasting this SSID (helps with mesh networks
+  // where multiple APs share the same SSID but have very different signal levels).
   wifi_config_t sta_config = {};
   std::snprintf(reinterpret_cast<char*>(sta_config.sta.ssid), sizeof(sta_config.sta.ssid), "%s",
                 credentials.ssid.c_str());
@@ -121,7 +125,39 @@ esp_err_t WifiManager::connect_station(const WifiCredentials& credentials) {
   sta_config.sta.pmf_cfg.capable = true;
   sta_config.sta.pmf_cfg.required = false;
 
-  ESP_RETURN_ON_ERROR(ensure_wifi_started(), kTag, "ensure_wifi_started failed");
+  // Targeted scan: only look for APs with our SSID.
+  wifi_scan_config_t scan_cfg = {};
+  scan_cfg.ssid = sta_config.sta.ssid;
+  scan_cfg.show_hidden = false;
+  const esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+  if (scan_err == ESP_OK) {
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    if (ap_count > 0) {
+      std::vector<wifi_ap_record_t> records(ap_count);
+      uint16_t fetched = ap_count;
+      if (esp_wifi_scan_get_ap_records(&fetched, records.data()) == ESP_OK && fetched > 0) {
+        // Pick the AP with the highest RSSI.
+        const wifi_ap_record_t* best = &records[0];
+        for (uint16_t i = 1; i < fetched; ++i) {
+          if (records[i].rssi > best->rssi) {
+            best = &records[i];
+          }
+        }
+        // Lock onto that specific BSSID so esp_wifi_connect() doesn't pick randomly.
+        std::memcpy(sta_config.sta.bssid, best->bssid, sizeof(sta_config.sta.bssid));
+        sta_config.sta.bssid_set = true;
+        sta_config.sta.channel = best->primary;
+        ESP_LOGI(kTag, "AP scan: best BSSID=%02X:%02X:%02X:%02X:%02X:%02X rssi=%d ch=%d (of %u APs)",
+                 best->bssid[0], best->bssid[1], best->bssid[2],
+                 best->bssid[3], best->bssid[4], best->bssid[5],
+                 best->rssi, best->primary, static_cast<unsigned int>(fetched));
+      }
+    }
+  } else {
+    ESP_LOGW(kTag, "AP scan failed (%s), connecting without BSSID preference", esp_err_to_name(scan_err));
+  }
+
   ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_config), kTag, "set STA config failed");
   ESP_RETURN_ON_ERROR(esp_wifi_connect(), kTag, "esp_wifi_connect failed");
 
@@ -256,6 +292,13 @@ void WifiManager::on_wifi_event(int32_t event_id, void* event_data) {
         ESP_LOGW(kTag, "Wi-Fi disconnected (reason=%d), retry %u/%u", reason,
                  static_cast<unsigned int>(sta_disconnect_retries_),
                  static_cast<unsigned int>(kSetupApRetryThreshold));
+        // Clear BSSID lock on retries so the ESP32 can roam to any available AP.
+        wifi_config_t cfg = {};
+        if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.bssid_set) {
+          cfg.sta.bssid_set = false;
+          cfg.sta.channel = 0;
+          esp_wifi_set_config(WIFI_IF_STA, &cfg);
+        }
         esp_wifi_connect();
       }
       if (!ap_ssid_.empty() && sta_disconnect_retries_ >= kSetupApRetryThreshold) {
