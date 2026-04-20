@@ -242,6 +242,30 @@ void enable_touch_bubble(lv_obj_t* obj) {
   lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
 }
 
+// Draw callback for the green triangle active-slot indicator.
+// The triangle is an upward-pointing isosceles triangle centered in the object.
+void ams_arrow_draw_cb(lv_event_t* e) {
+  auto* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
+  lv_layer_t* layer = lv_event_get_layer(e);
+  if (obj == nullptr || layer == nullptr) return;
+
+  lv_area_t coords;
+  lv_obj_get_coords(obj, &coords);
+  const int32_t w = coords.x2 - coords.x1;
+  const int32_t cx = coords.x1 + w / 2;
+
+  const lv_color_t color = lv_obj_get_style_bg_color(obj, LV_PART_MAIN);
+
+  lv_draw_triangle_dsc_t dsc;
+  lv_draw_triangle_dsc_init(&dsc);
+  dsc.p[0] = {cx, coords.y1};               // top center (tip)
+  dsc.p[1] = {coords.x1, coords.y2};        // bottom left
+  dsc.p[2] = {coords.x1 + w, coords.y2};   // bottom right
+  dsc.color = color;
+  dsc.opa = LV_OPA_COVER;
+  lv_draw_triangle(layer, &dsc);
+}
+
 int display_rotation_visual_offset_x(DisplayRotation rotation) {
   switch (rotation) {
     case DisplayRotation::k90:
@@ -1660,13 +1684,13 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         }
         // Shift AMS block right, shrink shelf/base proportionally
         lv_obj_set_size(ams_shelf_, 275, 85);
-        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 38, -36);
+        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 38, -55);
         lv_obj_set_size(ams_base_, 300, 80);
-        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 38, 38);
+        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 38, 19);
         lv_obj_set_size(ams_tray_row_, 310, LV_SIZE_CONTENT);
-        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 38, -11);
+        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 38, -30);
         // Show ext spool pill on the left
-        lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -11);
+        lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -30);
         lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
       } else {
         // Restore original sizes
@@ -1678,11 +1702,11 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
           lv_obj_set_size(ams_tray_fill_[i], 72, 0);
         }
         lv_obj_set_size(ams_shelf_, 359, 110);
-        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -47);
+        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -50);
         lv_obj_set_size(ams_base_, 385, 103);
-        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 38);
+        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 35);
         lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
-        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -19);
+        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -13);
         lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
       }
     }
@@ -1705,12 +1729,11 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
       }
       lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
-      lv_obj_set_style_border_width(ams_ext_rect_, 2, 0);
-      lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x000000), 0);
-      lv_obj_set_style_outline_width(ams_ext_rect_, 2, 0);
-      lv_obj_set_style_outline_color(ams_ext_rect_, lv_color_hex(0xFFFFFF), 0);
-      lv_obj_set_style_outline_opa(ams_ext_rect_, LV_OPA_COVER, 0);
-      lv_obj_set_style_outline_pad(ams_ext_rect_, 0, 0);
+      lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
+      lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
+      lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
+      // Show green arrow indicator below ext pill
+      lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x4ADE80), 0);
       // "EXT" always shown at top; material type below it
       const char* mat_label = !ext.material_type.empty() ? ext.material_type.c_str() : "";
       set_label_text_if_changed(ams_ext_mat_, mat_label);
@@ -1725,18 +1748,17 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         const uint32_t rgb = (rgba >> 8) & 0x00FFFFFF;
         lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(rgb), 0);
         lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-        // Active tray: 2px black border + 2px white outline (double ring)
+        // Active tray: show green triangle indicator below pill
         if (tray.active) {
-          lv_obj_set_style_border_width(ams_tray_rect_[i], 2, 0);
-          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x000000), 0);
-          lv_obj_set_style_outline_width(ams_tray_rect_[i], 2, 0);
-          lv_obj_set_style_outline_color(ams_tray_rect_[i], lv_color_hex(0xFFFFFF), 0);
-          lv_obj_set_style_outline_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-          lv_obj_set_style_outline_pad(ams_tray_rect_[i], 0, 0);
+          lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
+          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
+          lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
+          lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x4ADE80), 0);
         } else {
           lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
           lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
           lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
+          lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
         }
         set_label_text_if_changed(ams_tray_type_[i],
                                   tray.material_type.empty() ? "--" : tray.material_type);
@@ -1775,6 +1797,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         set_label_text_if_changed(ams_tray_type_[i], "Empty");
         lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
       }
     }
 
@@ -2065,8 +2088,11 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_radius(ams_shelf_, 20, 0);
   lv_obj_set_style_bg_color(ams_shelf_, lv_color_hex(0x565656), 0);
   lv_obj_set_style_bg_opa(ams_shelf_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_shelf_, 0, 0);
-  lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -47);
+  lv_obj_set_style_border_width(ams_shelf_, 2, 0);
+  lv_obj_set_style_border_color(ams_shelf_, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_border_opa(ams_shelf_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_side(ams_shelf_, static_cast<lv_border_side_t>(LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT), 0);
+  lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -50);
   lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_CLICKABLE);
   enable_touch_bubble(ams_shelf_);
@@ -2077,8 +2103,11 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_radius(ams_base_, 0, 0);
   lv_obj_set_style_bg_color(ams_base_, lv_color_hex(0x1F1F1F), 0);
   lv_obj_set_style_bg_opa(ams_base_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_base_, 0, 0);
-  lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 38);
+  lv_obj_set_style_border_width(ams_base_, 2, 0);
+  lv_obj_set_style_border_color(ams_base_, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_border_opa(ams_base_, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_side(ams_base_, LV_BORDER_SIDE_FULL, 0);
+  lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 35);
   lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_CLICKABLE);
   enable_touch_bubble(ams_base_);
@@ -2090,7 +2119,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_flex_align(ams_tray_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(ams_tray_row_, 6, 0);
-  lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -19);
+  lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -13);
   lv_obj_clear_flag(ams_tray_row_, LV_OBJ_FLAG_SCROLLABLE);
   enable_touch_bubble(ams_tray_row_);
 
@@ -2142,6 +2171,16 @@ esp_err_t Ui::build_dashboard() {
     lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
+
+    // Triangle indicator below the pill (color-switched: green=active, base=inactive)
+    ams_tray_arrow_[i] = lv_obj_create(ams_tray_col_[i]);
+    lv_obj_set_size(ams_tray_arrow_[i], 40, 25);
+    make_transparent(ams_tray_arrow_[i]);
+    lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
+    lv_obj_set_style_pad_all(ams_tray_arrow_[i], 0, 0);
+    lv_obj_clear_flag(ams_tray_arrow_[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_arrow_[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ams_tray_arrow_[i], ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
   }
 
   // Percentage labels (above pills, ignore layout so they float)
@@ -2163,7 +2202,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_border_opa(hum_pill, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(hum_pill, 1, 0);
   lv_obj_set_style_pad_all(hum_pill, 0, 0);
-  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 154);
+  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 135);
   lv_obj_clear_flag(hum_pill, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(hum_pill, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(hum_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
@@ -2236,6 +2275,17 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
+
+  // Triangle indicator below the ext pill (color-switched: green=active, base=inactive)
+  ams_ext_arrow_ = lv_obj_create(ams_ext_col_);
+  lv_obj_set_size(ams_ext_arrow_, 35, 23);
+  make_transparent(ams_ext_arrow_);
+  lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x1F1F1F), 0);
+  lv_obj_set_style_pad_all(ams_ext_arrow_, 0, 0);
+  lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(ams_ext_arrow_, ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+
   ams_ext_spool_shown_ = false;
 
   ams_note_ = lv_label_create(ams_page_);
@@ -2770,10 +2820,10 @@ void Ui::set_active_page(int page) {
   const int previous_page = active_page_;
   lv_obj_update_layout(pager_);
   if (lv_obj_t* target_page = page_object(clamped_page); target_page != nullptr) {
-    // LV_ANIM_ON with ease_in_out causes visible stutter: the ease-in phase is
-    // intentionally slow. The drag has already moved the pager visually — snap to
-    // final position instantly in one frame.
-    lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
+    // lv_obj_scroll_to_view can leave a small residual offset depending on
+    // scroll direction.  Use the page's exact x-position for a pixel-perfect snap.
+    const int target_x = lv_obj_get_x(target_page);
+    lv_obj_scroll_to_x(pager_, target_x, LV_ANIM_OFF);
   }
   if (previous_page == 3 && clamped_page != 3) {
     release_preview_image_locked();
@@ -2814,7 +2864,8 @@ void Ui::set_pager_scroll_locked(bool locked) {
   // between pages.
   lv_obj_update_layout(pager_);
   if (lv_obj_t* target_page = page_object(active_page_); target_page != nullptr) {
-    lv_obj_scroll_to_view(target_page, LV_ANIM_OFF);
+    const int target_x = lv_obj_get_x(target_page);
+    lv_obj_scroll_to_x(pager_, target_x, LV_ANIM_OFF);
   }
   scrolling_ = false;
   apply_page0_parallax();
