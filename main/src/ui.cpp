@@ -41,7 +41,7 @@ constexpr int kPage2NoteWithImageY = 138;
 constexpr int kPage2SubnoteWithImageY = 188;
 constexpr int kPage3CameraWidth = 400;
 constexpr int kPage3CameraHeight = 224;
-constexpr int kPage3CameraYOffset = 20;
+constexpr int kPage3CameraYOffset = 0;
 constexpr int kPage3NoteWithImageY = 150;
 constexpr int kPage3SubnoteWithImageY = 182;
 constexpr int kAuxTempRowY = 28;
@@ -827,11 +827,19 @@ std::string camera_note_text(const PrinterSnapshot& snapshot) {
 }
 
 std::string camera_subnote_text(const PrinterSnapshot& snapshot) {
+  if (snapshot.camera_blob && !snapshot.camera_blob->empty()) {
+    // Image is loaded: show layer progress below the snapshot so the cam page
+    // carries the print-in-progress info that the dashboard usually owns.
+    if (snapshot.total_layers > 0 || snapshot.current_layer > 0) {
+      return layer_text(snapshot);
+    }
+    if (!snapshot.job_name.empty()) {
+      return snapshot.job_name;
+    }
+    return "Tap to refresh now";
+  }
   if (!snapshot.job_name.empty()) {
     return snapshot.job_name;
-  }
-  if (snapshot.camera_blob && !snapshot.camera_blob->empty()) {
-    return "Tap to refresh now";
   }
   return "Auto-refresh every 2s";
 }
@@ -1939,6 +1947,12 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
   set_hidden(page3_subnote_, camera_subnote.empty());
   if (!camera_subnote.empty()) {
+    // Use the same large font as the main-page layer label when showing
+    // "Layer: X / Y", fall back to the regular small font otherwise.
+    const bool subnote_is_layer =
+        has_camera_image && (snapshot.total_layers > 0 || snapshot.current_layer > 0);
+    lv_obj_set_style_text_font(page3_subnote_,
+                               subnote_is_layer ? &dosis_32 : &lv_font_montserrat_20, 0);
     set_label_text_if_changed(page3_subnote_, camera_subnote);
   }
 

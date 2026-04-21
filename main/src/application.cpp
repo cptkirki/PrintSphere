@@ -116,6 +116,12 @@ Application::Application()
     : setup_portal_(config_store_, wifi_manager_, cloud_client_, printer_client_, camera_client_,
                     ui_, pmu_manager_) {
   cloud_client_.set_config_store(&config_store_);
+  // Route printer online/offline events from the Bambu Cloud MQTT feed to the
+  // local PrinterClient so it can collapse its reconnect backoff the moment the
+  // printer is known to be reachable again. Avoids blind TCP-probe cycles while
+  // the printer is powered off or roaming on the LAN.
+  cloud_client_.set_printer_presence_callback(
+      [this](bool online) { printer_client_.notify_cloud_presence(online); });
 }
 
 void Application::run() {

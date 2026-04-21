@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -162,6 +163,15 @@ class BambuCloudClient {
   void set_config_store(const ConfigStore* config_store) { config_store_ = config_store; }
   void configure(BambuCloudCredentials credentials, std::string printer_serial);
   void set_network_ready(bool ready) { network_ready_.store(ready); }
+  // Invoked whenever a `client.connected` / `client.disconnected` event for the
+  // currently-bound printer arrives on the Bambu Cloud MQTT feed. Used by the
+  // local PrinterClient to reconnect immediately when the printer comes back
+  // online instead of waiting for the next TCP-probe cycle.
+  // Callback is invoked from the cloud MQTT event task — keep handlers short
+  // and non-blocking.
+  void set_printer_presence_callback(std::function<void(bool online)> cb) {
+    printer_presence_callback_ = std::move(cb);
+  }
   void set_low_power_mode(bool enabled) { low_power_mode_.store(enabled); }
   void set_fetch_paused(bool paused);
   void set_live_mqtt_enabled(bool enabled) { live_mqtt_enabled_.store(enabled); }
@@ -283,6 +293,7 @@ class BambuCloudClient {
   std::atomic<bool> reload_requested_{false};
   std::atomic<bool> received_live_payload_{false};
   std::atomic<bool> initial_sync_sent_{false};
+  std::function<void(bool online)> printer_presence_callback_{};
   std::atomic<bool> delayed_start_sent_{false};
   std::atomic<uint32_t> initial_sync_tick_{0};
   std::atomic<bool> live_runtime_dirty_{false};

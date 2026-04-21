@@ -128,7 +128,11 @@ constexpr char kPushAll[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"p
 constexpr char kStartPush[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"start\"}}";
 constexpr uint32_t kDelayedPushallMs = 3000;
 constexpr uint32_t kInitialSyncTimeoutMs = 12000;
-constexpr uint32_t kNoDataProbeMs = 90000;
+// Watchdog timing: with keepalive=20s, a stalled LAN session is detected within
+// ~40s of silence. If the printer goes quiet despite a live TCP session we first
+// poke it with a start-push request (matches ha-bambulab's watchdog behaviour);
+// only if it still stays silent do we force a reconnect.
+constexpr uint32_t kNoDataProbeMs = 30000;
 constexpr uint32_t kNoDataReconnectMs = 15000;
 constexpr uint32_t kDisconnectedStallMs = 20000;
 constexpr uint32_t kRebuildDelayMs = 1500;
@@ -1364,6 +1368,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
       consecutive_probe_failures_ = 0;
       consecutive_mqtt_errors_ = 0;
       mqtt_connected_ = true;
+      session_ever_established_ = true;
       received_payload_ = false;
       subscription_acknowledged_ = false;
       initial_sync_sent_ = false;
@@ -2230,6 +2235,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
 void PrinterClient::stop_client() {
   mqtt_connected_ = false;
+  session_ever_established_ = false;
   received_payload_ = false;
   subscription_acknowledged_ = false;
   initial_sync_sent_ = false;
@@ -2266,11 +2272,20 @@ void PrinterClient::schedule_client_rebuild(const char* reason, uint32_t delay_m
   if (client_rebuild_requested_.exchange(true)) {
     return;
   }
-  const uint32_t delay_ticks = pdMS_TO_TICKS(delay_ms == 0 ? kRebuildDelayMs : delay_ms);
+  uint32_t effective_ms = delay_ms == 0 ? kRebuildDelayMs : delay_ms;
+  // Once the session has been established at least once for this profile,
+  // subsequent rebuilds are cheap (no TCP probe, no fresh TLS session —
+  // esp-mqtt's internal reconnect handles it). Cap long backoffs so a
+  // transient drop doesn't strand us in a 30 s retry window, which in
+  // local-only mode nobody would wake us out of.
+  if (session_ever_established_.load() && effective_ms > 5000U) {
+    effective_ms = 5000U;
+  }
+  const uint32_t delay_ticks = pdMS_TO_TICKS(effective_ms);
   rebuild_request_tick_ = xTaskGetTickCount();
   rebuild_delay_ticks_ = delay_ticks;
   ESP_LOGW(kTag, "Scheduling MQTT client rebuild in %u ms (%s)",
-           static_cast<unsigned int>(delay_ms == 0 ? kRebuildDelayMs : delay_ms),
+           static_cast<unsigned int>(effective_ms),
            reason != nullptr ? reason : "unspecified");
 }
 
@@ -2278,6 +2293,48 @@ void PrinterClient::cancel_client_rebuild() {
   client_rebuild_requested_ = false;
   rebuild_request_tick_ = 0;
   rebuild_delay_ticks_ = 0;
+}
+
+void PrinterClient::notify_cloud_presence(bool online) {
+  if (!online) {
+    ESP_LOGI(kTag, "Cloud presence hint: printer offline (no local action)");
+    return;
+  }
+  if (mqtt_connected_.load()) {
+    ESP_LOGD(kTag, "Cloud presence hint: printer online, local MQTT already connected");
+    return;
+  }
+  // Collapse any pending backoff and force an immediate connect attempt.
+  // The task loop picks this up within ~250 ms. Also zero the failure counters
+  // so the next attempt restarts from the aggressive early-retry cadence.
+  ESP_LOGI(kTag, "Cloud presence hint: printer online, collapsing backoff and retrying local MQTT");
+  consecutive_probe_failures_ = 0;
+  consecutive_mqtt_errors_ = 0;
+  if (client_rebuild_requested_.load()) {
+    rebuild_request_tick_ = xTaskGetTickCount();
+    rebuild_delay_ticks_ = pdMS_TO_TICKS(250);
+  } else if (client_ != nullptr && !mqtt_connected_.load()) {
+    schedule_client_rebuild("cloud presence hint", 250);
+  }
+  wake_task();
+}
+
+void PrinterClient::set_network_ready(bool ready) {
+  const bool previous = network_ready_.exchange(ready);
+  if (ready && !previous) {
+    // Wi-Fi just came (back) up. Collapse any pending reconnect backoff and
+    // wake the task so it can retry immediately instead of sitting in a stale
+    // backoff window computed before the link loss. This is the local-only
+    // counterpart to notify_cloud_presence(true).
+    ESP_LOGI(kTag, "Wi-Fi ready hint: collapsing backoff and waking task");
+    consecutive_probe_failures_ = 0;
+    consecutive_mqtt_errors_ = 0;
+    if (client_rebuild_requested_.load()) {
+      rebuild_request_tick_ = xTaskGetTickCount();
+      rebuild_delay_ticks_ = pdMS_TO_TICKS(250);
+    }
+    wake_task();
+  }
 }
 
 void PrinterClient::task_loop() {
@@ -2385,8 +2442,18 @@ void PrinterClient::task_loop() {
                connection.host.c_str(), static_cast<unsigned int>(connection.mqtt_port),
                connection.serial.c_str(), connection.mqtt_username.c_str());
 
-      // TCP probe: quick reachability check before expensive TLS+MQTT handshake
-      {
+      // TCP probe: quick reachability check before expensive TLS+MQTT handshake.
+      // We only run the probe on the very first connect attempt for this profile.
+      // Once the session has been established at least once, subsequent rebuilds
+      // skip the probe so we don't trip on transient Wi-Fi jitter (AP roaming,
+      // power-save wake, ARP cache miss). esp-mqtt's internal
+      // network.timeout_ms / network.reconnect_timeout_ms handles those cases
+      // without churning the TLS session or fragmenting the heap.
+      const bool skip_probe = session_ever_established_.load();
+      if (skip_probe) {
+        ESP_LOGI(kTag, "TCP probe: skipping (session previously established, relying on esp-mqtt reconnect)");
+        consecutive_probe_failures_ = 0;
+      } else {
         int probe_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (probe_sock >= 0) {
           struct sockaddr_in dest = {};
@@ -2506,7 +2573,11 @@ void PrinterClient::task_loop() {
                  "Embedded local Bambu CA bundle is empty; falling back to insecure local MQTT TLS");
       }
       mqtt_cfg.credentials.client_id = client_id_.c_str();
-      mqtt_cfg.session.keepalive = 60;
+      // Shorter keepalive (was 60s) helps detect stalled LAN sessions faster — the
+      // Bambu firmware and some router NAT tables drop idle LAN-MQTT sessions after
+      // ~30-45s, leaving us with a zombie TCP session that silently loses traffic.
+      // ha-bambulab uses 5s; 20s is a pragmatic compromise for ESP32 radio duty cycle.
+      mqtt_cfg.session.keepalive = 20;
       mqtt_cfg.session.disable_clean_session = false;
       mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
       mqtt_cfg.buffer.size = 16384;

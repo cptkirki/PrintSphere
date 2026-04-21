@@ -22,7 +22,18 @@ class PrinterClient {
 
   void configure(PrinterConnection connection);
   bool is_configured() const;
-  void set_network_ready(bool ready) { network_ready_.store(ready); }
+  // Notify the client about Wi-Fi station link state. A transition from
+  // not-ready → ready also acts as an implicit presence hint (see
+  // notify_cloud_presence()) so that we don't sit in a 30 s backoff window when
+  // Wi-Fi comes back.
+  void set_network_ready(bool ready);
+  // Hook driven by the Bambu Cloud MQTT feed: when the cloud reports that the
+  // printer has just come back online (`client.connected`), we can short-circuit
+  // the current reconnect backoff and attempt a local connection immediately
+  // instead of waiting for the next TCP-probe cycle. Called with online=false
+  // on `client.disconnected` for logging / future offline handling. Safe to
+  // call from the cloud MQTT task context; only touches atomics.
+  void notify_cloud_presence(bool online);
   bool set_chamber_light(bool on);
   esp_err_t start();
   PrinterSnapshot snapshot() const { return state_.snapshot(); }
@@ -120,6 +131,13 @@ class PrinterClient {
   std::mutex incoming_mutex_{};
   std::atomic<bool> client_started_{false};
   std::atomic<bool> mqtt_connected_{false};
+  // Latched once the MQTT session successfully reached CONNECTED state at least
+  // once for the currently active profile. Used to skip the expensive TCP probe
+  // on subsequent reconnect attempts so esp-mqtt's internal reconnect
+  // (network.reconnect_timeout_ms) can do the heavy lifting without tearing
+  // down and reinitialising the client (and its TLS session) every time.
+  // Reset in stop_client() when the client is actually destroyed.
+  std::atomic<bool> session_ever_established_{false};
   std::atomic<bool> received_payload_{false};
   std::atomic<bool> subscription_acknowledged_{false};
   std::atomic<bool> initial_sync_sent_{false};

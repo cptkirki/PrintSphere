@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,12 @@ class ConfigStore {
  private:
   esp_err_t save_string(const char* key, const std::string& value) const;
   std::string load_string(const char* key) const;
+  void migrate_legacy_printer_profile();
+
+  // Serializes printer-profile read-modify-write operations so concurrent
+  // callers (HTTP handlers on httpd task + main loop) cannot race and clobber
+  // `prn_count` / profile slot assignments (see /api/printers/save upsert).
+  mutable std::mutex printer_profile_mutex_{};
 };
 
 }  // namespace printsphere

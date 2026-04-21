@@ -1951,7 +1951,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         "Switch between configured printers without rebooting. Cloud printers are automatically matched with local profiles by serial number.",
         printer_count_str + (profiles.size() == 1 ? " Printer" : " Printers"),
         printer_badge_class, false);
-    html += "<div id=\"printer-list\">";
+    html += "<div id=\"printer-list\" data-initial-count=\"";
+    html += std::to_string(profiles.size() + cloud_devices.size());
+    html += "\">";
     // Render saved profiles
     for (const auto& p : profiles) {
       const bool is_active = (p.index == active_idx);
@@ -2047,6 +2049,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += "\">Add to Profiles</button></div></div>";
     }
     html += "</div>";
+    if (profiles.empty() && cloud_devices.empty()) {
+      html += "<div class=\"hint-box\" id=\"printer-empty-hint\"><strong>No printers configured yet.</strong> ";
+      if (cloud.is_configured()) {
+        html += "Waiting for Bambu Cloud binding list to finish loading — this page refreshes automatically once your printers appear.";
+      } else {
+        html += "Use Cloud Login below or enter a local printer (host, serial, access code) to add your first printer.";
+      }
+      html += "</div>";
+    }
     if (cloud.is_configured()) {
       html += "<div style=\"margin-top:12px\"><button type=\"button\" class=\"secondary\" id=\"load-cloud-printers-btn\">Load Cloud Printers</button>"
               "<span id=\"cloud-printers-status\" style=\"margin-left:10px;font-size:0.85em;color:#888\"></span></div>";
@@ -2629,6 +2640,29 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "updateDisplayRotationControls();updatePortalAccessControls();updateSourceModeControls();updateHealth();healthTimer=setInterval(updateHealth,4000);window.addEventListener('beforeunload',()=>{if(healthTimer){clearInterval(healthTimer);healthTimer=null;}stopCloudFollowup();stopLocalFollowup();});";
 
   // --- Printer selection JS ---
+  // Auto-refresh guard: if the page was rendered while the Cloud binding call
+  // hadn't returned yet (or with a stale legacy NVS before migration), the
+  // server-rendered count is 0.  Poll /api/printers every 4 s and reload the
+  // page when the backend reports more profiles/cloud devices than we were
+  // rendered with.  This specifically addresses the "Printers page empty"
+  // report for users with ≥1 cloud-bound printer — their devices appear after
+  // the Cloud login/bindings fetch completes (T ≈ 5-45 s after boot).
+  html += "(function(){const list=document.getElementById('printer-list');"
+          "if(!list)return;"
+          "const initial=parseInt(list.dataset.initialCount||'0',10);"
+          "let pollTimer=null;let polls=0;"
+          "async function poll(){polls++;"
+          "try{const r=await fetch('/api/printers',{cache:'no-store'});"
+          "if(!r.ok)return;const d=await r.json();"
+          "const total=((d.profiles||[]).length)+((d.cloud_devices||[]).length);"
+          "if(total>initial){clearInterval(pollTimer);pollTimer=null;location.reload();}"
+          "}catch(e){}"
+          // Stop polling after ~3 minutes to avoid indefinite network chatter.
+          "if(polls>=45){clearInterval(pollTimer);pollTimer=null;}}"
+          "pollTimer=setInterval(poll,4000);"
+          "window.addEventListener('beforeunload',()=>{if(pollTimer){clearInterval(pollTimer);pollTimer=null;}});"
+          "})();";
+
   html += "(function(){const btn=document.getElementById('load-cloud-printers-btn');"
           "if(!btn)return;"
           "const st=document.getElementById('cloud-printers-status');"

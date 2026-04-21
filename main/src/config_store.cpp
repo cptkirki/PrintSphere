@@ -153,9 +153,48 @@ esp_err_t ConfigStore::initialize() {
 
   if (err == ESP_OK) {
     ESP_LOGI(kTag, "NVS ready");
+    migrate_legacy_printer_profile();
   }
 
   return err;
+}
+
+// One-shot migration: versions ≤ v1.3 stored a single printer connection in
+// flat keys ("prn_host", "prn_serial", "prn_access", "prn_port").  v1.4.1+
+// uses indexed multi-profile keys ("prn_0_ser", "prn_0_host", ...) plus a
+// "prn_count" counter.  Without this migration, users upgrading from v1.3 land
+// on the new firmware with prn_count=0 → the Printers page renders empty and
+// the main loop never connects to their saved printer.
+void ConfigStore::migrate_legacy_printer_profile() {
+  // If new-format profiles already exist, nothing to do.
+  if (load_printer_profile_count() > 0) return;
+
+  const std::string legacy_host = load_string("prn_host");
+  const std::string legacy_serial = load_string("prn_serial");
+  const std::string legacy_access = load_string("prn_access");
+  if (legacy_host.empty() && legacy_serial.empty() && legacy_access.empty()) {
+    return;
+  }
+
+  ESP_LOGI(kTag, "Migrating legacy printer profile (serial=%s host=%s) to slot 0",
+           legacy_serial.c_str(), legacy_host.c_str());
+
+  PrinterProfile profile;
+  profile.index = 0;
+  profile.serial = legacy_serial;
+  profile.host = legacy_host;
+  profile.access_code = legacy_access;
+  // display_name / model left empty — will be populated from cloud binding
+  // list on first Cloud login.
+  save_printer_profile(profile);
+  save_active_printer_index(0);
+
+  // Clear the legacy keys so we don't re-migrate and so stale values can't
+  // resurrect if the user edits profile 0 later.
+  save_string("prn_host", "");
+  save_string("prn_serial", "");
+  save_string("prn_access", "");
+  save_string("prn_port", "");
 }
 
 std::string ConfigStore::load_device_name() const { return kDeviceName; }
@@ -416,6 +455,7 @@ esp_err_t ConfigStore::save_active_printer_index(uint8_t index) const {
 }
 
 std::vector<PrinterProfile> ConfigStore::load_printer_profiles() const {
+  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
   const uint8_t count = load_printer_profile_count();
   std::vector<PrinterProfile> profiles;
   profiles.reserve(count);
@@ -436,6 +476,7 @@ std::vector<PrinterProfile> ConfigStore::load_printer_profiles() const {
 }
 
 esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const {
+  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
   const uint8_t idx = profile.index;
   if (idx >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
 
@@ -461,21 +502,26 @@ esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const
 }
 
 esp_err_t ConfigStore::delete_printer_profile(uint8_t index) const {
+  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
   if (index >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
   const uint8_t count = load_printer_profile_count();
   if (index >= count) return ESP_ERR_NOT_FOUND;
 
-  // Shift all profiles above index down by one
+  // Shift all profiles above index down by one.
+  // Inline writes only — save_printer_profile() would re-acquire the mutex and deadlock.
   for (uint8_t i = index; i + 1 < count; ++i) {
-    PrinterProfile next;
-    next.index = i;
-    next.serial = load_string(profile_key(i + 1, "ser").c_str());
-    next.host = load_string(profile_key(i + 1, "host").c_str());
-    next.access_code = load_string(profile_key(i + 1, "acc").c_str());
-    next.display_name = load_string(profile_key(i + 1, "name").c_str());
-    next.model = load_string(profile_key(i + 1, "mdl").c_str());
-    next.cloud_bound = load_string(profile_key(i + 1, "cld").c_str()) == "1";
-    save_printer_profile(next);
+    const std::string serial = load_string(profile_key(i + 1, "ser").c_str());
+    const std::string host = load_string(profile_key(i + 1, "host").c_str());
+    const std::string access = load_string(profile_key(i + 1, "acc").c_str());
+    const std::string name = load_string(profile_key(i + 1, "name").c_str());
+    const std::string model = load_string(profile_key(i + 1, "mdl").c_str());
+    const std::string cloud = load_string(profile_key(i + 1, "cld").c_str());
+    save_string(profile_key(i, "ser").c_str(), serial);
+    save_string(profile_key(i, "host").c_str(), host);
+    save_string(profile_key(i, "acc").c_str(), access);
+    save_string(profile_key(i, "name").c_str(), name);
+    save_string(profile_key(i, "mdl").c_str(), model);
+    save_string(profile_key(i, "cld").c_str(), cloud);
   }
   // Clear the last slot
   const uint8_t last = count - 1;

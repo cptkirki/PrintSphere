@@ -3059,6 +3059,9 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       }
       copy_text(&runtime.detail, "Printer offline");
       store_live_runtime(std::move(runtime), true);
+      if (printer_presence_callback_) {
+        printer_presence_callback_(false);
+      }
     } else if (event_type == "client.connected") {
       // Note: ha-bambulab resets to offline first before re-onlining, because a client.connected
       // may arrive without a preceding client.disconnected (e.g. after a reboot).  Reset sync
@@ -3078,6 +3081,9 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
         store_live_runtime(std::move(runtime), false);
       }
       request_initial_sync();
+      if (printer_presence_callback_) {
+        printer_presence_callback_(true);
+      }
     } else if (!event_type.empty()) {
       ESP_LOGD(kTag, "Cloud event: unknown event type '%s'", event_type.c_str());
     }
