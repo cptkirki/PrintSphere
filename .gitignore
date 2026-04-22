@@ -23,6 +23,14 @@ release/ota/*
 !release/ota/archive/
 release/ota/archive/*
 !release/ota/archive/printsphere_ota-v*.bin
+!release/beta/
+release/beta/*
+!release/beta/printsphere_full.bin
+!release/beta/printsphere_ota.bin
+!release/beta/archive/
+release/beta/archive/*
+!release/beta/archive/printsphere_full-v*.bin
+!release/beta/archive/printsphere_ota-v*.bin
 !release/debug/
 release/debug/*
 !release/debug/printsphere_full.bin
