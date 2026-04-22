@@ -42,9 +42,12 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 
 ## Flashing
 
-[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
-
+for the first use please use the Webflasher: https://cptkirki.github.io/PrintSphere/flash/
 For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere_ota.bin).
+
+### manual flashing:
+
+[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
 
 Versioned builds are archived in the `archive/` subfolder of each release directory.
 
