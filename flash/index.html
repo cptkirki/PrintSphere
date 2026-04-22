@@ -348,7 +348,7 @@
           <div class="mark" aria-hidden="true">PS</div>
           <div class="brand-text">
             <p class="brand-name">PrintSphere</p>
-            <p class="brand-subtitle">ESP32-S3 factory flasher</p>
+            <p class="brand-subtitle">USB setup for new devices</p>
           </div>
         </div>
         <a class="repo-link" href="https://github.com/cptkirki/PrintSphere">GitHub repository</a>
@@ -359,8 +359,8 @@
           <div class="tool">
             <h1 id="page-title">Factory Flash</h1>
             <p class="lead">
-              Install the merged PrintSphere image to a Waveshare ESP32-S3 AMOLED device
-              through the browser.
+              Prepare a new PrintSphere device directly from your browser. Connect it with a
+              USB data cable, choose the firmware, then start the install.
             </p>
 
             <div class="field">
@@ -385,8 +385,8 @@
 
             <p class="note" id="firmware-note"></p>
             <p class="note warning" id="beta-warning" hidden>
-              Beta and release-candidate builds are newer than stable, but may contain unfinished
-              changes.
+              Beta versions are newer, but they are meant for testing and may not be as reliable
+              as the stable version.
             </p>
 
             <div class="install-row">
@@ -397,7 +397,7 @@
                 <span slot="unsupported">Use Chrome or Edge on a desktop browser.</span>
                 <span slot="not-allowed">Open this page through HTTPS or localhost.</span>
               </esp-web-install-button>
-              <span class="support">USB data cable required</span>
+              <span class="support">Use Chrome or Edge with a USB data cable</span>
             </div>
           </div>
 
@@ -415,16 +415,16 @@
 
         <section class="details" aria-label="Flash details">
           <div class="detail">
-            <h2>Image</h2>
-            <p>Factory flashing uses full merged binaries that include bootloader and partitions.</p>
+            <h2>Install</h2>
+            <p>This writes everything the device needs for its first start.</p>
           </div>
           <div class="detail">
-            <h2>Target</h2>
-            <p>The manifest only advertises ESP32-S3 builds for the supported PrintSphere hardware.</p>
+            <h2>Device</h2>
+            <p>Use this for the Waveshare ESP32-S3 AMOLED hardware used by PrintSphere.</p>
           </div>
           <div class="detail">
-            <h2>After Flash</h2>
-            <p>The device starts its PrintSphere setup access point for Wi-Fi and printer setup.</p>
+            <h2>Next Step</h2>
+            <p>After installing, the device opens the PrintSphere setup Wi-Fi for configuration.</p>
           </div>
         </section>
       </main>
@@ -438,7 +438,7 @@
           version: "v1.5",
           path: "../release/initial/printsphere_full.bin",
           displayPath: "release/initial/printsphere_full.bin",
-          note: "Recommended for regular setup and first-time installs.",
+          note: "Recommended for normal setup. Choose this unless you were asked to test a beta.",
         },
         {
           label: "Beta v1.5.1-rc2",
@@ -446,7 +446,7 @@
           version: "v1.5.1-rc2",
           path: "../release/beta/archive/printsphere_full-v1.5.1-rc2.bin",
           displayPath: "release/beta/archive/printsphere_full-v1.5.1-rc2.bin",
-          note: "Newest beta factory image currently published in the repository.",
+          note: "Newest test version. Use this only if you want the latest fixes before stable.",
         },
         {
           label: "Beta v1.5.1-rc1 rotation fix",
@@ -454,7 +454,7 @@
           version: "v1.5.1-rc1_rotation-fix",
           path: "../release/beta/archive/printsphere_full-v1.5.1-rc1_rotation-fix.bin",
           displayPath: "release/beta/archive/printsphere_full-v1.5.1-rc1_rotation-fix.bin",
-          note: "Earlier v1.5.1 release candidate with rotation fixes.",
+          note: "Test version with rotation fixes before the latest release candidate.",
         },
         {
           label: "Beta v1.5.1-beta1",
@@ -462,7 +462,7 @@
           version: "v1.5.1-beta1",
           path: "../release/beta/archive/printsphere_full-v1.5.1-beta1.bin",
           displayPath: "release/beta/archive/printsphere_full-v1.5.1-beta1.bin",
-          note: "First v1.5.1 beta factory image.",
+          note: "Older test version from the v1.5.1 beta series.",
         },
       ];
 
