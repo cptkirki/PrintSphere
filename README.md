@@ -48,6 +48,14 @@ For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere
 
 Versioned builds are archived in the `archive/` subfolder of each release directory.
 
+### PrintSphere Web Installer
+
+`https://cptkirki.github.io/PrintSphere/flash/`
+
+- stable is selected by default
+- newer beta factory images are available from the firmware selector
+- Chrome or Edge with Web Serial support is required
+
 ### Web Flashers
 
 `web.esphome.io`

@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>PrintSphere Factory Flash</title>
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+    ></script>
+    <style>
+      :root {
+        --ink: #172021;
+        --muted: #5f6d6f;
+        --line: #cbd8d2;
+        --paper: #f6f2e8;
+        --surface: #ffffff;
+        --accent: #167c80;
+        --accent-dark: #0e5f62;
+        --warn: #8d4b18;
+        --ok: #2f6f46;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        background:
+          linear-gradient(180deg, rgba(246, 242, 232, 0.94), rgba(232, 240, 235, 0.96)),
+          #f6f2e8;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .page {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 28px 0 40px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .mark {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        place-items: center;
+        border: 1px solid rgba(22, 124, 128, 0.34);
+        border-radius: 50%;
+        background: #e0f0ec;
+        color: var(--accent-dark);
+        font-weight: 800;
+      }
+
+      .brand-text {
+        min-width: 0;
+      }
+
+      .brand-name {
+        margin: 0;
+        font-size: 1rem;
+        line-height: 1.2;
+        font-weight: 760;
+      }
+
+      .brand-subtitle {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .repo-link {
+        border-bottom: 1px solid currentColor;
+        color: var(--accent-dark);
+        font-size: 0.9rem;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.08fr) minmax(280px, 0.92fr);
+        gap: 34px;
+        align-items: stretch;
+      }
+
+      .tool {
+        align-self: center;
+        padding: 28px;
+        border: 1px solid rgba(23, 32, 33, 0.12);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.82);
+        box-shadow: 0 18px 54px rgba(26, 47, 43, 0.12);
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 720px;
+        font-size: 4.1rem;
+        line-height: 0.96;
+        letter-spacing: 0;
+      }
+
+      .lead {
+        max-width: 650px;
+        margin: 18px 0 24px;
+        color: #344244;
+        font-size: 1.04rem;
+        line-height: 1.6;
+      }
+
+      .field {
+        display: grid;
+        gap: 9px;
+        margin-bottom: 16px;
+      }
+
+      label {
+        color: #253133;
+        font-size: 0.83rem;
+        font-weight: 740;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      select {
+        width: 100%;
+        min-height: 48px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--ink);
+        font: inherit;
+        font-weight: 650;
+        padding: 0 42px 0 14px;
+      }
+
+      select:focus {
+        border-color: var(--accent);
+        outline: 3px solid rgba(22, 124, 128, 0.16);
+      }
+
+      .release-info {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin: 16px 0 22px;
+      }
+
+      .fact {
+        min-width: 0;
+        padding: 4px 12px;
+        border-left: 1px solid rgba(23, 32, 33, 0.16);
+      }
+
+      .fact span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.76rem;
+        font-weight: 720;
+        text-transform: uppercase;
+      }
+
+      .fact strong {
+        display: block;
+        overflow-wrap: anywhere;
+        margin-top: 4px;
+        font-size: 0.95rem;
+      }
+
+      .note {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 0.94rem;
+        line-height: 1.55;
+      }
+
+      .note.warning {
+        color: var(--warn);
+      }
+
+      .install-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 14px;
+      }
+
+      esp-web-install-button {
+        --esp-tools-button-color: var(--accent);
+        --esp-tools-button-text-color: #ffffff;
+        --esp-tools-button-border-radius: 6px;
+      }
+
+      .primary-button {
+        min-height: 48px;
+        border: 0;
+        border-radius: 6px;
+        background: var(--accent);
+        color: #ffffff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 780;
+        padding: 0 22px;
+      }
+
+      .primary-button:hover {
+        background: var(--accent-dark);
+      }
+
+      .support {
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .visual {
+        position: relative;
+        min-height: 520px;
+        overflow: hidden;
+        border-radius: 8px;
+        background: #1d2829;
+        box-shadow: 0 18px 54px rgba(26, 47, 43, 0.18);
+      }
+
+      .visual img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center;
+        filter: saturate(1.02) contrast(1.02);
+      }
+
+      .caption {
+        position: absolute;
+        left: 18px;
+        right: 18px;
+        bottom: 18px;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.28);
+        border-radius: 6px;
+        background: rgba(10, 20, 21, 0.7);
+        color: #ffffff;
+        font-size: 0.88rem;
+        backdrop-filter: blur(8px);
+      }
+
+      .caption strong,
+      .caption span {
+        overflow-wrap: anywhere;
+      }
+
+      .details {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin-top: 26px;
+      }
+
+      .detail {
+        padding: 18px;
+        border-top: 1px solid rgba(23, 32, 33, 0.16);
+      }
+
+      .detail h2 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+      }
+
+      .detail p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.93rem;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 860px) {
+        .hero {
+          grid-template-columns: 1fr;
+        }
+
+        .visual {
+          min-height: 320px;
+          order: -1;
+        }
+
+        .details,
+        .release-info {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .page {
+          width: min(100% - 22px, 1120px);
+          padding-top: 18px;
+        }
+
+        .topbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .tool {
+          padding: 20px;
+        }
+
+        h1 {
+          font-size: 2.45rem;
+        }
+
+        .caption {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <div class="brand" aria-label="PrintSphere">
+          <div class="mark" aria-hidden="true">PS</div>
+          <div class="brand-text">
+            <p class="brand-name">PrintSphere</p>
+            <p class="brand-subtitle">ESP32-S3 factory flasher</p>
+          </div>
+        </div>
+        <a class="repo-link" href="https://github.com/cptkirki/PrintSphere">GitHub repository</a>
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="page-title">
+          <div class="tool">
+            <h1 id="page-title">Factory Flash</h1>
+            <p class="lead">
+              Install the merged PrintSphere image to a Waveshare ESP32-S3 AMOLED device
+              through the browser.
+            </p>
+
+            <div class="field">
+              <label for="firmware-select">Firmware</label>
+              <select id="firmware-select" autocomplete="off"></select>
+            </div>
+
+            <div class="release-info" aria-live="polite">
+              <div class="fact">
+                <span>Channel</span>
+                <strong id="firmware-channel">Stable</strong>
+              </div>
+              <div class="fact">
+                <span>Version</span>
+                <strong id="firmware-version">v1.5</strong>
+              </div>
+              <div class="fact">
+                <span>Flash offset</span>
+                <strong>0x0</strong>
+              </div>
+            </div>
+
+            <p class="note" id="firmware-note"></p>
+            <p class="note warning" id="beta-warning" hidden>
+              Beta and release-candidate builds are newer than stable, but may contain unfinished
+              changes.
+            </p>
+
+            <div class="install-row">
+              <esp-web-install-button id="install-button">
+                <button class="primary-button" slot="activate" type="button">
+                  Install selected firmware
+                </button>
+                <span slot="unsupported">Use Chrome or Edge on a desktop browser.</span>
+                <span slot="not-allowed">Open this page through HTTPS or localhost.</span>
+              </esp-web-install-button>
+              <span class="support">USB data cable required</span>
+            </div>
+          </div>
+
+          <aside class="visual" aria-label="PrintSphere device">
+            <img
+              src="https://github.com/user-attachments/assets/820c2e9b-10a7-4430-949c-e8b0adc1357d"
+              alt="PrintSphere circular display device"
+            >
+            <div class="caption">
+              <strong id="caption-version">Stable v1.5</strong>
+              <span id="caption-path">release/initial/printsphere_full.bin</span>
+            </div>
+          </aside>
+        </section>
+
+        <section class="details" aria-label="Flash details">
+          <div class="detail">
+            <h2>Image</h2>
+            <p>Factory flashing uses full merged binaries that include bootloader and partitions.</p>
+          </div>
+          <div class="detail">
+            <h2>Target</h2>
+            <p>The manifest only advertises ESP32-S3 builds for the supported PrintSphere hardware.</p>
+          </div>
+          <div class="detail">
+            <h2>After Flash</h2>
+            <p>The device starts its PrintSphere setup access point for Wi-Fi and printer setup.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const firmwares = [
+        {
+          label: "Stable v1.5",
+          channel: "Stable",
+          version: "v1.5",
+          path: "../release/initial/printsphere_full.bin",
+          displayPath: "release/initial/printsphere_full.bin",
+          note: "Recommended for regular setup and first-time installs.",
+        },
+        {
+          label: "Beta v1.5.1-rc2",
+          channel: "Beta",
+          version: "v1.5.1-rc2",
+          path: "../release/beta/archive/printsphere_full-v1.5.1-rc2.bin",
+          displayPath: "release/beta/archive/printsphere_full-v1.5.1-rc2.bin",
+          note: "Newest beta factory image currently published in the repository.",
+        },
+        {
+          label: "Beta v1.5.1-rc1 rotation fix",
+          channel: "Beta",
+          version: "v1.5.1-rc1_rotation-fix",
+          path: "../release/beta/archive/printsphere_full-v1.5.1-rc1_rotation-fix.bin",
+          displayPath: "release/beta/archive/printsphere_full-v1.5.1-rc1_rotation-fix.bin",
+          note: "Earlier v1.5.1 release candidate with rotation fixes.",
+        },
+        {
+          label: "Beta v1.5.1-beta1",
+          channel: "Beta",
+          version: "v1.5.1-beta1",
+          path: "../release/beta/archive/printsphere_full-v1.5.1-beta1.bin",
+          displayPath: "release/beta/archive/printsphere_full-v1.5.1-beta1.bin",
+          note: "First v1.5.1 beta factory image.",
+        },
+      ];
+
+      const select = document.querySelector("#firmware-select");
+      const installButton = document.querySelector("#install-button");
+      const channel = document.querySelector("#firmware-channel");
+      const version = document.querySelector("#firmware-version");
+      const note = document.querySelector("#firmware-note");
+      const betaWarning = document.querySelector("#beta-warning");
+      const captionVersion = document.querySelector("#caption-version");
+      const captionPath = document.querySelector("#caption-path");
+      let manifestUrl = null;
+
+      function appendOptionGroup(label, entries) {
+        const group = document.createElement("optgroup");
+        group.label = label;
+        entries.forEach((firmware) => {
+          const option = document.createElement("option");
+          option.value = String(firmwares.indexOf(firmware));
+          option.textContent = firmware.label;
+          group.append(option);
+        });
+        select.append(group);
+      }
+
+      function manifestFor(firmware) {
+        const imageUrl = new URL(firmware.path, window.location.href).href;
+
+        return {
+          name: "PrintSphere",
+          version: firmware.version,
+          new_install_prompt_erase: true,
+          new_install_improv_wait_time: 0,
+          builds: [
+            {
+              chipFamily: "ESP32-S3",
+              improv: false,
+              parts: [{ path: imageUrl, offset: 0 }],
+            },
+          ],
+        };
+      }
+
+      function setManifest(firmware) {
+        if (manifestUrl) {
+          URL.revokeObjectURL(manifestUrl);
+        }
+
+        const manifest = JSON.stringify(manifestFor(firmware));
+        const blob = new Blob([manifest], { type: "application/json" });
+        manifestUrl = URL.createObjectURL(blob);
+        installButton.setAttribute("manifest", manifestUrl);
+      }
+
+      function updateSelection() {
+        const firmware = firmwares[Number(select.value)] || firmwares[0];
+        channel.textContent = firmware.channel;
+        version.textContent = firmware.version;
+        note.textContent = firmware.note;
+        betaWarning.hidden = firmware.channel !== "Beta";
+        captionVersion.textContent = `${firmware.channel} ${firmware.version}`;
+        captionPath.textContent = firmware.displayPath;
+        setManifest(firmware);
+      }
+
+      appendOptionGroup(
+        "Stable release",
+        firmwares.filter((firmware) => firmware.channel === "Stable"),
+      );
+      appendOptionGroup(
+        "Newer beta builds",
+        firmwares.filter((firmware) => firmware.channel === "Beta"),
+      );
+      select.value = "0";
+
+      updateSelection();
+      customElements.whenDefined("esp-web-install-button").then(updateSelection);
+      select.addEventListener("change", updateSelection);
+    </script>
+  </body>
+</html>
