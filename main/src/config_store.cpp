@@ -15,7 +15,7 @@ namespace printsphere {
 namespace {
 constexpr char kTag[] = "printsphere.cfg";
 constexpr char kNamespace[] = "printsphere";
-constexpr char kDeviceName[] = "PrintSphere";
+constexpr char kDeviceName[] = "bambustat";
 
 std::string color_to_html_hex(uint32_t color) {
   char buffer[8] = {};

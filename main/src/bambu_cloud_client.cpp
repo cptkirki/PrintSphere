@@ -2660,7 +2660,7 @@ bool BambuCloudClient::ensure_mqtt_client_started() {
     return true;
   }
 
-  mqtt_client_id_ = "printsphere-cloud-" + std::to_string(static_cast<unsigned int>(esp_random()));
+  mqtt_client_id_ = "bambustat-cloud-" + std::to_string(static_cast<unsigned int>(esp_random()));
   mqtt_report_topic_ = desired_report_topic;
   mqtt_request_topic_ = desired_request_topic;
 
@@ -4327,7 +4327,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
     }
     esp_http_client_set_header(client, "Accept", "image/png,image/*;q=0.9,*/*;q=0.1");
     esp_http_client_set_header(client, "Accept-Encoding", "identity");
-    esp_http_client_set_header(client, "User-Agent", "PrintSphere/1.0");
+    esp_http_client_set_header(client, "User-Agent", "bambustat/1.0");
 
     perform_err = esp_http_client_perform(client);
     status_code = esp_http_client_get_status_code(client);
@@ -4400,7 +4400,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
   if (range_client != nullptr) {
     esp_http_client_set_header(range_client, "Accept", "image/png,image/*;q=0.9,*/*;q=0.1");
     esp_http_client_set_header(range_client, "Accept-Encoding", "identity");
-    esp_http_client_set_header(range_client, "User-Agent", "PrintSphere/1.0");
+    esp_http_client_set_header(range_client, "User-Agent", "bambustat/1.0");
   }
 
   for (size_t offset = 0; !range_failed && range_client != nullptr && offset < kMaxPreviewBytes;
@@ -4494,7 +4494,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
 
   const std::string request =
       "GET " + parsed.target + " HTTP/1.1\r\nHost: " + parsed.host +
-      "\r\nUser-Agent: PrintSphere/1.0\r\nAccept: image/png,image/*;q=0.9,*/*;q=0.1\r\n"
+      "\r\nUser-Agent: bambustat/1.0\r\nAccept: image/png,image/*;q=0.9,*/*;q=0.1\r\n"
       "Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
   size_t written_total = 0;

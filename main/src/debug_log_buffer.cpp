@@ -237,7 +237,7 @@ void debug_log_init() {
     static const char banner[] =
         "\n"
         "===========================================\n"
-        "  PrintSphere Debug Log\n"
+        "  bambustat Debug Log\n"
         "  FW : " PRINTSPHERE_RELEASE_VERSION "\n"
         "  Built: " __DATE__ " " __TIME__ "\n"
         "===========================================\n"

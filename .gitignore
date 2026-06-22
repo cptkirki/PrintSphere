@@ -9,6 +9,13 @@ Official-hardware-examples/
 tools/*
 !tools/patches/
 !tools/patches/*.ps1
+!tools/patches/*.sh
+!tools/build_only.sh
+!tools/backup_device_state.sh
+!tools/flash_round_amoled.sh
+!tools/verify_round_amoled.sh
+!tools/restore_round_amoled_apps.sh
+!tools/run_round_amoled_flash_acceptance.sh
 !tools/package_initial_flash.py
 release/*
 !release/archive/

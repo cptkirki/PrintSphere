@@ -1255,6 +1255,11 @@ bool Ui::consume_portal_unlock_request() {
   return portal_unlock_requested_.exchange(false);
 }
 
+void Ui::simulate_portal_long_press() {
+  note_activity(true);
+  portal_unlock_requested_.store(true);
+}
+
 void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
                                  bool session_active, bool pin_active,
                                  const std::string& pin_code, uint32_t pin_remaining_s,
@@ -2655,7 +2660,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_scrollbar_mode(page0_card_list_, LV_SCROLLBAR_MODE_OFF);
 
   page0_empty_note_ = lv_label_create(page0_);
-  set_label_text_if_changed(page0_empty_note_, "No printers configured.\nUse the web portal to add printers.");
+  set_label_text_if_changed(page0_empty_note_, "No printers configured.\nUse bambustat Web Config to add printers.");
   lv_obj_set_width(page0_empty_note_, 320);
   lv_label_set_long_mode(page0_empty_note_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page0_empty_note_, LV_TEXT_ALIGN_CENTER, 0);

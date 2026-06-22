@@ -489,7 +489,7 @@ void log_heap_status(const char* context) {
 
 std::string make_client_id() {
   char buffer[48] = {};
-  std::snprintf(buffer, sizeof(buffer), "printsphere-%08" PRIx32 "%08" PRIx32,
+  std::snprintf(buffer, sizeof(buffer), "bambustat-%08" PRIx32 "%08" PRIx32,
                 esp_random(), esp_random());
   return buffer;
 }

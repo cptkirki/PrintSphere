@@ -10,7 +10,7 @@ from typing import Iterable
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Merge ESP-IDF flash artifacts into one initial-flash firmware.bin."
+        description="Merge ESP-IDF flash artifacts into one bambustat initial-flash image."
     )
     parser.add_argument(
         "--build-dir",
@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="release/initial/printsphere_full.bin",
+        default="release/initial/bambustat_full.bin",
         help="Output path for the merged firmware image",
     )
     parser.add_argument(
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ota-output",
-        default="release/ota/printsphere_ota.bin",
+        default="release/ota/bambustat_ota.bin",
         help="Output path for the OTA-flashable app-only firmware image",
     )
     parser.add_argument(
@@ -126,8 +126,8 @@ def main() -> int:
 
     # Resolve output paths: --debug and --beta both go to release/beta/
     if args.debug or args.beta:
-        output_path = Path("release/beta/printsphere_full.bin").resolve()
-        ota_output_path = Path("release/beta/printsphere_ota.bin").resolve()
+        output_path = Path("release/beta/bambustat_full.bin").resolve()
+        ota_output_path = Path("release/beta/bambustat_ota.bin").resolve()
     else:
         output_path = Path(args.output).resolve()
         ota_output_path = Path(args.ota_output).resolve()

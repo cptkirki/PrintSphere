@@ -50,6 +50,7 @@ class SetupPortal {
   static esp_err_t handle_root(httpd_req_t* request);
   static esp_err_t handle_favicon(httpd_req_t* request);
   static esp_err_t handle_health(httpd_req_t* request);
+  static esp_err_t handle_touch_simulate(httpd_req_t* request);
   static esp_err_t handle_unlock(httpd_req_t* request);
   static esp_err_t handle_wifi_scan(httpd_req_t* request);
   static esp_err_t handle_config_get(httpd_req_t* request);

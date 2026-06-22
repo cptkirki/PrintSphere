@@ -1,4 +1,8 @@
-# PrintSphere
+# bambustat Round AMOLED
+
+This branch ships the round AMOLED Bambu status display under the `bambustat`
+project name. `PrintSphere` remains the upstream/reference codebase and may
+still appear in legacy file paths, package names, and compatibility notes.
 
 Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch setup, hybrid cloud/local routing, and the current code paths for cover preview, camera snapshots, and battery-aware operation.
 
@@ -10,7 +14,7 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 
 ## Hardware And Stack
 
-- ESP-IDF `v5.5.x`
+- ESP-IDF `>= v6.0.0` (the component manifest requires `idf >=6.0.0`)
 - LVGL `v9.4.0`
 - Waveshare ESP32-S3 AMOLED 1.75
 - AXP2101 PMU integration via `XPowersLib`
@@ -43,11 +47,11 @@ Round ESP32-S3 printer companion for Bambu Lab with a circular display, touch se
 ## Flashing
 
 for the first use please use the Webflasher: https://cptkirki.github.io/PrintSphere/flash/
-For OTA updates, use [`release/ota/printsphere_ota.bin`](release/ota/printsphere_ota.bin).
+For OTA updates, use [`release/ota/bambustat_ota.bin`](release/ota/bambustat_ota.bin).
 
 ### manual flashing:
 
-[`release/initial/printsphere_full.bin`](release/initial/printsphere_full.bin) is the merged initial-flash image for empty devices.
+[`release/initial/bambustat_full.bin`](release/initial/bambustat_full.bin) is the merged initial-flash image for empty devices. The guarded local flash flow also keeps the current merged image at `release/firmware.bin`.
 
 Versioned builds are archived in the `archive/` subfolder of each release directory.
 
@@ -67,17 +71,17 @@ Versioned builds are archived in the `archive/` subfolder of each release direct
 - connect USB
 - choose the COM port
 - do not use "Prepare for first use"
-- install `printsphere_full.bin` directly
+- install `bambustat_full.bin` directly
 
 `espboards.dev`
 `https://www.espboards.dev/tools/program/`
 
-- write `printsphere_full.bin` to address `0x0`
+- write `bambustat_full.bin` to address `0x0`
 
 `esptool-js`
 `https://espressif.github.io/esptool-js/`
 
-- write `printsphere_full.bin` to address `0x0`
+- write `bambustat_full.bin` to address `0x0`
 
 The bootloader is already included in the merged image.
 
@@ -86,21 +90,33 @@ The bootloader is already included in the merged image.
 If you clone the repo and build it yourself:
 
 ```bash
+idf.py build
+```
+
+This branch also includes a no-flash helper for local verification:
+
+```bash
+./tools/build_only.sh
+```
+
+Only flash after you have an approved device migration plan:
+
+```bash
 idf.py -p PORT flash
 ```
 
 Alternatively, write the merged image directly with `esptool`:
 
 ```bash
-esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/initial/printsphere_full.bin
+esptool.exe --chip esp32s3 --port PORT write_flash 0x0 release/initial/bambustat_full.bin
 ```
 
 ## Setup Flow
 
-1. Flash [`printsphere_full.bin`](https://github.com/cptkirki/PrintSphere/blob/main/release/initial/printsphere_full.bin)
+1. Flash `bambustat_full.bin` or the guarded `release/firmware.bin` image built from this branch
 2. On first boot, the device starts a setup AP:
-   - SSID: `PrintSphere-Setup`
-   - password: `printsphere`
+   - SSID: `bambustat-Setup`
+   - password: `bambustat`
 3. Open `http://192.168.4.1` and save your home Wi-Fi.
 4. After the reboot, reopen Web Config on the device IP in your home network.
 5. During provisioning, Web Config stays open without a PIN until the selected source path is ready.
@@ -130,7 +146,7 @@ Cloud and local credentials can usually be applied live from Web Config without 
 ## Connection Modes
 
 - `Hybrid`:
-  Current default recommendation. PrintSphere tries to combine cloud and local data, picks the better active path at runtime, and still uses the local camera when available. Provisioning is considered complete once Wi-Fi is connected and either Cloud or Local is working.
+  Current default recommendation. bambustat tries to combine cloud and local data, picks the better active path at runtime, and still uses the local camera when available. Provisioning is considered complete once Wi-Fi is connected and either Cloud or Local is working.
 - `Cloud only`:
   Cloud monitoring and cover preview only. Local MQTT and the local camera page are disabled. Provisioning is complete once Wi-Fi and Bambu Cloud are connected.
 - `Local only`:
@@ -191,5 +207,3 @@ Arc colors are intended to preview live immediately and can be saved without res
 - local MQTT TLS now uses an embedded Bambu CA bundle
 - `Local only` works, but the broadest hands-on validation so far is still in `Hybrid` and `Cloud only`
 - most hands-on testing so far has been on `P1S` and `P1P`
-
-

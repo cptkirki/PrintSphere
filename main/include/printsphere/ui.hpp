@@ -56,6 +56,7 @@ class Ui {
   bool consume_chamber_light_toggle_request();
   bool has_chamber_light_toggle_request() const { return chamber_light_toggle_requested_.load(); }
   bool consume_portal_unlock_request();
+  void simulate_portal_long_press();
 
   struct PrinterCardInfo {
     uint8_t index = 0;

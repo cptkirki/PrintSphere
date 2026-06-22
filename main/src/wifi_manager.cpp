@@ -17,7 +17,7 @@ namespace printsphere {
 
 namespace {
 constexpr char kTag[] = "printsphere.wifi";
-constexpr char kSetupPassword[] = "printsphere";
+constexpr char kSetupPassword[] = "bambustat";
 constexpr char kSetupApIp[] = "192.168.4.1";
 constexpr uint8_t kSetupApRetryThreshold = 3;
 }  // namespace

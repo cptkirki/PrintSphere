@@ -176,7 +176,7 @@ Application::Application()
 
 void Application::run() {
   esp_log_level_set("mbedtls", ESP_LOG_WARN);
-  ESP_LOGI(kTag, "Bootstrapping native PrintSphere project");
+  ESP_LOGI(kTag, "Bootstrapping native bambustat project");
 
   ESP_ERROR_CHECK(config_store_.initialize());
   // Apply persisted timezone before any localtime_r() consumer (UI ETA,
