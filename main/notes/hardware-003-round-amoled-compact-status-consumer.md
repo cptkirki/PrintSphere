@@ -87,29 +87,46 @@ was modified in this slice.)
 auto-mode of that script picks the native ESP-IDF lane first, falling
 back to Docker (`espressif/idf:release-v6.0`).
 
-### Last command output
+### Last command output (2026-07-07, HARDWARE-003 build-acceptance run)
+
+Docker Desktop was started via `open -a Docker` and the daemon reached
+`docker info` READY before the build command was re-run. The daemon
+blocker from the prior run is resolved; the remaining blocker is the
+missing IDF image, which this work order forbids resolving with
+`--pull`.
 
 ```
 $ ./tools/build_only.sh
-Docker daemon is not running.
-$ echo $?
-127
+Missing Docker image: espressif/idf:release-v6.0
+Run again with --pull, or pull it explicitly after accepting the download cost.
+EXIT=127
+```
+
+Image cache check on the running daemon:
+
+```
+$ docker image inspect espressif/idf:release-v6.0   # -> not found
+$ docker images 'espressif/idf'                      # -> no cached tags
 ```
 
 ### Interpretation
 
 - `idf.py` is not on the host `PATH` (native ESP-IDF lane unavailable).
-- Docker is installed but the daemon is not running, so the script's
-  Docker fallback cannot pull the `espressif/idf:release-v6.0` image
-  either.
-- The script returned exit code `127` from the Docker lane and did
-  not write to flash, serial, `/dev/cu.*`, NVS, or any external
-  transport.
+- Docker daemon is now RUNNING (started this run), so the earlier
+  "Docker daemon is not running" blocker is cleared.
+- The required image `espressif/idf:release-v6.0` is not present in the
+  local Docker cache, and no `espressif/idf` tag is cached at all. The
+  script's Docker lane therefore returned exit code `127` with
+  `Missing Docker image`.
+- Completing the build would require `docker pull` / `--pull`, which the
+  HARDWARE-003 build-acceptance work order explicitly forbids.
+- The script did not write to flash, serial, `/dev/cu.*`, NVS, or any
+  external transport.
 
-This is the exact blocker the work order's Acceptance section
-explicitly permits: "if the build environment is unavailable, Claude
-records the exact blocker and the last command output in the
-evidence note."
+This is the exact allowed-blocker path the build-acceptance work order
+defines: "required Docker image is missing and would require `--pull`
+... Evidence note records exact command output and keeps status
+`implemented-awaiting-build-acceptance`."
 
 ### Local syntax-only check (host compiler)
 
