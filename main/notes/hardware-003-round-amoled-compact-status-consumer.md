@@ -1,6 +1,8 @@
 # HARDWARE-003 Round AMOLED Compact Status Consumer — Evidence
 
 Status: implemented-awaiting-codex-review
+Build verification status: blocked (Docker Hub `registry-1.docker.io`
+TLS-handshake outage, 2026-07-07 pull-and-build run, exit 1)
 Branch: `codex/round-amoled-printsphere`
 Worktree: `/Users/seanlee/Documents/printsphere-round-amoled`
 Owner: Claude Code (M3)
@@ -128,6 +130,87 @@ defines: "required Docker image is missing and would require `--pull`
 ... Evidence note records exact command output and keeps status
 `implemented-awaiting-build-acceptance`."
 
+### Last command output (2026-07-07 01:48 CST, HARDWARE-003 pull-and-build run)
+
+Follow-up work order `HARDWARE-003-round-amoled-pull-image-build-acceptance.md`
+explicitly authorizes a single `--pull` invocation. Pre-flight:
+
+```
+$ git branch --show-current
+codex/round-amoled-printsphere
+$ git status --short
+(empty — clean)
+$ command -v docker
+/usr/local/bin/docker
+$ docker info | grep Server Version
+ Server Version: 29.6.1     # daemon READY (started in prior run)
+$ docker image inspect espressif/idf:release-v6.0 >/dev/null 2>&1
+                                  # IMAGE_MISSING from local cache
+```
+
+`./tools/build_only.sh --pull` invocation (full transcript captured to
+`/tmp/hardware-003-pull-build.log`):
+
+```
+2026-07-06T17:48:57Z RUN_START
+Error response from daemon: failed to resolve reference
+"docker.io/espressif/idf:release-v6.0": failed to do request: Head
+"https://registry-1.docker.io/v2/espressif/idf/manifests/release-v6.0":
+Service Unavailable
+2026-07-06T17:49:02Z RUN_END exit=1
+```
+
+The build script exited `1` after the image pull failed; the rest of the
+script's pipeline (no native `idf.py`, so the docker lane was the only
+option) never executed.
+
+### Why the pull failed — registry backend diagnostics
+
+Layered evidence captured to `/tmp/hardware-003-registry-diag.log`
+(2026-07-07 01:48 CST):
+
+| Probe | Result | Interpretation |
+|---|---|---|
+| `docker info` | Server Version 29.6.1 | Docker daemon is RUNNING, API reachable |
+| `nslookup registry-1.docker.io` | resolves to `198.18.0.159` | DNS works |
+| `ping -c 2 -W 5 registry-1.docker.io` | 0% loss, avg 0.27 ms | ICMP / L3 reachability is fine |
+| `curl -v` to `https://registry-1.docker.io/v2/espressif/idf/manifests/release-v6.0` | `Connected to ... port 443`, then `SSL_connect: SSL_ERROR_SYSCALL in connection to registry-1.docker.io:443` → `Closing connection` | TCP succeeds (port 443), but the TLS handshake aborts |
+| `openssl s_client -connect registry-1.docker.io:443 -servername registry-1.docker.io` | `error:0A000126:SSL routines::unexpected eof while reading` after ClientHello | Server closes the TLS connection mid-handshake; "0 bytes read, 1558 bytes written" confirms server never finished the handshake |
+| Repeated `curl` 3x to the manifest URL | HTTP=000 t≈0.06s each (3/3) | Persistent, not transient; the registry frontend is not even returning a 5xx — it's hanging up at TLS |
+| `curl https://hub.docker.com/` | 200 | Other Docker Hub host works |
+| `curl https://registry.hub.docker.com/v2/` | 401 (expects auth) | Reachable, returns expected auth challenge |
+| `curl https://github.com/` | 200 | Non-Docker hosts unaffected |
+| `docker pull` (re-run via build script) | same `Service Unavailable` from daemon, exit 1 | Reproducible; not a transient flake |
+
+### Interpretation (pull-and-build run)
+
+- Network stack (DNS, ICMP, TCP/443) reaches `registry-1.docker.io`
+  without issue.
+- The TLS server at that endpoint accepts the TCP connection but then
+  abruptly closes the socket (`SSL_ERROR_SYSCALL` / `unexpected eof`)
+  before completing the handshake. Docker's daemon reports this as
+  `Service Unavailable`.
+- The same exact pattern reproduces 3/3 attempts with sub-second
+  timeouts, so it is not a transient retry candidate inside this run.
+- Other Docker Hub hosts (`hub.docker.com`, `registry.hub.docker.com`)
+  and unrelated public hosts (`github.com`, `anthropic.com`) are
+  unaffected, ruling out a Mac-side firewall / proxy / TLS-MITM.
+- This is therefore a **Docker Hub v2 registry backend outage**
+  affecting the `registry-1.docker.io` endpoint, not a local or branch
+  defect. There is no safe fix this work order can apply: the only
+  way to obtain the image is to wait for the registry to recover.
+- The pull run did not write to flash, serial, `/dev/cu.*`, NVS,
+  partitions, or any external transport. No source file was edited.
+  No alternate Docker image was pulled (the work order permits exactly
+  `./tools/build_only.sh --pull`'s normal `docker pull`).
+
+This matches the pull-build work order's `failure/blocker` clause:
+*"Pull fails due to network/provider/docker registry issue, ...
+Evidence note records exact command output and first concrete failure.
+This work order status becomes `blocked` or `implemented-awaiting-fix`
+as appropriate."* The correct status is `blocked` (third-party outage),
+not `implemented-awaiting-fix` (no code change is required).
+
 ### Local syntax-only check (host compiler)
 
 To provide additional evidence that the new source compiles cleanly
@@ -175,6 +258,7 @@ any field accessor.
 | Pre-existing HTTP helper not required | N/A — no fetch in this slice |
 | Match local ESP-IDF / C++ style | DONE — free functions in `printsphere` namespace, cJSON, cstdint, std::string, `-Wall -Wextra` clean |
 | `./tools/build_only.sh` runs | PARTIAL — script ran; environment blocker recorded above |
+| `./tools/build_only.sh --pull` runs (follow-up pull-and-build work order) | BLOCKED — Docker Hub `registry-1.docker.io` returned `Service Unavailable` with TLS-handshake EOF (3/3 reproducible); exit `1`. See "Last command output (2026-07-07 01:48 CST, HARDWARE-003 pull-and-build run)" above. |
 | Target branch remains `codex/round-amoled-printsphere` | DONE — `git branch --show-current` confirms |
 | `git status --short` shows only intended source/evidence changes | DONE — only the four paths in the Files Changed table |
 | Evidence note exists at `main/notes/hardware-003-...md` | DONE — this file |
