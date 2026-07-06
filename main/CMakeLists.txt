@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.cpp"
         "src/application.cpp"
+        "src/bambustat_compact_status.cpp"
         "src/bambu_status.cpp"
         "src/bambu_cloud_client.cpp"
         "src/config_store.cpp"
