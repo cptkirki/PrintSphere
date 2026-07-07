@@ -39,6 +39,69 @@ bool ci_key_equals(const char* key, const char* target) {
   return key[i] == '\0';
 }
 
+std::string normalize_key_name(const char* key) {
+  std::string normalized;
+  if (key == nullptr) {
+    return normalized;
+  }
+  for (const char* p = key; *p != '\0'; ++p) {
+    const char ch = *p == '-' ? '_' : *p;
+    normalized.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return normalized;
+}
+
+bool starts_with(const std::string& value, const char* prefix) {
+  const size_t len = std::strlen(prefix);
+  return value.size() >= len && value.compare(0, len, prefix) == 0;
+}
+
+bool ends_with(const std::string& value, const char* suffix) {
+  const size_t len = std::strlen(suffix);
+  return value.size() >= len &&
+         value.compare(value.size() - len, len, suffix) == 0;
+}
+
+bool matches_redaction_policy_family(const char* key) {
+  const std::string normalized = normalize_key_name(key);
+  if (normalized.empty()) {
+    return false;
+  }
+
+  if (normalized.find("token") != std::string::npos) {
+    return true;
+  }
+  if (normalized == "print" || normalized == "host" ||
+      normalized == "port") {
+    return true;
+  }
+  if (normalized == "nvs" || starts_with(normalized, "nvs_")) {
+    return true;
+  }
+  if (normalized == "customer" || starts_with(normalized, "customer_")) {
+    return true;
+  }
+  if (normalized == "order" || starts_with(normalized, "order_")) {
+    return true;
+  }
+  if (normalized == "quote" || starts_with(normalized, "quote_")) {
+    return true;
+  }
+  if (normalized == "cost" || normalized == "cost_basis" ||
+      ends_with(normalized, "_cost")) {
+    return true;
+  }
+  if (normalized.find("secret") != std::string::npos) {
+    return true;
+  }
+  if (normalized == "passwd" || normalized == "pwd") {
+    return true;
+  }
+
+  return false;
+}
+
 // Pull a string and copy it; returns true when the key was present and
 // parsed successfully (including the explicit-null JSON case).
 bool cjson_assign_string(const cJSON* node, std::string* out) {
@@ -149,7 +212,7 @@ bool bambustat_is_forbidden_payload_key(const char* key) {
       return true;
     }
   }
-  return false;
+  return matches_redaction_policy_family(key);
 }
 
 bool bambustat_is_hardware_safe_field(const char* key) {

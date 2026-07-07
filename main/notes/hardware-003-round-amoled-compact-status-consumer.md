@@ -62,11 +62,13 @@ was modified in this slice.)
   suppress rows for absent/null/empty values rather than rendering a
   misleading `0` or `false`.
 - **Forbidden payload key set** — `kBambustatForbiddenPayloadKeys[]`
-  unions the 14 keys from `contract.json:forbidden_payload_fields`
-  with the 31 redaction-policy denials from `main/notes/redaction-policy.md`
-  (F1..F14). Match is case-insensitive and dash-insensitive to stay
-  aligned with the policy's regex catalog (e.g. `Access-Code` matches
-  `access_code`).
+  includes the 14 keys from `contract.json:forbidden_payload_fields`
+  plus representative round-AMOLED redaction-policy keys. The
+  classifier also applies bounded family matching for policy patterns
+  such as token-family keys, `nvs_*`, customer/order/quote families,
+  cost families, host/port, and short password aliases. Matching is
+  case-insensitive and dash-insensitive to stay aligned with the
+  policy's key catalog (e.g. `Access-Code` matches `access_code`).
 - **Subtree walk** — `count_forbidden_in_subtree()` recursively scans
   objects and arrays so a forbidden key nested inside
   `ams_slot_summary` or anywhere else still contributes to the audit
@@ -253,7 +255,7 @@ any field accessor.
 |---|---|
 | Build a parser/mapper for PMD-007 into a round-AMOLED-safe struct | DONE — `BambustatCompactStatus`, header exposes exactly the 18 PMD-007 fields |
 | Include only hardware-safe display fields | DONE — mapper only reads from `kBambustatHardwareSafeFieldNames` |
-| Count and suppress forbidden keys (PMD-007 + redaction policy) | DONE — `suppressed_forbidden_keys` counts both lists |
+| Count and suppress forbidden keys (PMD-007 + redaction policy) | DONE — `suppressed_forbidden_keys` counts the PMD-007 deny-list plus bounded redaction-policy key families |
 | Keep read-only / parser-focused | DONE — no transport, no fetch, no storage |
 | Pre-existing HTTP helper not required | N/A — no fetch in this slice |
 | Match local ESP-IDF / C++ style | DONE — free functions in `printsphere` namespace, cJSON, cstdint, std::string, `-Wall -Wextra` clean |
@@ -288,13 +290,13 @@ human approval for the exact device, port, and command.
 
 ## Suggested Codex Review Notes
 
-- Confirm the union of forbidden keys in
-  `kBambustatForbiddenPayloadKeys[]` matches what
+- Confirm the forbidden-key classifier matches what
   `docs/bambustat-compact-status-contract.json` plus
   `main/notes/redaction-policy.md` together require. The 18 safe
-  fields are the full contract field set; the 45 forbidden keys cover
-  `forbidden_payload_fields` (14) + redaction-policy (31) without
-  overlap.
+  fields are the full contract field set; the 41 exact forbidden keys
+  do not overlap with safe fields, and family matching covers the
+  policy catalog's token, NVS, customer/order/quote, cost, host/port,
+  secret and password-alias key patterns.
 - Confirm the future integration slice (HARDWARE-004 family) will
   consume `BambustatCompactStatus` without needing changes here.
 - Re-run `./tools/build_only.sh --pull` when the docker daemon is
