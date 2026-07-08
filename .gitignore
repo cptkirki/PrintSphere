@@ -1,4 +1,5 @@
 build/
+build-docker/
 managed_components/
 sdkconfig
 sdkconfig.old

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${BAMBUSTAT_IDF_IMAGE:-${PRINTSPHERE_IDF_IMAGE:-espressif/idf:release-v6.0}}"
+DOCKER_BUILD_DIR="${BAMBUSTAT_DOCKER_BUILD_DIR:-build-docker}"
 MODE="auto"
 TARGET="build"
 PULL_IMAGE=0
@@ -22,6 +23,8 @@ Modes:
 Environment:
   BAMBUSTAT_IDF_IMAGE    Override Docker image tag.
   PRINTSPHERE_IDF_IMAGE  Legacy override for the same Docker image tag.
+  BAMBUSTAT_DOCKER_BUILD_DIR
+                          Docker build directory. Default: build-docker.
 
 This script never runs idf.py flash, esptool write_flash, or a serial monitor.
 USAGE
@@ -94,10 +97,11 @@ run_docker() {
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
     -e TARGET="$TARGET" \
+    -e DOCKER_BUILD_DIR="$DOCKER_BUILD_DIR" \
     -v "$ROOT":/project \
     -w /project \
     "$IMAGE" \
-    bash -lc 'idf.py reconfigure && if [[ -x tools/patches/apply_adapter_patches.sh ]]; then tools/patches/apply_adapter_patches.sh; fi && idf.py "$TARGET"'
+    bash -lc 'idf.py -B "$DOCKER_BUILD_DIR" reconfigure && if [[ -x tools/patches/apply_adapter_patches.sh ]]; then tools/patches/apply_adapter_patches.sh; fi && idf.py -B "$DOCKER_BUILD_DIR" "$TARGET"'
 }
 
 case "$MODE" in
