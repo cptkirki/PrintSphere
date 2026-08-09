@@ -126,7 +126,15 @@ void P1sCameraClient::configure(PrinterConnection connection) {
   }
   reconfigure_requested_.store(true);
 
+  // Keep the last decoded frame across reconfigure so the UI does not flash
+  // empty while the TLS session is rebuilt (common after a print finishes).
   P1sCameraSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot.frame_blob = snapshot_.frame_blob;
+    snapshot.width = snapshot_.width;
+    snapshot.height = snapshot_.height;
+  }
   snapshot.configured = configured;
   snapshot.enabled = false;
   snapshot.connected = false;
@@ -163,10 +171,26 @@ P1sCameraSnapshot P1sCameraClient::snapshot() const {
 }
 
 void P1sCameraClient::observe_printer_snapshot(const PrinterSnapshot& snapshot) {
-  std::lock_guard<std::mutex> lock(observed_mutex_);
-  observed_model_ = snapshot.local_model;
-  observed_rtsp_url_ = snapshot.camera_rtsp_url;
-  observed_signature_required_ = snapshot.local_mqtt_signature_required;
+  const bool now_live = snapshot.print_active ||
+                        snapshot.lifecycle == PrintLifecycleState::kPreparing ||
+                        snapshot.lifecycle == PrintLifecycleState::kPrinting ||
+                        snapshot.lifecycle == PrintLifecycleState::kPaused;
+  bool request_reconnect = false;
+  {
+    std::lock_guard<std::mutex> lock(observed_mutex_);
+    observed_model_ = snapshot.local_model;
+    observed_rtsp_url_ = snapshot.camera_rtsp_url;
+    observed_signature_required_ = snapshot.local_mqtt_signature_required;
+    // A1/P1 JPEG sockets often stall when a job ends; force a fresh TLS session.
+    if (observed_print_live_ && !now_live) {
+      request_reconnect = true;
+    }
+    observed_print_live_ = now_live;
+  }
+  if (request_reconnect) {
+    force_reconnect_.store(true);
+    refresh_requested_.store(true);
+  }
 }
 
 PrinterModel P1sCameraClient::observed_model() const {
@@ -394,23 +418,28 @@ bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint
 }
 
 bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
+  last_fetch_error_.clear();
   if (!connection.is_ready()) {
+    last_fetch_error_ = "Camera not configured";
     return false;
   }
 
   if (!ensure_connected(connection)) {
+    last_fetch_error_ = "Camera connect failed";
     return false;
   }
 
   for (int frame_index = 0; frame_index < 3; ++frame_index) {
     if (frame_index > 0 && !enabled_.load()) {
       ESP_LOGD(kTag, "Camera disabled mid-fetch, aborting");
+      last_fetch_error_ = "Camera off";
       return false;
     }
     uint8_t header[kFrameHeaderBytes] = {};
     if (!read_exact(tls_, header, sizeof(header))) {
       ESP_LOGW(kTag, "Camera frame header read failed");
       disconnect();
+      last_fetch_error_ = "Camera stream timed out";
       return false;
     }
 
@@ -422,6 +451,7 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
                static_cast<unsigned>(little_u32(header)), static_cast<unsigned>(frame_marker),
                static_cast<unsigned>(reserved0), static_cast<unsigned>(reserved1));
       disconnect();
+      last_fetch_error_ = "Camera stream invalid";
       return false;
     }
 
@@ -429,6 +459,7 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
     if (frame_size < 4U || frame_size > kMaxFrameBytes) {
       ESP_LOGW(kTag, "Camera frame size invalid: %u", static_cast<unsigned>(frame_size));
       disconnect();
+      last_fetch_error_ = "Camera stream invalid";
       return false;
     }
 
@@ -438,12 +469,14 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
     if (!read_exact(tls_, jpeg_frame->data(), jpeg_frame->size())) {
       ESP_LOGW(kTag, "Camera frame body read failed");
       disconnect();
+      last_fetch_error_ = "Camera stream timed out";
       return false;
     }
     log_blob_diag("camera jpeg frame buffer", jpeg_frame);
 
     if (!enabled_.load()) {
       ESP_LOGD(kTag, "Camera disabled before decode, dropping received frame");
+      last_fetch_error_ = "Camera off";
       return false;
     }
 
@@ -463,6 +496,7 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
 
     if (!enabled_.load()) {
       ESP_LOGD(kTag, "Camera disabled after decode, dropping frame");
+      last_fetch_error_ = "Camera off";
       return false;
     }
 
@@ -475,6 +509,8 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
   }
 
   ESP_LOGW(kTag, "No valid camera JPEG frame received");
+  disconnect();
+  last_fetch_error_ = "Camera image failed";
   return false;
 }
 
@@ -486,7 +522,16 @@ void P1sCameraClient::task_loop() {
       disconnect();
       refresh_requested_.store(false);
       idle_notified_ = false;
+      was_enabled_ = false;
+      consecutive_connect_failures_ = 0;
       last_fetch_us = 0;
+    }
+
+    if (force_reconnect_.exchange(false)) {
+      disconnect();
+      consecutive_connect_failures_ = 0;
+      last_fetch_us = 0;
+      idle_notified_ = false;
     }
 
     const PrinterConnection connection = desired_connection();
@@ -500,12 +545,25 @@ void P1sCameraClient::task_loop() {
     if (!network_ready_.load()) {
       disconnect();
       idle_notified_ = false;
+      was_enabled_ = false;
       set_status_snapshot(true, enabled_.load(), false, "Camera waiting for Wi-Fi");
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
-    if (!enabled_.load()) {
+    const bool enabled_now = enabled_.load();
+    if (enabled_now && !was_enabled_) {
+      // Rising edge: drop any stale TLS session left over from a print and
+      // fetch immediately (do not wait for the auto-refresh interval).
+      disconnect();
+      consecutive_connect_failures_ = 0;
+      last_fetch_us = 0;
+      refresh_requested_.store(true);
+      idle_notified_ = false;
+    }
+    was_enabled_ = enabled_now;
+
+    if (!enabled_now) {
       disconnect();
       if (!idle_notified_) {
         set_status_snapshot(true, false, false, has_cached_frame() ? "Tap for new image"
@@ -548,13 +606,16 @@ void P1sCameraClient::task_loop() {
     }
 
     const int64_t now_us = esp_timer_get_time();
-    const bool due = last_fetch_us != 0 && (now_us - last_fetch_us) >= kAutoRefreshIntervalUs;
+    // last_fetch_us == 0 means "fetch ASAP" (page open / reconnect / print end).
+    const bool due =
+        last_fetch_us == 0 || (now_us - last_fetch_us) >= kAutoRefreshIntervalUs;
     if (!refresh_requested_.exchange(false) && !due) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
-    set_status_snapshot(true, true, false, "Loading camera image");
+    set_status_snapshot(true, true, false,
+                        has_cached_frame() ? "Refreshing camera..." : "Loading camera image");
 
     const bool ok = fetch_frame_once(connection);
     last_fetch_us = esp_timer_get_time();
@@ -569,7 +630,11 @@ void P1sCameraClient::task_loop() {
           consecutive_connect_failures_ <= 2 ? 4000U :
           consecutive_connect_failures_ <= 4 ? 8000U :
           consecutive_connect_failures_ <= 6 ? 15000U : 30000U;
-      set_status_snapshot(true, enabled_.load(), false, "Camera image failed");
+      const char* detail = last_fetch_error_.empty() ? "Camera image failed"
+                                                     : last_fetch_error_.c_str();
+      // Keep the last good frame; only update the status line.
+      set_status_snapshot(true, enabled_.load(), false, detail);
+      disconnect();
       vTaskDelay(pdMS_TO_TICKS(backoff_ms));
     } else {
       consecutive_connect_failures_ = 0;

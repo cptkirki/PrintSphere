@@ -24,6 +24,8 @@
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #elif defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
 #include "bsp/esp32_s3_touch_lcd_2_8c.h"
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+#include "bsp/btt_knomi_v2.h"
 #else
 #error "Unknown PrintSphere hardware variant"
 #endif
@@ -45,33 +47,206 @@ namespace {
 constexpr char kTag[] = "printsphere.ui";
 constexpr size_t kImagePersistentReserveBytes = 20U * 1024U;
 constexpr int kDefaultBrightnessPercent = 80;
+
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+// Knomi 240x240 needs a dedicated compact layout — linear scaling from 466px
+// keeps large fonts and causes stacked/overlapping labels.
+constexpr int ui_px(int value) {
+  return (value * board::kDisplayWidth + 233) / 466;
+}
+constexpr int kRingStrokeWidth = 10;
+constexpr int kProgressY = -88;
+constexpr int kStatusY = -52;
+constexpr int kLogoY = 0;
+// Temps + remaining pulled up toward the progress ring / %-label.
+constexpr int kTempY = 0;
+// Slot must fit the unscaled mdi_40 layout box (line_height 36); scale is visual only.
+constexpr int32_t kMdiIconScale = 154;
+constexpr int kMdiIconSlotW = 36;
+constexpr int kMdiIconSlotH = 36;
+// Lift Montserrat text inside the tall icon slot so it matches the glyph center.
+constexpr int kMdiValuePadTop = 10;
+// Temp groups are flex rows so icon + value share one vertical center.
+constexpr int kNozzleTempGroupX = -70;
+constexpr int kBedTempGroupX = 70;
+constexpr int kNozzleIconX = -72;
+constexpr int kNozzleValueX = -40;
+constexpr int kBedIconX = 72;
+constexpr int kBedValueX = 40;
+constexpr int kLayerY = 40;
+constexpr int kRemainingRowY = 85;
+// Keep detail above the round-panel clip zone (center+102 was unreadable).
+constexpr int kDetailY = 58;
+// AP / MQTT / portal link copy uses the layer band until the printer is online.
+constexpr int kDetailSetupY = 40;
+constexpr int kBadgeSize = 44;
+constexpr int kLogoBadgeSize = 52;
+constexpr int kLogoScale = 100;
+constexpr int kTempValueWidth = 48;
+constexpr int kDetailWidth = 168;
+constexpr int kLayerRowWidth = 200;
+constexpr int kRemainingRowWidth = 160;
+#if CONFIG_PRINTSPHERE_EXPERIMENTAL_PRINT_CONTROL
+constexpr int kPage2PreviewSize = 110;
+constexpr int kPage2PreviewYOffset = -55;
+// Job-file title under cover (page2_subnote_).
+constexpr int kPage2JobTitleWithImageY = 40;
+constexpr int kPage2PrintButtonY = 88;
+#else
+constexpr int kPage2PreviewSize = 140;
+constexpr int kPage2PreviewYOffset = -8;
+constexpr int kPage2JobTitleWithImageY = 58;
+constexpr int kPage2PrintButtonY = 88;
+#endif
+constexpr int kPage2EmptyNoteY = -7;      // ui_px(-14) ≈ -7 on 240
+constexpr int kPage2EmptySubnoteY = 9;    // ui_px(18) ≈ 9
+// Fit inside the round 240 bezel with room for status/subnote labels.
+constexpr int kPage3CameraWidth = 200;
+constexpr int kPage3CameraHeight = 112;
+constexpr int kPage3CameraYOffset = 0;
+constexpr int kPage3StatusAboveImageY = -78;
+constexpr int kPage3SubnoteWithImageY = 78;
+constexpr int kPage3EmptySubnoteY = 28;  // below centered "Tap for new image"
+// AMS geometry (dedicated; keep inside round bezel / under progress ring).
+constexpr int kAmsShelfW = 168;
+constexpr int kAmsShelfH = 48;
+constexpr int kAmsShelfY = -22;
+constexpr int kAmsBaseW = 178;
+constexpr int kAmsBaseH = 44;
+constexpr int kAmsBaseY = 16;
+constexpr int kAmsTrayRowW = 182;
+constexpr int kAmsTrayRowY = -4;
+constexpr int kAmsTrayPadCol = 3;
+constexpr int kAmsTrayColW = 40;
+constexpr int kAmsPillW = 36;
+constexpr int kAmsPillH = 60;
+constexpr int kAmsPillRadius = 18;
+constexpr int kAmsTypeW = 32;
+constexpr int kAmsArrowW = 18;
+constexpr int kAmsArrowH = 12;
+constexpr int kAmsExtColW = 30;
+constexpr int kAmsExtRectW = 28;
+constexpr int kAmsExtRectH = 58;
+constexpr int kAmsExtTypeW = 24;
+constexpr int kAmsExtArrowW = 16;
+constexpr int kAmsExtArrowH = 10;
+constexpr int kAmsExtShiftX = 24;
+constexpr int kAmsExtColX = -78;
+constexpr int kAmsExtActiveShelfW = 138;
+constexpr int kAmsExtActiveShelfH = 42;
+constexpr int kAmsExtActiveShelfY = -26;
+constexpr int kAmsExtActiveBaseW = 148;
+constexpr int kAmsExtActiveBaseH = 38;
+constexpr int kAmsExtActiveBaseY = 10;
+constexpr int kAmsExtActiveRowW = 140;
+constexpr int kAmsExtActiveRowY = -14;
+constexpr int kAmsExtActiveColW = 30;
+constexpr int kAmsExtActivePillW = 28;
+constexpr int kAmsExtActivePillH = 46;
+constexpr int kAmsExtActivePillRadius = 14;
+constexpr int kAmsExtActiveTypeW = 24;
+constexpr int kAmsNoteW = 180;
+constexpr int kAmsHumY = 66;
+constexpr int kAmsUnitLabelY = 40;
+constexpr int kAuxTempRowY = -8;
+constexpr int kSwipeThresholdPx = 14;
+constexpr int kGestureAxisLockMarginPx = 10;
+constexpr int kBrightnessHorizontalTolerancePx = 12;
+constexpr int kRotatedVisualOffsetX = 0;
+constexpr int kRotatedVisualOffsetY = 0;
+constexpr int kManualMinBrightnessPercent = 4;
+constexpr uint8_t kRingPulseDepthPercent = 55U;
+constexpr int32_t kParallaxTitleMaxY = -8;
+constexpr int32_t kParallaxCardsMaxY = -4;
+constexpr uint32_t kBatteryDimTimeoutIdleMs = 20000U;
+constexpr uint32_t kBatteryOffTimeoutIdleMs = 60000U;
+constexpr uint32_t kBatteryDimTimeoutActiveMs = 30000U;
+constexpr uint32_t kBatteryOffTimeoutActiveMs = 120000U;
+constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint32_t kCardRevealDurationMs = 300U;
+constexpr int32_t kCardRevealYStart = 12;
+constexpr uint32_t kCardRevealStaggerMs = 55U;
+#else
+constexpr int ui_px(int value) { return value; }
 constexpr int kRingStrokeWidth = 22;
+constexpr int kProgressY = -178;
+constexpr int kStatusY = -86;
+constexpr int kLogoY = -7;
+constexpr int kTempY = -10;
+constexpr int kNozzleIconX = -182;
+constexpr int kNozzleValueX = -132;
+constexpr int kBedIconX = 182;
+constexpr int kBedValueX = 108;
+constexpr int kLayerY = 70;
 constexpr int kRemainingRowY = 172;
-// Page-2 preview cover layout. The compact layout (240 px cover, lifted up
-// to make room for two print-control buttons below) is only used when the
-// experimental print-control buttons are compiled in. The default build keeps
-// the original full-size cover layout (320 px, centered) to preserve the
-// look-and-feel of releases prior to v1.6-rc1.
+constexpr int kDetailY = 114;
+constexpr int kDetailSetupY = 70;
+constexpr int kBadgeSize = 86;
+constexpr int kLogoBadgeSize = 120;
+constexpr int kLogoScale = 183;
+constexpr int kTempValueWidth = 96;
+constexpr int kDetailWidth = 320;
+constexpr int kLayerRowWidth = 360;
+constexpr int kRemainingRowWidth = 280;
 #if CONFIG_PRINTSPHERE_EXPERIMENTAL_PRINT_CONTROL
 constexpr int kPage2PreviewSize = 240;
 constexpr int kPage2PreviewYOffset = -90;
-constexpr int kPage2NoteWithImageY = 56;
-constexpr int kPage2SubnoteWithImageY = 60;
+constexpr int kPage2JobTitleWithImageY = 56;
+constexpr int kPage2PrintButtonY = 110;
 #else
 constexpr int kPage2PreviewSize = 320;
 constexpr int kPage2PreviewYOffset = -12;
-constexpr int kPage2NoteWithImageY = 138;
-constexpr int kPage2SubnoteWithImageY = 188;
+constexpr int kPage2JobTitleWithImageY = 138;
+constexpr int kPage2PrintButtonY = 110;
 #endif
-constexpr int kPage3CameraWidth = 400;
+constexpr int kPage2EmptyNoteY = -14;
+constexpr int kPage2EmptySubnoteY = 18;
+constexpr int kPage3CameraWidth = board::kDisplayWidth;
 constexpr int kPage3CameraHeight = 224;
 constexpr int kPage3CameraYOffset = 0;
-constexpr int kPage3NoteWithImageY = 150;
-constexpr int kPage3SubnoteWithImageY = 182;
-// Status text shown above the camera JPEG when an image is loaded.
-// Image is 224 high and centered at y=0, so its top is ~y=-112; the
-// status sits above with comfortable breathing room.
 constexpr int kPage3StatusAboveImageY = -138;
+constexpr int kPage3SubnoteWithImageY = 150;
+constexpr int kPage3EmptySubnoteY = 28;
+constexpr int kAmsShelfW = 359;
+constexpr int kAmsShelfH = 110;
+constexpr int kAmsShelfY = -50;
+constexpr int kAmsBaseW = 385;
+constexpr int kAmsBaseH = 103;
+constexpr int kAmsBaseY = 35;
+constexpr int kAmsTrayRowW = 420;
+constexpr int kAmsTrayRowY = -13;
+constexpr int kAmsTrayPadCol = 6;
+constexpr int kAmsTrayColW = 76;
+constexpr int kAmsPillW = 72;
+constexpr int kAmsPillH = 140;
+constexpr int kAmsPillRadius = 40;
+constexpr int kAmsTypeW = 68;
+constexpr int kAmsArrowW = 40;
+constexpr int kAmsArrowH = 25;
+constexpr int kAmsExtColW = 56;
+constexpr int kAmsExtRectW = 52;
+constexpr int kAmsExtRectH = 108;
+constexpr int kAmsExtTypeW = 48;
+constexpr int kAmsExtArrowW = 35;
+constexpr int kAmsExtArrowH = 23;
+constexpr int kAmsExtShiftX = 38;
+constexpr int kAmsExtColX = -155;
+constexpr int kAmsExtActiveShelfW = 275;
+constexpr int kAmsExtActiveShelfH = 85;
+constexpr int kAmsExtActiveShelfY = -55;
+constexpr int kAmsExtActiveBaseW = 300;
+constexpr int kAmsExtActiveBaseH = 80;
+constexpr int kAmsExtActiveBaseY = 19;
+constexpr int kAmsExtActiveRowW = 310;
+constexpr int kAmsExtActiveRowY = -30;
+constexpr int kAmsExtActiveColW = 58;
+constexpr int kAmsExtActivePillW = 54;
+constexpr int kAmsExtActivePillH = 108;
+constexpr int kAmsExtActivePillRadius = 30;
+constexpr int kAmsExtActiveTypeW = 50;
+constexpr int kAmsNoteW = 280;
+constexpr int kAmsHumY = 135;
+constexpr int kAmsUnitLabelY = 60;
 constexpr int kAuxTempRowY = 28;
 constexpr int kSwipeThresholdPx = 24;
 constexpr int kGestureAxisLockMarginPx = 16;
@@ -90,6 +265,7 @@ constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
 constexpr uint32_t kCardRevealDurationMs = 300U;
 constexpr int32_t kCardRevealYStart = 28;
 constexpr uint32_t kCardRevealStaggerMs = 55U;
+#endif
 constexpr uint32_t kRingBaseDark = 0x101010;
 constexpr uint32_t kRingIdleSolid = 0x404040;
 constexpr char kDegreeC[] = "\xC2\xB0""C";
@@ -287,6 +463,31 @@ void apply_touch_rotation_flags(DisplayRotation rotation, bsp_display_cfg_t* cfg
         cfg->touch_flags.swap_xy = 0;
         cfg->touch_flags.mirror_x = 1;
         cfg->touch_flags.mirror_y = 1;
+        break;
+    }
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    // CST816S defaults match BTT firmware (no mirror at 0°).
+    switch (rotation) {
+      case DisplayRotation::k90:
+        cfg->touch_flags.swap_xy = 1;
+        cfg->touch_flags.mirror_x = 0;
+        cfg->touch_flags.mirror_y = 1;
+        break;
+      case DisplayRotation::k180:
+        cfg->touch_flags.swap_xy = 0;
+        cfg->touch_flags.mirror_x = 1;
+        cfg->touch_flags.mirror_y = 1;
+        break;
+      case DisplayRotation::k270:
+        cfg->touch_flags.swap_xy = 1;
+        cfg->touch_flags.mirror_x = 1;
+        cfg->touch_flags.mirror_y = 0;
+        break;
+      case DisplayRotation::k0:
+      default:
+        cfg->touch_flags.swap_xy = 0;
+        cfg->touch_flags.mirror_x = 0;
+        cfg->touch_flags.mirror_y = 0;
         break;
     }
 #else
@@ -1133,9 +1334,8 @@ std::string camera_subnote_text(const PrinterSnapshot& snapshot) {
     }
     return {};
   }
-  if (!snapshot.job_name.empty()) {
-    return snapshot.job_name;
-  }
+  // Empty / loading: never put the job filename here. On 240px it wraps into
+  // the centered "Tap for new image" / status note and covers it.
   return "Auto-refresh every 2s";
 }
 
@@ -1215,10 +1415,40 @@ bool should_show_logo(const PrinterSnapshot& snapshot) {
   }
 }
 
+// Layer / print metrics only make sense once MQTT (or cloud) reports online.
+bool printer_link_ready(const PrinterSnapshot& snapshot) {
+  return snapshot.connection == PrinterConnectionState::kOnline;
+}
+
 // Micro-interaction: uniform scale on card tap (256 = 100% in LVGL 9)
 void card_scale_exec_cb(void* obj, int32_t val) {
   lv_obj_set_style_transform_scale(static_cast<lv_obj_t*>(obj), val, 0);
 }
+
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+void apply_knomi_mdi_icon_scale(lv_obj_t* label) {
+  lv_obj_set_style_transform_pivot_x(label, LV_PCT(50), 0);
+  lv_obj_set_style_transform_pivot_y(label, LV_PCT(50), 0);
+  lv_obj_set_style_transform_scale(label, kMdiIconScale, 0);
+  lv_obj_add_flag(label, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+}
+
+// Fixed slot so scaled MDI glyphs share the same cross-axis center as Montserrat text.
+lv_obj_t* make_knomi_mdi_slot(lv_obj_t* parent) {
+  lv_obj_t* slot = lv_obj_create(parent);
+  make_transparent(slot);
+  lv_obj_set_size(slot, kMdiIconSlotW, kMdiIconSlotH);
+  lv_obj_set_style_pad_all(slot, 0, 0);
+  lv_obj_set_style_clip_corner(slot, false, 0);
+  lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(slot, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  // Keep the slot from clipping transformed children to its content area.
+  lv_obj_remove_flag(slot, LV_OBJ_FLAG_SCROLL_CHAIN);
+  return slot;
+}
+#else
+void apply_knomi_mdi_icon_scale(lv_obj_t* /*label*/) {}
+#endif
 
 // Cascading reveal: vertical slide-in per card
 void card_reveal_y_exec_cb(void* obj, int32_t val) {
@@ -1273,6 +1503,9 @@ esp_err_t Ui::initialize() {
       // buffering so the RGB driver can switch complete framebuffers instead of
       // showing LVGL's in-progress updates on screen.
       .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL,
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+      // GC9A01 SPI has no TE line; partial buffers via adapter NONE mode.
+      .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
 #else
       // AMOLED 1.75 (CO5300 QSPI) has a TE line: TE_SYNC + single PSRAM buffer
       // is the validated combo (see April 2026 notes). DOUBLE_FULL is rejected
@@ -1577,12 +1810,19 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
   for (const auto& info : cards) {
     // Card container — glasmorphism-lite: semi-transparent bg + shadow elevation
     lv_obj_t* card = lv_obj_create(page0_card_list_);
-    lv_obj_set_size(card, 340, LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(card, 72, 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_size(card, 180, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, 44, 0);
+    lv_obj_set_style_pad_all(card, 6, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+#else
+    lv_obj_set_size(card, ui_px(340), LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(card, ui_px(72), 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+#endif
     lv_obj_set_style_bg_color(card, lv_color_hex(0x1E1E1E), 0);
     lv_obj_set_style_bg_opa(card, 195, 0);
-    lv_obj_set_style_radius(card, 16, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
     lv_obj_set_style_pad_row(card, 2, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     // Shadow for 3D depth on OLED
@@ -1618,7 +1858,10 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
     lv_obj_t* name_lbl = lv_label_create(card);
     const std::string display_name = info.name.empty() ? info.model : info.name;
     set_label_text_if_changed(name_lbl, display_name);
-    lv_obj_set_width(name_lbl, 300);
+    lv_obj_set_width(name_lbl, ui_px(300));
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_width(name_lbl, 150);
+#endif
     lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(name_lbl, font_name, 0);
     lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xFFFFFF), 0);
@@ -1627,7 +1870,7 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
     // Model
     lv_obj_t* model_lbl = lv_label_create(card);
     set_label_text_if_changed(model_lbl, info.model.empty() ? "Unknown" : info.model);
-    lv_obj_set_width(model_lbl, 300);
+    lv_obj_set_width(model_lbl, ui_px(300));
     lv_label_set_long_mode(model_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(model_lbl, font_detail, 0);
     lv_obj_set_style_text_color(model_lbl, lv_color_hex(0x888888), 0);
@@ -1636,7 +1879,7 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
     // Host IP
     lv_obj_t* host_lbl = lv_label_create(card);
     set_label_text_if_changed(host_lbl, info.host.empty() ? "No local IP" : info.host);
-    lv_obj_set_width(host_lbl, 300);
+    lv_obj_set_width(host_lbl, ui_px(300));
     lv_label_set_long_mode(host_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(host_lbl, font_detail, 0);
     lv_obj_set_style_text_color(host_lbl, lv_color_hex(0x666666), 0);
@@ -1939,28 +2182,34 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
   detail_visible_ = !detail.empty();
   if (detail_visible_) {
-    // Scroll long error / HMS messages so the full TSV-resolved text is
-    // readable on the narrow label.  Warnings (HMS codes without `has_error`)
-    // also scroll: the user otherwise only sees a wrapped/truncated bare
-    // code where the lookup text would not fit on a single line.
+    // Scroll long HMS/error text and long job filenames so they stay readable
+    // on the narrow detail label. Portal/setup copy keeps WRAP so IPs/URLs
+    // remain fully visible on multiple lines.
     const bool has_hms_or_error = snapshot.has_error ||
                                   snapshot.print_error_code != 0 ||
                                   !snapshot.hms_codes.empty() ||
                                   snapshot.hms_alert_count > 0;
-    // LVGL's circular-scroll long mode triggers continuous widget invalidation
-    // for the running marquee animation. That work happens regardless of the
-    // detail label being on screen, so on the AMS / preview pages it just
-    // burns LVGL-lock time. Only enable scrolling when the main page is
-    // actually settled in front of the user — every other state falls back
-    // to the cheaper LV_LABEL_LONG_WRAP, which renders once and is silent.
+    const bool is_job_filename =
+        !snapshot.job_name.empty() && detail == snapshot.job_name;
+    // Circular-scroll permanently invalidates the label; only enable it when
+    // the main status page is settled in front of the user.
     const bool main_page_visible = !scrolling_ && active_page_ == kPageIdxMain;
     const lv_label_long_mode_t desired_mode =
-        (has_hms_or_error && main_page_visible) ? LV_LABEL_LONG_SCROLL_CIRCULAR
-                                                 : LV_LABEL_LONG_WRAP;
+        (main_page_visible && (has_hms_or_error || is_job_filename))
+            ? LV_LABEL_LONG_SCROLL_CIRCULAR
+            : LV_LABEL_LONG_WRAP;
     if (lv_label_get_long_mode(detail_label_) != desired_mode) {
       lv_label_set_long_mode(detail_label_, desired_mode);
     }
     set_label_text_if_changed(detail_label_, detail);
+  }
+  // AP / MQTT / portal messages sit higher and reclaim the Layer row until linked.
+  {
+    const int detail_y = printer_link_ready(snapshot) ? kDetailY : kDetailSetupY;
+    lv_obj_align(detail_label_, LV_ALIGN_CENTER, 0, detail_y);
+    if (portal_hint_label_ != nullptr) {
+      lv_obj_align(portal_hint_label_, LV_ALIGN_CENTER, 0, detail_y);
+    }
   }
 
   const std::string layer = layer_text(snapshot);
@@ -1974,10 +2223,15 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   // (renders as "human-male-board" instead of a spool). Keep it hidden until
   // the font is regenerated with the correct codepoint mapping.
   set_hidden(filament_icon_label_, true);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  // Filament grams next to layer overflows the 240px row — drop on Knomi.
+  set_hidden(filament_value_label_, true);
+#else
   set_hidden(filament_value_label_, !has_filament_estimate);
   if (has_filament_estimate) {
     set_label_text_if_changed(filament_value_label_, filament);
   }
+#endif
 
   const std::string remaining = show_eta_ ? eta_text(snapshot) : remaining_text(snapshot);
   set_label_text_if_changed(remaining_label_, remaining);
@@ -2096,33 +2350,41 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   const bool has_page2_image = has_preview_image;
   preview_image_visible_ = has_page2_image;
 
-  if (preview_text_image_mode_ != has_page2_image) {
-    if (has_page2_image) {
-      // Note is hidden when cover is loaded; subnote (title) moves to former note position.
-      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2NoteWithImageY);
-    } else {
-      lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, -14);
-      lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 18);
-    }
-    preview_text_image_mode_ = has_page2_image;
+  // Layout from cover blob presence (not only successful decode on this page).
+  // Always re-apply align so kPage2JobTitleWithImageY edits take effect immediately.
+  const bool cover_layout =
+      snapshot.preview_blob && !snapshot.preview_blob->empty();
+  if (cover_layout) {
+    // Job name / title under the cover image.
+    lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2JobTitleWithImageY);
+  } else {
+    lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, kPage2EmptyNoteY);
+    lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2EmptySubnoteY);
   }
+  preview_text_image_mode_ = cover_layout;
   set_hidden(page2_note_, preview_note.empty());
   if (!preview_note.empty()) {
     set_label_text_if_changed(page2_note_, preview_note);
   }
   set_hidden(page2_subnote_, preview_subnote.empty());
-  if (!preview_subnote.empty()) {
-    set_label_text_if_changed(page2_subnote_, preview_subnote);
-  }
-  // Avoid LV_LABEL_LONG_SCROLL_CIRCULAR here. It is a permanent LVGL animation
-  // and on the preview page it competes with large image redraws under the
-  // display lock. Use a static dotted title instead.
+  // Long job filenames (.3mf / .stl) scroll when the preview page is settled.
+  // Off-page / while swiping: fall back to DOT/WRAP so the marquee animation
+  // does not keep invalidating under the display lock (same pattern as HMS).
   {
-    const bool image_title = active_page_ == kPageIdxPreview && has_page2_image;
-    const lv_label_long_mode_t desired = image_title ? LV_LABEL_LONG_DOT : LV_LABEL_LONG_WRAP;
+    const bool preview_page_visible = !scrolling_ && active_page_ == kPageIdxPreview;
+    const bool image_title = cover_layout && !preview_subnote.empty();
+    lv_label_long_mode_t desired = LV_LABEL_LONG_WRAP;
+    if (image_title && preview_page_visible) {
+      desired = LV_LABEL_LONG_SCROLL_CIRCULAR;
+    } else if (image_title) {
+      desired = LV_LABEL_LONG_DOT;
+    }
     if (lv_label_get_long_mode(page2_subnote_) != desired) {
       lv_label_set_long_mode(page2_subnote_, desired);
     }
+  }
+  if (!preview_subnote.empty()) {
+    set_label_text_if_changed(page2_subnote_, preview_subnote);
   }
 
   update_print_buttons_locked(snapshot);
@@ -2184,17 +2446,15 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
   camera_image_visible_ = has_camera_image;
 
-  if (camera_text_image_mode_ != has_camera_image) {
-    if (has_camera_image) {
-      // Status note moves above the image; layer/subnote sits below.
-      lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, kPage3StatusAboveImageY);
-      lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3NoteWithImageY);
-    } else {
-      lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, 0);
-      lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, 28);
-    }
-    camera_text_image_mode_ = has_camera_image;
+  if (has_camera_image) {
+    // Status note moves above the image; layer/subnote sits below.
+    lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, kPage3StatusAboveImageY);
+    lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3SubnoteWithImageY);
+  } else {
+    lv_obj_align(page3_note_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3EmptySubnoteY);
   }
+  camera_text_image_mode_ = has_camera_image;
   set_hidden(page3_note_, camera_note.empty());
   if (!camera_note.empty()) {
     set_label_text_if_changed(page3_note_, camera_note);
@@ -2205,8 +2465,14 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     // "Layer: X / Y", fall back to the regular small font otherwise.
     const bool subnote_is_layer =
         has_camera_image && (snapshot.total_layers > 0 || snapshot.current_layer > 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_style_text_font(page3_subnote_,
+                               subnote_is_layer ? &lv_font_montserrat_14 : &lv_font_montserrat_12,
+                               0);
+#else
     lv_obj_set_style_text_font(page3_subnote_,
                                subnote_is_layer ? &dosis_32 : &lv_font_montserrat_20, 0);
+#endif
     set_label_text_if_changed(page3_subnote_, camera_subnote);
   }
 
@@ -2273,15 +2539,19 @@ void Ui::build_ams_page(int unit_idx) {
   char unit_label_buf[16];
   std::snprintf(unit_label_buf, sizeof(unit_label_buf), "AMS %d", unit_idx + 1);
   set_label_text_if_changed(ams_unit_label_[unit_idx], unit_label_buf);
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_text_font(ams_unit_label_[unit_idx], &dosis_20, 0);
+#else
   lv_obj_set_style_text_font(ams_unit_label_[unit_idx], &dosis_32, 0);
+#endif
   lv_obj_set_style_text_color(ams_unit_label_[unit_idx], lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_style_text_align(ams_unit_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(ams_unit_label_[unit_idx], LV_ALIGN_TOP_MID, 0, 60);
+  lv_obj_align(ams_unit_label_[unit_idx], LV_ALIGN_TOP_MID, 0, kAmsUnitLabelY);
   lv_obj_add_flag(ams_unit_label_[unit_idx], LV_OBJ_FLAG_HIDDEN);
 
   // Gray shelf background (behind upper half of pills)
   ams_shelf_[unit_idx] = lv_obj_create(page);
-  lv_obj_set_size(ams_shelf_[unit_idx], 359, 110);
+  lv_obj_set_size(ams_shelf_[unit_idx], kAmsShelfW, kAmsShelfH);
   lv_obj_set_style_radius(ams_shelf_[unit_idx], 20, 0);
   lv_obj_set_style_bg_color(ams_shelf_[unit_idx], lv_color_hex(0x565656), 0);
   lv_obj_set_style_bg_opa(ams_shelf_[unit_idx], LV_OPA_COVER, 0);
@@ -2290,14 +2560,14 @@ void Ui::build_ams_page(int unit_idx) {
   lv_obj_set_style_border_opa(ams_shelf_[unit_idx], LV_OPA_COVER, 0);
   lv_obj_set_style_border_side(ams_shelf_[unit_idx],
       static_cast<lv_border_side_t>(LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT), 0);
-  lv_obj_align(ams_shelf_[unit_idx], LV_ALIGN_CENTER, 0, -50);
+  lv_obj_align(ams_shelf_[unit_idx], LV_ALIGN_CENTER, 0, kAmsShelfY);
   lv_obj_clear_flag(ams_shelf_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(ams_shelf_[unit_idx], LV_OBJ_FLAG_CLICKABLE);
   enable_touch_bubble(ams_shelf_[unit_idx]);
 
   // Dark base behind lower half of pills
   ams_base_[unit_idx] = lv_obj_create(page);
-  lv_obj_set_size(ams_base_[unit_idx], 385, 103);
+  lv_obj_set_size(ams_base_[unit_idx], kAmsBaseW, kAmsBaseH);
   lv_obj_set_style_radius(ams_base_[unit_idx], 0, 0);
   lv_obj_set_style_bg_color(ams_base_[unit_idx], lv_color_hex(0x1F1F1F), 0);
   lv_obj_set_style_bg_opa(ams_base_[unit_idx], LV_OPA_COVER, 0);
@@ -2305,25 +2575,25 @@ void Ui::build_ams_page(int unit_idx) {
   lv_obj_set_style_border_color(ams_base_[unit_idx], lv_color_hex(0x888888), 0);
   lv_obj_set_style_border_opa(ams_base_[unit_idx], LV_OPA_COVER, 0);
   lv_obj_set_style_border_side(ams_base_[unit_idx], LV_BORDER_SIDE_FULL, 0);
-  lv_obj_align(ams_base_[unit_idx], LV_ALIGN_CENTER, 0, 35);
+  lv_obj_align(ams_base_[unit_idx], LV_ALIGN_CENTER, 0, kAmsBaseY);
   lv_obj_clear_flag(ams_base_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(ams_base_[unit_idx], LV_OBJ_FLAG_CLICKABLE);
   enable_touch_bubble(ams_base_[unit_idx]);
 
   ams_tray_row_[unit_idx] = lv_obj_create(page);
-  lv_obj_set_size(ams_tray_row_[unit_idx], 420, LV_SIZE_CONTENT);
+  lv_obj_set_size(ams_tray_row_[unit_idx], kAmsTrayRowW, LV_SIZE_CONTENT);
   make_transparent(ams_tray_row_[unit_idx]);
   lv_obj_set_flex_flow(ams_tray_row_[unit_idx], LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(ams_tray_row_[unit_idx], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
                         LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(ams_tray_row_[unit_idx], 6, 0);
-  lv_obj_align(ams_tray_row_[unit_idx], LV_ALIGN_CENTER, 0, -13);
+  lv_obj_set_style_pad_column(ams_tray_row_[unit_idx], kAmsTrayPadCol, 0);
+  lv_obj_align(ams_tray_row_[unit_idx], LV_ALIGN_CENTER, 0, kAmsTrayRowY);
   lv_obj_clear_flag(ams_tray_row_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
   enable_touch_bubble(ams_tray_row_[unit_idx]);
 
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     ams_tray_col_[unit_idx][i] = lv_obj_create(ams_tray_row_[unit_idx]);
-    lv_obj_set_size(ams_tray_col_[unit_idx][i], 76, LV_SIZE_CONTENT);
+    lv_obj_set_size(ams_tray_col_[unit_idx][i], kAmsTrayColW, LV_SIZE_CONTENT);
     make_transparent(ams_tray_col_[unit_idx][i]);
     lv_obj_set_flex_flow(ams_tray_col_[unit_idx][i], LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(ams_tray_col_[unit_idx][i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
@@ -2333,8 +2603,8 @@ void Ui::build_ams_page(int unit_idx) {
     lv_obj_clear_flag(ams_tray_col_[unit_idx][i], LV_OBJ_FLAG_SCROLLABLE);
 
     ams_tray_rect_[unit_idx][i] = lv_obj_create(ams_tray_col_[unit_idx][i]);
-    lv_obj_set_size(ams_tray_rect_[unit_idx][i], 72, 140);
-    lv_obj_set_style_radius(ams_tray_rect_[unit_idx][i], 40, 0);
+    lv_obj_set_size(ams_tray_rect_[unit_idx][i], kAmsPillW, kAmsPillH);
+    lv_obj_set_style_radius(ams_tray_rect_[unit_idx][i], kAmsPillRadius, 0);
     lv_obj_set_style_bg_color(ams_tray_rect_[unit_idx][i], lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_opa(ams_tray_rect_[unit_idx][i], LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(ams_tray_rect_[unit_idx][i], 1, 0);
@@ -2351,15 +2621,19 @@ void Ui::build_ams_page(int unit_idx) {
 
     ams_tray_type_[unit_idx][i] = lv_label_create(ams_tray_rect_[unit_idx][i]);
     set_label_text_if_changed(ams_tray_type_[unit_idx][i], "--");
-    lv_obj_set_width(ams_tray_type_[unit_idx][i], 68);
+    lv_obj_set_width(ams_tray_type_[unit_idx][i], kAmsTypeW);
     lv_label_set_long_mode(ams_tray_type_[unit_idx][i], LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(ams_tray_type_[unit_idx][i], LV_TEXT_ALIGN_CENTER, 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_style_text_font(ams_tray_type_[unit_idx][i], &lv_font_montserrat_12, 0);
+#else
     lv_obj_set_style_text_font(ams_tray_type_[unit_idx][i], &dosis_20, 0);
+#endif
     lv_obj_set_style_text_color(ams_tray_type_[unit_idx][i], lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(ams_tray_type_[unit_idx][i], LV_ALIGN_TOP_MID, 0, 10);
 
     ams_tray_fill_[unit_idx][i] = lv_obj_create(ams_tray_rect_[unit_idx][i]);
-    lv_obj_set_size(ams_tray_fill_[unit_idx][i], 72, 0);
+    lv_obj_set_size(ams_tray_fill_[unit_idx][i], kAmsPillW, 0);
     lv_obj_set_style_radius(ams_tray_fill_[unit_idx][i], 0, 0);
     lv_obj_set_style_bg_color(ams_tray_fill_[unit_idx][i], lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ams_tray_fill_[unit_idx][i], LV_OPA_40, 0);
@@ -2370,7 +2644,7 @@ void Ui::build_ams_page(int unit_idx) {
     lv_obj_add_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
 
     ams_tray_arrow_[unit_idx][i] = lv_obj_create(ams_tray_col_[unit_idx][i]);
-    lv_obj_set_size(ams_tray_arrow_[unit_idx][i], 40, 25);
+    lv_obj_set_size(ams_tray_arrow_[unit_idx][i], kAmsArrowW, kAmsArrowH);
     make_transparent(ams_tray_arrow_[unit_idx][i]);
     // bg_color carries the triangle color; bg_opa stays 0 so the OBJ background
     // is invisible and only the triangle drawn in ams_arrow_draw_cb is visible.
@@ -2385,7 +2659,11 @@ void Ui::build_ams_page(int unit_idx) {
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     ams_tray_pct_[unit_idx][i] = lv_label_create(page);
     set_label_text_if_changed(ams_tray_pct_[unit_idx][i], "");
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_style_text_font(ams_tray_pct_[unit_idx][i], &lv_font_montserrat_12, 0);
+#else
     lv_obj_set_style_text_font(ams_tray_pct_[unit_idx][i], &lv_font_montserrat_20, 0);
+#endif
     lv_obj_set_style_text_color(ams_tray_pct_[unit_idx][i], lv_color_hex(0xFFFFFF), 0);
     lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -2393,22 +2671,39 @@ void Ui::build_ams_page(int unit_idx) {
 
   // Humidity pill
   lv_obj_t* hum_pill = lv_obj_create(page);
-  lv_obj_set_size(hum_pill, 139, 50);
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_size(hum_pill, LV_SIZE_CONTENT, 26);
+  lv_obj_set_style_pad_hor(hum_pill, 12, 0);
+  lv_obj_set_style_pad_ver(hum_pill, 0, 0);
+#else
+  lv_obj_set_size(hum_pill, ui_px(139), ui_px(50));
+  lv_obj_set_style_pad_all(hum_pill, 0, 0);
+#endif
   lv_obj_set_style_radius(hum_pill, 25, 0);
   lv_obj_set_style_bg_opa(hum_pill, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_color(hum_pill, lv_color_hex(0x9B9B9B), 0);
   lv_obj_set_style_border_opa(hum_pill, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(hum_pill, 1, 0);
-  lv_obj_set_style_pad_all(hum_pill, 0, 0);
-  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 135);
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_clip_corner(hum_pill, true, 0);
+#endif
+  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, kAmsHumY);
   lv_obj_clear_flag(hum_pill, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(hum_pill, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(hum_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_pad_column(hum_pill, 4, 0);
+#else
   lv_obj_set_style_pad_column(hum_pill, 8, 0);
+#endif
 
   ams_humidity_drop_[unit_idx] = lv_obj_create(hum_pill);
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_size(ams_humidity_drop_[unit_idx], 10, 10);
+#else
   lv_obj_set_size(ams_humidity_drop_[unit_idx], 14, 14);
+#endif
   lv_obj_set_style_radius(ams_humidity_drop_[unit_idx], LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(ams_humidity_drop_[unit_idx], lv_color_hex(0x4A90D9), 0);
   lv_obj_set_style_bg_opa(ams_humidity_drop_[unit_idx], LV_OPA_COVER, 0);
@@ -2418,20 +2713,28 @@ void Ui::build_ams_page(int unit_idx) {
 
   ams_humidity_label_[unit_idx] = lv_label_create(hum_pill);
   set_label_text_if_changed(ams_humidity_label_[unit_idx], "--");
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_text_font(ams_humidity_label_[unit_idx], &lv_font_montserrat_12, 0);
+#else
   lv_obj_set_style_text_font(ams_humidity_label_[unit_idx], &dosis_20, 0);
+#endif
   lv_obj_set_style_text_color(ams_humidity_label_[unit_idx], lv_color_hex(0x94A3B8), 0);
   lv_obj_set_style_text_align(ams_humidity_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
 
   ams_temp_label_[unit_idx] = lv_label_create(hum_pill);
   set_label_text_if_changed(ams_temp_label_[unit_idx], "--\xC2\xB0""C");
+  #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_text_font(ams_temp_label_[unit_idx], &lv_font_montserrat_12, 0);
+#else
   lv_obj_set_style_text_font(ams_temp_label_[unit_idx], &dosis_20, 0);
+#endif
   lv_obj_set_style_text_color(ams_temp_label_[unit_idx], lv_color_hex(0x94A3B8), 0);
   lv_obj_set_style_text_align(ams_temp_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
 
   // External-spool widgets only on the first AMS page.
   if (unit_idx == 0) {
     ams_ext_col_ = lv_obj_create(page);
-    lv_obj_set_size(ams_ext_col_, 56, LV_SIZE_CONTENT);
+    lv_obj_set_size(ams_ext_col_, kAmsExtColW, LV_SIZE_CONTENT);
     make_transparent(ams_ext_col_);
     lv_obj_set_flex_flow(ams_ext_col_, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(ams_ext_col_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
@@ -2443,7 +2746,7 @@ void Ui::build_ams_page(int unit_idx) {
     lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
 
     ams_ext_rect_ = lv_obj_create(ams_ext_col_);
-    lv_obj_set_size(ams_ext_rect_, 52, 108);
+    lv_obj_set_size(ams_ext_rect_, kAmsExtRectW, kAmsExtRectH);
     lv_obj_set_style_radius(ams_ext_rect_, 32, 0);
     lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
     lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
@@ -2458,24 +2761,32 @@ void Ui::build_ams_page(int unit_idx) {
 
     ams_ext_type_ = lv_label_create(ams_ext_rect_);
     set_label_text_if_changed(ams_ext_type_, "EXT");
-    lv_obj_set_width(ams_ext_type_, 48);
+    lv_obj_set_width(ams_ext_type_, kAmsExtTypeW);
     lv_label_set_long_mode(ams_ext_type_, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(ams_ext_type_, LV_TEXT_ALIGN_CENTER, 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_style_text_font(ams_ext_type_, &lv_font_montserrat_12, 0);
+#else
     lv_obj_set_style_text_font(ams_ext_type_, &lv_font_montserrat_20, 0);
+#endif
     lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(ams_ext_type_, LV_ALIGN_CENTER, 0, 8);
 
     ams_ext_mat_ = lv_label_create(ams_ext_rect_);
     set_label_text_if_changed(ams_ext_mat_, "");
-    lv_obj_set_width(ams_ext_mat_, 48);
+    lv_obj_set_width(ams_ext_mat_, kAmsExtTypeW);
     lv_label_set_long_mode(ams_ext_mat_, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(ams_ext_mat_, LV_TEXT_ALIGN_CENTER, 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+    lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_12, 0);
+#else
     lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
+#endif
     lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
 
     ams_ext_arrow_ = lv_obj_create(ams_ext_col_);
-    lv_obj_set_size(ams_ext_arrow_, 35, 23);
+    lv_obj_set_size(ams_ext_arrow_, kAmsExtArrowW, kAmsExtArrowH);
     make_transparent(ams_ext_arrow_);
     // bg_color carries the triangle color; bg_opa stays 0 (see ams_arrow_draw_cb).
     lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x1F1F1F), 0);
@@ -2487,10 +2798,14 @@ void Ui::build_ams_page(int unit_idx) {
 
   ams_note_[unit_idx] = lv_label_create(page);
   set_label_text_if_changed(ams_note_[unit_idx], "No AMS connected");
-  lv_obj_set_width(ams_note_[unit_idx], 280);
+  lv_obj_set_width(ams_note_[unit_idx], kAmsNoteW);
   lv_label_set_long_mode(ams_note_[unit_idx], LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(ams_note_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_style_text_font(ams_note_[unit_idx], &lv_font_montserrat_12, 0);
+#else
   lv_obj_set_style_text_font(ams_note_[unit_idx], &dosis_20, 0);
+#endif
   lv_obj_set_style_text_color(ams_note_[unit_idx], lv_color_hex(0x666666), 0);
   lv_obj_align(ams_note_[unit_idx], LV_ALIGN_CENTER, 0, 0);
   lv_obj_add_flag(ams_note_[unit_idx], LV_OBJ_FLAG_HIDDEN);
@@ -2599,34 +2914,34 @@ void Ui::render_ams_unit(int unit_idx, const PrinterSnapshot& snapshot, bool sho
     ams_ext_spool_shown_ = ext_spool_active;
     if (ext_spool_active) {
       for (int i = 0; i < kMaxAmsTrays; ++i) {
-        lv_obj_set_size(ams_tray_col_[0][i], 58, LV_SIZE_CONTENT);
-        lv_obj_set_size(ams_tray_rect_[0][i], 54, 108);
-        lv_obj_set_style_radius(ams_tray_rect_[0][i], 30, 0);
-        lv_obj_set_width(ams_tray_type_[0][i], 50);
-        lv_obj_set_size(ams_tray_fill_[0][i], 54, 0);
+        lv_obj_set_size(ams_tray_col_[0][i], kAmsExtActiveColW, LV_SIZE_CONTENT);
+        lv_obj_set_size(ams_tray_rect_[0][i], kAmsExtActivePillW, kAmsExtActivePillH);
+        lv_obj_set_style_radius(ams_tray_rect_[0][i], kAmsExtActivePillRadius, 0);
+        lv_obj_set_width(ams_tray_type_[0][i], kAmsExtActiveTypeW);
+        lv_obj_set_size(ams_tray_fill_[0][i], kAmsExtActivePillW, 0);
       }
-      lv_obj_set_size(ams_shelf_[0], 275, 85);
-      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, 38, -55);
-      lv_obj_set_size(ams_base_[0], 300, 80);
-      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, 38, 19);
-      lv_obj_set_size(ams_tray_row_[0], 310, LV_SIZE_CONTENT);
-      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, 38, -30);
-      lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -30);
+      lv_obj_set_size(ams_shelf_[0], kAmsExtActiveShelfW, kAmsExtActiveShelfH);
+      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, kAmsExtShiftX, kAmsExtActiveShelfY);
+      lv_obj_set_size(ams_base_[0], kAmsExtActiveBaseW, kAmsExtActiveBaseH);
+      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, kAmsExtShiftX, kAmsExtActiveBaseY);
+      lv_obj_set_size(ams_tray_row_[0], kAmsExtActiveRowW, LV_SIZE_CONTENT);
+      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, kAmsExtShiftX, kAmsExtActiveRowY);
+      lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, kAmsExtColX, kAmsExtActiveRowY);
       lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
     } else {
       for (int i = 0; i < kMaxAmsTrays; ++i) {
-        lv_obj_set_size(ams_tray_col_[0][i], 76, LV_SIZE_CONTENT);
-        lv_obj_set_size(ams_tray_rect_[0][i], 72, 140);
-        lv_obj_set_style_radius(ams_tray_rect_[0][i], 40, 0);
-        lv_obj_set_width(ams_tray_type_[0][i], 68);
-        lv_obj_set_size(ams_tray_fill_[0][i], 72, 0);
+        lv_obj_set_size(ams_tray_col_[0][i], kAmsTrayColW, LV_SIZE_CONTENT);
+        lv_obj_set_size(ams_tray_rect_[0][i], kAmsPillW, kAmsPillH);
+        lv_obj_set_style_radius(ams_tray_rect_[0][i], kAmsPillRadius, 0);
+        lv_obj_set_width(ams_tray_type_[0][i], kAmsTypeW);
+        lv_obj_set_size(ams_tray_fill_[0][i], kAmsPillW, 0);
       }
-      lv_obj_set_size(ams_shelf_[0], 359, 110);
-      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, 0, -50);
-      lv_obj_set_size(ams_base_[0], 385, 103);
-      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, 0, 35);
-      lv_obj_set_size(ams_tray_row_[0], 420, LV_SIZE_CONTENT);
-      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, 0, -13);
+      lv_obj_set_size(ams_shelf_[0], kAmsShelfW, kAmsShelfH);
+      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, 0, kAmsShelfY);
+      lv_obj_set_size(ams_base_[0], kAmsBaseW, kAmsBaseH);
+      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, 0, kAmsBaseY);
+      lv_obj_set_size(ams_tray_row_[0], kAmsTrayRowW, LV_SIZE_CONTENT);
+      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, 0, kAmsTrayRowY);
       lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
     }
   }
@@ -2657,7 +2972,7 @@ void Ui::render_ams_unit(int unit_idx, const PrinterSnapshot& snapshot, bool sho
     set_label_text_if_changed(ams_ext_mat_, mat_label);
   }
 
-  const int pill_h = (unit_idx == 0 && ext_spool_active) ? 108 : 140;
+  const int pill_h = (unit_idx == 0 && ext_spool_active) ? kAmsExtActivePillH : kAmsPillH;
 
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     const AmsTrayInfo& tray = unit.trays[i];
@@ -2753,12 +3068,23 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_bg_color(screen_, lv_color_hex(0x000000), 0);
   lv_obj_set_style_bg_opa(screen_, LV_OPA_COVER, 0);
 
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  // One step smaller than before: Montserrat 14 for body, 12 for detail/aux.
+  // Keep mdi_40: mdi_30 only embeds battery glyphs, not nozzle/bed/clock.
+  const lv_font_t* dosis20 = &lv_font_montserrat_12;
+  const lv_font_t* dosis32 = &lv_font_montserrat_14;
+  const lv_font_t* dosis40 = &lv_font_montserrat_14;
+  const lv_font_t* info20 = &lv_font_montserrat_12;
+  const lv_font_t* mdi30 = &mdi_30;
+  const lv_font_t* mdi40 = &mdi_40;
+#else
   const lv_font_t* dosis20 = &dosis_20;
   const lv_font_t* dosis32 = &dosis_32;
   const lv_font_t* dosis40 = &dosis_40;
   const lv_font_t* info20 = &lv_font_montserrat_20;
   const lv_font_t* mdi30 = &mdi_30;
   const lv_font_t* mdi40 = &mdi_40;
+#endif
 
   pager_ = lv_obj_create(screen_);
   lv_obj_set_size(pager_, board::kDisplayWidth, board::kDisplayHeight);
@@ -2801,32 +3127,48 @@ esp_err_t Ui::build_dashboard() {
   // --- Page 0: printer selection ---
   page0_title_ = lv_label_create(page0_);
   set_label_text_if_changed(page0_title_, "Printers");
-  lv_obj_set_width(page0_title_, 320);
-  lv_label_set_long_mode(page0_title_, LV_LABEL_LONG_WRAP);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_width(page0_title_, 180);
+  lv_obj_align(page0_title_, LV_ALIGN_TOP_MID, 0, 28);
+#else
+  lv_obj_set_width(page0_title_, ui_px(320));
+  lv_obj_align(page0_title_, LV_ALIGN_TOP_MID, 0, ui_px(60));
+#endif
+  lv_label_set_long_mode(page0_title_, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_align(page0_title_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page0_title_, dosis32, 0);
   lv_obj_set_style_text_color(page0_title_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(page0_title_, LV_ALIGN_TOP_MID, 0, 60);
 
   page0_card_list_ = lv_obj_create(page0_);
-  lv_obj_set_size(page0_card_list_, 380, 300);
-  lv_obj_align(page0_card_list_, LV_ALIGN_CENTER, 0, 20);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_size(page0_card_list_, 200, 150);
+  lv_obj_align(page0_card_list_, LV_ALIGN_CENTER, 0, 18);
+  lv_obj_set_style_pad_row(page0_card_list_, 6, 0);
+#else
+  lv_obj_set_size(page0_card_list_, ui_px(380), ui_px(300));
+  lv_obj_align(page0_card_list_, LV_ALIGN_CENTER, 0, ui_px(20));
+  lv_obj_set_style_pad_row(page0_card_list_, 10, 0);
+#endif
   make_transparent(page0_card_list_);
   lv_obj_set_flex_flow(page0_card_list_, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(page0_card_list_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(page0_card_list_, 10, 0);
   lv_obj_set_style_pad_all(page0_card_list_, 0, 0);
   lv_obj_set_scroll_dir(page0_card_list_, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(page0_card_list_, LV_SCROLLBAR_MODE_OFF);
 
   page0_empty_note_ = lv_label_create(page0_);
   set_label_text_if_changed(page0_empty_note_, "No printers configured.\nUse the web portal to add printers.");
-  lv_obj_set_width(page0_empty_note_, 320);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_width(page0_empty_note_, 180);
+  lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, 20);
+#else
+  lv_obj_set_width(page0_empty_note_, ui_px(320));
+  lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, ui_px(20));
+#endif
   lv_label_set_long_mode(page0_empty_note_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page0_empty_note_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page0_empty_note_, info20, 0);
   lv_obj_set_style_text_color(page0_empty_note_, lv_color_hex(0x666666), 0);
-  lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, 20);
   lv_obj_add_flag(page0_empty_note_, LV_OBJ_FLAG_HIDDEN);
 
   // --- AMS pages (one per AMS unit, indices kPageIdxAmsFirst..kPageIdxAmsLast) ---
@@ -2873,7 +3215,7 @@ esp_err_t Ui::build_dashboard() {
   set_label_text_if_changed(progress_label_, "--%");
   lv_obj_set_style_text_font(progress_label_, dosis40, 0);
   lv_obj_set_style_text_color(progress_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(progress_label_, LV_ALIGN_CENTER, 0, -178);
+  lv_obj_align(progress_label_, LV_ALIGN_CENTER, 0, kProgressY);
   apply_display_rotation_visual_offset(progress_label_, display_rotation_);
   lv_obj_move_foreground(progress_label_);
 
@@ -2881,7 +3223,7 @@ esp_err_t Ui::build_dashboard() {
   set_label_text_if_changed(battery_icon_label_, kMdiBattery100);
   lv_obj_set_style_text_font(battery_icon_label_, mdi30, 0);
   lv_obj_set_style_text_color(battery_icon_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(battery_icon_label_, LV_ALIGN_CENTER, -20, -140);
+  lv_obj_align(battery_icon_label_, LV_ALIGN_CENTER, -18, kProgressY + 28);
   apply_display_rotation_visual_offset(battery_icon_label_, display_rotation_);
   lv_obj_move_foreground(battery_icon_label_);
 
@@ -2889,18 +3231,23 @@ esp_err_t Ui::build_dashboard() {
   set_label_text_if_changed(battery_pct_label_, "--%");
   lv_obj_set_style_text_font(battery_pct_label_, dosis20, 0);
   lv_obj_set_style_text_color(battery_pct_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(battery_pct_label_, LV_ALIGN_CENTER, 20, -140);
+  lv_obj_align(battery_pct_label_, LV_ALIGN_CENTER, 18, kProgressY + 28);
   apply_display_rotation_visual_offset(battery_pct_label_, display_rotation_);
   lv_obj_move_foreground(battery_pct_label_);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  // Knomi is USB/DC powered — keep battery widgets hidden.
+  lv_obj_add_flag(battery_icon_label_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(battery_pct_label_, LV_OBJ_FLAG_HIDDEN);
+#endif
 
   badge_slot_ = lv_obj_create(page1_);
   make_transparent(badge_slot_);
-  lv_obj_set_size(badge_slot_, 86, 86);
-  lv_obj_align(badge_slot_, LV_ALIGN_CENTER, 0, -7);
+  lv_obj_set_size(badge_slot_, kBadgeSize, kBadgeSize);
+  lv_obj_align(badge_slot_, LV_ALIGN_CENTER, 0, kLogoY);
   lv_obj_clear_flag(badge_slot_, LV_OBJ_FLAG_SCROLLABLE);
 
   logo_badge_ = lv_obj_create(badge_slot_);
-  lv_obj_set_size(logo_badge_, 120, 120);
+  lv_obj_set_size(logo_badge_, kLogoBadgeSize, kLogoBadgeSize);
   lv_obj_set_style_radius(logo_badge_, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_opa(logo_badge_, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_opa(logo_badge_, LV_OPA_TRANSP, 0);
@@ -2913,7 +3260,7 @@ esp_err_t Ui::build_dashboard() {
 
   logo_image_ = lv_image_create(logo_badge_);
   lv_image_set_src(logo_image_, &bambuicon_small);
-  lv_image_set_scale(logo_image_, 183);
+  lv_image_set_scale(logo_image_, kLogoScale);
   lv_image_set_antialias(logo_image_, true);
   lv_obj_set_style_image_recolor_opa(logo_image_, LV_OPA_TRANSP, 0);
   lv_obj_center(logo_image_);
@@ -2924,24 +3271,23 @@ esp_err_t Ui::build_dashboard() {
   set_label_text_if_changed(status_label_, "waiting...");
   lv_obj_set_style_text_font(status_label_, dosis32, 0);
   lv_obj_set_style_text_color(status_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, -86);
+  lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, kStatusY);
 
   detail_label_ = lv_label_create(page1_);
   set_label_text_if_changed(detail_label_, "Waiting for printer data");
-  lv_label_set_long_mode(detail_label_, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(detail_label_, 320);
+  lv_label_set_long_mode(detail_label_, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(detail_label_, kDetailWidth);
   lv_obj_set_style_text_align(detail_label_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(detail_label_, info20, 0);
   lv_obj_set_style_text_color(detail_label_, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(detail_label_, LV_ALIGN_CENTER, 0, 114);
+  lv_obj_align(detail_label_, LV_ALIGN_CENTER, 0, kDetailY);
 
   layer_row_ = lv_obj_create(page1_);
   make_transparent(layer_row_);
-  lv_obj_set_size(layer_row_, 360, LV_SIZE_CONTENT);
+  lv_obj_set_size(layer_row_, kLayerRowWidth, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(layer_row_, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(layer_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
-  lv_obj_align(layer_row_, LV_ALIGN_CENTER, 0, 70);
   lv_obj_clear_flag(layer_row_, LV_OBJ_FLAG_SCROLLABLE);
 
   layer_label_ = lv_label_create(layer_row_);
@@ -2957,9 +3303,10 @@ esp_err_t Ui::build_dashboard() {
   filament_icon_label_ = lv_label_create(layer_row_);
   set_label_text_if_changed(filament_icon_label_, kMdiSpool);
   lv_obj_set_style_text_font(filament_icon_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(filament_icon_label_);
   lv_obj_set_style_text_color(filament_icon_label_, lv_color_hex(0xC9A227), 0);
-  lv_obj_set_style_pad_left(filament_icon_label_, 14, 0);
-  lv_obj_set_style_pad_right(filament_icon_label_, 4, 0);
+  lv_obj_set_style_pad_left(filament_icon_label_, 8, 0);
+  lv_obj_set_style_pad_right(filament_icon_label_, 2, 0);
   lv_obj_add_flag(filament_icon_label_, LV_OBJ_FLAG_HIDDEN);
 
   filament_value_label_ = lv_label_create(layer_row_);
@@ -2968,88 +3315,164 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_set_style_text_color(filament_value_label_, lv_color_hex(0xDDDDDD), 0);
   // Add a left pad so the value sits a sensible distance from the layer
   // counter now that the spool icon is hidden.
-  lv_obj_set_style_pad_left(filament_value_label_, 14, 0);
+  lv_obj_set_style_pad_left(filament_value_label_, 8, 0);
   lv_obj_add_flag(filament_value_label_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_update_layout(layer_row_);
+  lv_obj_align(layer_row_, LV_ALIGN_CENTER, 0, kLayerY);
 
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  auto make_temp_row = [](lv_obj_t* parent) {
+    lv_obj_t* row = lv_obj_create(parent);
+    make_transparent(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 2, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    // Align after children are added — SIZE_CONTENT + early align pins y1 wrong.
+    return row;
+  };
+
+  lv_obj_t* nozzle_temp_row = make_temp_row(page1_);
+  lv_obj_t* nozzle_icon_slot = make_knomi_mdi_slot(nozzle_temp_row);
+  nozzle_prefix_label_ = lv_label_create(nozzle_icon_slot);
+  set_label_text_if_changed(nozzle_prefix_label_, kMdiNozzle);
+  lv_obj_set_style_text_font(nozzle_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(nozzle_prefix_label_);
+  lv_obj_set_style_text_color(nozzle_prefix_label_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(nozzle_prefix_label_);
+
+  nozzle_value_label_ = lv_label_create(nozzle_temp_row);
+  set_label_text_if_changed(nozzle_value_label_, std::string("--") + kDegreeC);
+  lv_obj_set_style_text_font(nozzle_value_label_, dosis32, 0);
+  lv_obj_set_style_text_color(nozzle_value_label_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_height(nozzle_value_label_, kMdiIconSlotH);
+  lv_obj_set_style_pad_top(nozzle_value_label_, kMdiValuePadTop, 0);
+  lv_obj_update_layout(nozzle_temp_row);
+  lv_obj_align(nozzle_temp_row, LV_ALIGN_CENTER, kNozzleTempGroupX, kTempY);
+
+  lv_obj_t* bed_temp_row = make_temp_row(page1_);
+  bed_value_label_ = lv_label_create(bed_temp_row);
+  set_label_text_if_changed(bed_value_label_, std::string("--") + kDegreeC);
+  lv_obj_set_style_text_font(bed_value_label_, dosis32, 0);
+  lv_obj_set_style_text_color(bed_value_label_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_height(bed_value_label_, kMdiIconSlotH);
+  lv_obj_set_style_pad_top(bed_value_label_, kMdiValuePadTop, 0);
+
+  lv_obj_t* bed_icon_slot = make_knomi_mdi_slot(bed_temp_row);
+  bed_prefix_label_ = lv_label_create(bed_icon_slot);
+  set_label_text_if_changed(bed_prefix_label_, kMdiBed);
+  lv_obj_set_style_text_font(bed_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(bed_prefix_label_);
+  lv_obj_set_style_text_color(bed_prefix_label_, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(bed_prefix_label_);
+  lv_obj_update_layout(bed_temp_row);
+  lv_obj_align(bed_temp_row, LV_ALIGN_CENTER, kBedTempGroupX, kTempY);
+#else
   nozzle_prefix_label_ = lv_label_create(page1_);
   set_label_text_if_changed(nozzle_prefix_label_, kMdiNozzle);
   lv_obj_set_style_text_font(nozzle_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(nozzle_prefix_label_);
   lv_obj_set_style_text_color(nozzle_prefix_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(nozzle_prefix_label_, LV_ALIGN_CENTER, -182, -10);
+  lv_obj_align(nozzle_prefix_label_, LV_ALIGN_CENTER, kNozzleIconX, kTempY);
 
   nozzle_value_label_ = lv_label_create(page1_);
   set_label_text_if_changed(nozzle_value_label_, "--°C");
   lv_obj_set_style_text_font(nozzle_value_label_, dosis32, 0);
   lv_obj_set_style_text_color(nozzle_value_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(nozzle_value_label_, LV_ALIGN_CENTER, -132, -10);
+  lv_obj_align(nozzle_value_label_, LV_ALIGN_CENTER, kNozzleValueX, kTempY);
   set_label_text_if_changed(nozzle_value_label_, std::string("--") + kDegreeC);
-
-  nozzle_aux_label_ = lv_label_create(page1_);
-  set_label_text_if_changed(nozzle_aux_label_, "");
-  lv_obj_set_width(nozzle_aux_label_, 170);
-  lv_label_set_long_mode(nozzle_aux_label_, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(nozzle_aux_label_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(nozzle_aux_label_, dosis20, 0);
-  lv_obj_set_style_text_color(nozzle_aux_label_, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(nozzle_aux_label_, LV_ALIGN_CENTER, -132, kAuxTempRowY);
-  lv_obj_add_flag(nozzle_aux_label_, LV_OBJ_FLAG_HIDDEN);
 
   bed_prefix_label_ = lv_label_create(page1_);
   set_label_text_if_changed(bed_prefix_label_, kMdiBed);
   lv_obj_set_style_text_font(bed_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(bed_prefix_label_);
   lv_obj_set_style_text_color(bed_prefix_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(bed_prefix_label_, LV_ALIGN_CENTER, 182, -10);
+  lv_obj_align(bed_prefix_label_, LV_ALIGN_CENTER, kBedIconX, kTempY);
 
   bed_value_label_ = lv_label_create(page1_);
   set_label_text_if_changed(bed_value_label_, "--°C");
   lv_obj_set_style_text_font(bed_value_label_, dosis32, 0);
   lv_obj_set_style_text_color(bed_value_label_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_width(bed_value_label_, 96);
+  lv_obj_set_width(bed_value_label_, kTempValueWidth);
   lv_obj_set_style_text_align(bed_value_label_, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_align(bed_value_label_, LV_ALIGN_CENTER, 108, -10);
+  lv_obj_align(bed_value_label_, LV_ALIGN_CENTER, kBedValueX, kTempY);
   set_label_text_if_changed(bed_value_label_, std::string("--") + kDegreeC);
+#endif
+
+  nozzle_aux_label_ = lv_label_create(page1_);
+  set_label_text_if_changed(nozzle_aux_label_, "");
+  lv_obj_set_width(nozzle_aux_label_, ui_px(170));
+  lv_label_set_long_mode(nozzle_aux_label_, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_align(nozzle_aux_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(nozzle_aux_label_, dosis20, 0);
+  lv_obj_set_style_text_color(nozzle_aux_label_, lv_color_hex(0x94A3B8), 0);
+  lv_obj_align(nozzle_aux_label_, LV_ALIGN_CENTER, kNozzleValueX, kAuxTempRowY);
+  lv_obj_add_flag(nozzle_aux_label_, LV_OBJ_FLAG_HIDDEN);
 
   bed_aux_label_ = lv_label_create(page1_);
   set_label_text_if_changed(bed_aux_label_, "");
-  lv_obj_set_width(bed_aux_label_, 170);
-  lv_label_set_long_mode(bed_aux_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(bed_aux_label_, ui_px(170));
+  lv_label_set_long_mode(bed_aux_label_, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_align(bed_aux_label_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(bed_aux_label_, dosis20, 0);
   lv_obj_set_style_text_color(bed_aux_label_, lv_color_hex(0x94A3B8), 0);
-  lv_obj_align(bed_aux_label_, LV_ALIGN_CENTER, 132, kAuxTempRowY);
+  lv_obj_align(bed_aux_label_, LV_ALIGN_CENTER, kBedValueX, kAuxTempRowY);
   lv_obj_add_flag(bed_aux_label_, LV_OBJ_FLAG_HIDDEN);
 
   remaining_row_ = lv_obj_create(page1_);
   make_transparent(remaining_row_);
-  lv_obj_set_size(remaining_row_, 280, LV_SIZE_CONTENT);
+  lv_obj_set_size(remaining_row_, kRemainingRowWidth, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(remaining_row_, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(remaining_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
-  lv_obj_align(remaining_row_, LV_ALIGN_CENTER, 0, kRemainingRowY);
   lv_obj_clear_flag(remaining_row_, LV_OBJ_FLAG_SCROLLABLE);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_add_flag(remaining_row_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+#endif
   // Tap to toggle between remaining duration and predicted finish time.
   lv_obj_add_flag(remaining_row_, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(remaining_row_, &Ui::remaining_row_event_cb, LV_EVENT_CLICKED, this);
 
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_t* remaining_icon_slot = make_knomi_mdi_slot(remaining_row_);
+  remaining_prefix_label_ = lv_label_create(remaining_icon_slot);
+  set_label_text_if_changed(remaining_prefix_label_, kMdiClock);
+  lv_obj_set_style_text_font(remaining_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(remaining_prefix_label_);
+  lv_obj_set_style_text_color(remaining_prefix_label_, lv_color_hex(0x87CEEB), 0);
+  lv_obj_center(remaining_prefix_label_);
+#else
   remaining_prefix_label_ = lv_label_create(remaining_row_);
   set_label_text_if_changed(remaining_prefix_label_, kMdiClock);
   lv_obj_set_style_text_font(remaining_prefix_label_, mdi40, 0);
+  apply_knomi_mdi_icon_scale(remaining_prefix_label_);
   lv_obj_set_style_text_color(remaining_prefix_label_, lv_color_hex(0x87CEEB), 0);
-  lv_obj_set_style_pad_right(remaining_prefix_label_, 8, 0);
+  lv_obj_set_style_pad_right(remaining_prefix_label_, 4, 0);
+#endif
 
   remaining_label_ = lv_label_create(remaining_row_);
   set_label_text_if_changed(remaining_label_, "--m");
   lv_obj_set_style_text_font(remaining_label_, dosis40, 0);
   lv_obj_set_style_text_color(remaining_label_, lv_color_hex(0x87CEEB), 0);
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  lv_obj_set_height(remaining_label_, kMdiIconSlotH);
+  lv_obj_set_style_pad_top(remaining_label_, kMdiValuePadTop, 0);
+#endif
+  // Align after children so SIZE_CONTENT height is known (center stays on kRemainingRowY).
+  lv_obj_update_layout(remaining_row_);
+  lv_obj_align(remaining_row_, LV_ALIGN_CENTER, 0, kRemainingRowY);
 
   portal_hint_label_ = lv_label_create(page1_);
   set_label_text_if_changed(portal_hint_label_, "");
-  lv_obj_set_width(portal_hint_label_, 320);
-  lv_label_set_long_mode(portal_hint_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(portal_hint_label_, kDetailWidth);
+  lv_label_set_long_mode(portal_hint_label_, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_align(portal_hint_label_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(portal_hint_label_, info20, 0);
   lv_obj_set_style_text_color(portal_hint_label_, lv_color_hex(0x64748B), 0);
-  lv_obj_align(portal_hint_label_, LV_ALIGN_CENTER, 0, 114);
+  lv_obj_align(portal_hint_label_, LV_ALIGN_CENTER, 0, kDetailY);
   lv_obj_add_flag(portal_hint_label_, LV_OBJ_FLAG_HIDDEN);
 
   brightness_overlay_ = lv_label_create(lv_layer_top());
@@ -3067,7 +3490,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_move_foreground(brightness_overlay_);
 
   portal_overlay_card_ = lv_obj_create(lv_layer_top());
-  lv_obj_set_size(portal_overlay_card_, 280, LV_SIZE_CONTENT);
+  lv_obj_set_size(portal_overlay_card_, ui_px(280), LV_SIZE_CONTENT);
   lv_obj_set_style_radius(portal_overlay_card_, 22, 0);
   lv_obj_set_style_bg_color(portal_overlay_card_, lv_color_hex(0x071018), 0);
   lv_obj_set_style_bg_opa(portal_overlay_card_, LV_OPA_90, 0);
@@ -3099,7 +3522,7 @@ esp_err_t Ui::build_dashboard() {
 
   portal_overlay_detail_ = lv_label_create(portal_overlay_card_);
   set_label_text_if_changed(portal_overlay_detail_, "");
-  lv_obj_set_width(portal_overlay_detail_, 236);
+  lv_obj_set_width(portal_overlay_detail_, ui_px(236));
   lv_label_set_long_mode(portal_overlay_detail_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(portal_overlay_detail_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(portal_overlay_detail_, dosis20, 0);
@@ -3118,22 +3541,22 @@ esp_err_t Ui::build_dashboard() {
 
   page2_note_ = lv_label_create(page2_);
   set_label_text_if_changed(page2_note_, "No cover image yet");
-  lv_obj_set_width(page2_note_, 280);
+  lv_obj_set_width(page2_note_, ui_px(280));
   lv_label_set_long_mode(page2_note_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page2_note_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page2_note_, dosis20, 0);
   lv_obj_set_style_text_color(page2_note_, lv_color_hex(0x888888), 0);
-  lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, -14);
+  lv_obj_align(page2_note_, LV_ALIGN_CENTER, 0, kPage2EmptyNoteY);
   enable_touch_bubble(page2_note_);
 
   page2_subnote_ = lv_label_create(page2_);
   set_label_text_if_changed(page2_subnote_, "");
-  lv_obj_set_width(page2_subnote_, 320);
+  lv_obj_set_width(page2_subnote_, ui_px(320));
   lv_label_set_long_mode(page2_subnote_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page2_subnote_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page2_subnote_, info20, 0);
   lv_obj_set_style_text_color(page2_subnote_, lv_color_hex(0x888888), 0);
-  lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, 18);
+  lv_obj_align(page2_subnote_, LV_ALIGN_CENTER, 0, kPage2EmptySubnoteY);
   lv_obj_add_flag(page2_subnote_, LV_OBJ_FLAG_HIDDEN);
   enable_touch_bubble(page2_subnote_);
 
@@ -3144,7 +3567,7 @@ esp_err_t Ui::build_dashboard() {
   // stay nullptr and update_print_buttons_locked() becomes a no-op.
 #if CONFIG_PRINTSPHERE_EXPERIMENTAL_PRINT_CONTROL
   auto style_print_button = [&](lv_obj_t* button, lv_color_t bg) {
-    lv_obj_set_size(button, 96, 64);
+    lv_obj_set_size(button, ui_px(96), ui_px(64));
     lv_obj_set_style_radius(button, 14, 0);
     lv_obj_set_style_bg_color(button, bg, 0);
     lv_obj_set_style_bg_opa(button, LV_OPA_90, 0);
@@ -3159,7 +3582,7 @@ esp_err_t Ui::build_dashboard() {
 
   page2_pause_button_ = lv_obj_create(page2_);
   style_print_button(page2_pause_button_, lv_color_hex(0x1F6F4A));
-  lv_obj_align(page2_pause_button_, LV_ALIGN_CENTER, -64, 110);
+  lv_obj_align(page2_pause_button_, LV_ALIGN_CENTER, ui_px(-64), kPage2PrintButtonY);
   lv_obj_add_event_cb(page2_pause_button_, &Ui::pause_button_event_cb, LV_EVENT_CLICKED, this);
   page2_pause_button_label_ = lv_label_create(page2_pause_button_);
   lv_obj_center(page2_pause_button_label_);
@@ -3169,7 +3592,7 @@ esp_err_t Ui::build_dashboard() {
 
   page2_stop_button_ = lv_obj_create(page2_);
   style_print_button(page2_stop_button_, lv_color_hex(0x8E2A2A));
-  lv_obj_align(page2_stop_button_, LV_ALIGN_CENTER, 64, 110);
+  lv_obj_align(page2_stop_button_, LV_ALIGN_CENTER, ui_px(64), kPage2PrintButtonY);
   // Stop requires a long press (~1.5 s default) to commit — guards against
   // accidental cancellation. A short tap is intentionally a no-op.
   lv_obj_add_event_cb(page2_stop_button_, &Ui::stop_button_event_cb, LV_EVENT_LONG_PRESSED, this);
@@ -3181,8 +3604,9 @@ esp_err_t Ui::build_dashboard() {
 #endif  // CONFIG_PRINTSPHERE_EXPERIMENTAL_PRINT_CONTROL
 
   page3_image_ = lv_image_create(page3_);
-  lv_obj_set_size(page3_image_, board::kDisplayWidth, kPage3CameraHeight);
-  lv_image_set_inner_align(page3_image_, LV_IMAGE_ALIGN_CENTER);
+  lv_obj_set_size(page3_image_, kPage3CameraWidth, kPage3CameraHeight);
+  // Scale to fit the widget (camera JPEGs are often much larger than the panel).
+  lv_image_set_inner_align(page3_image_, LV_IMAGE_ALIGN_CONTAIN);
   lv_obj_align(page3_image_, LV_ALIGN_CENTER, 0, kPage3CameraYOffset);
   lv_obj_add_flag(page3_image_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(page3_image_, LV_OBJ_FLAG_CLICKABLE);
@@ -3191,7 +3615,7 @@ esp_err_t Ui::build_dashboard() {
 
   page3_note_ = lv_label_create(page3_);
   set_label_text_if_changed(page3_note_, "Tap for new image");
-  lv_obj_set_width(page3_note_, 320);
+  lv_obj_set_width(page3_note_, ui_px(320));
   lv_label_set_long_mode(page3_note_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page3_note_, LV_TEXT_ALIGN_CENTER, 0);
   // Match the main-page status label (dosis32 / white) so the lifecycle status
@@ -3203,12 +3627,12 @@ esp_err_t Ui::build_dashboard() {
 
   page3_subnote_ = lv_label_create(page3_);
   set_label_text_if_changed(page3_subnote_, "Auto-refresh every 2s");
-  lv_obj_set_width(page3_subnote_, 320);
+  lv_obj_set_width(page3_subnote_, ui_px(320));
   lv_label_set_long_mode(page3_subnote_, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(page3_subnote_, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_set_style_text_font(page3_subnote_, info20, 0);
   lv_obj_set_style_text_color(page3_subnote_, lv_color_hex(0x888888), 0);
-  lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, 28);
+  lv_obj_align(page3_subnote_, LV_ALIGN_CENTER, 0, kPage3EmptySubnoteY);
   lv_obj_add_flag(page3_subnote_, LV_OBJ_FLAG_HIDDEN);
   enable_touch_bubble(page3_subnote_);
 
@@ -3263,15 +3687,22 @@ void Ui::apply_page_visibility() {
   set_hidden(page3_, !camera_page_available_);
   set_hidden(status_label_, !on_page1);
   set_hidden(detail_label_, !on_page1 || !detail_visible_ || show_portal_hint);
-  set_hidden(layer_row_, !on_page1);
+  set_hidden(layer_row_, !on_page1 || !printer_link_ready(last_snapshot_));
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  set_hidden(battery_icon_label_, true);
+  set_hidden(battery_pct_label_, true);
+  set_hidden(nozzle_aux_label_, true);
+  set_hidden(bed_aux_label_, true);
+#else
   set_hidden(battery_icon_label_, !show_battery_overlay);
   set_hidden(battery_pct_label_, !show_battery_overlay);
+  set_hidden(nozzle_aux_label_, !on_page1 || !nozzle_aux_visible_);
+  set_hidden(bed_aux_label_, !on_page1 || !bed_aux_visible_);
+#endif
   set_hidden(nozzle_prefix_label_, !on_page1);
   set_hidden(nozzle_value_label_, !on_page1);
-  set_hidden(nozzle_aux_label_, !on_page1 || !nozzle_aux_visible_);
   set_hidden(bed_prefix_label_, !on_page1);
   set_hidden(bed_value_label_, !on_page1);
-  set_hidden(bed_aux_label_, !on_page1 || !bed_aux_visible_);
   set_hidden(remaining_row_, !on_page1);
   set_hidden(badge_slot_, !on_page1);
   set_hidden(portal_hint_label_, !show_portal_hint);

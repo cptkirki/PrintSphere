@@ -20,6 +20,8 @@
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #elif defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
 #include "bsp/esp32_s3_touch_lcd_2_8c.h"
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+#include "bsp/btt_knomi_v2.h"
 #else
 #error "Unknown PrintSphere hardware variant"
 #endif

@@ -44,6 +44,8 @@ const char* hardware_variant() {
   return "ESP32-S3 / AMOLED 1.75";
 #elif defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
   return "ESP32-S3 / LCD 2.8C";
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+  return "ESP32-S3 / Knomi v2";
 #else
   return "ESP32-S3";
 #endif

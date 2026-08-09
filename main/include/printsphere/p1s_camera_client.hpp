@@ -70,14 +70,18 @@ class P1sCameraClient {
   PrinterModel observed_model_ = PrinterModel::kUnknown;
   std::string observed_rtsp_url_{};
   bool observed_signature_required_ = false;
+  bool observed_print_live_ = false;
   TaskHandle_t task_handle_ = nullptr;
   esp_tls_t* tls_ = nullptr;
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> enabled_{false};
   std::atomic<bool> refresh_requested_{false};
   std::atomic<bool> reconfigure_requested_{false};
+  std::atomic<bool> force_reconnect_{false};
   bool idle_notified_ = false;
+  bool was_enabled_ = false;
   uint32_t consecutive_connect_failures_ = 0;
+  std::string last_fetch_error_{};
 };
 
 }  // namespace printsphere

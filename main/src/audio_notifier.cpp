@@ -17,6 +17,8 @@
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #elif defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
 #include "bsp/esp32_s3_touch_lcd_2_8c.h"
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+#include "bsp/btt_knomi_v2.h"
 #else
 #error "Unknown PrintSphere hardware variant"
 #endif
@@ -318,8 +320,15 @@ esp_err_t AudioNotifier::initialize() {
 
   g_codec = bsp_audio_codec_speaker_init();
   if (g_codec == nullptr) {
+#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2) || defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
+    ESP_LOGW(kTag, "audio codec unavailable on this board; notifier disabled");
+    initialized_.store(true);
+    enabled_.store(false);
+    return ESP_OK;
+#else
     ESP_LOGE(kTag, "bsp_audio_codec_speaker_init failed");
     return ESP_FAIL;
+#endif
   }
 
   g_queue = xQueueCreate(kQueueDepth, sizeof(uint8_t));

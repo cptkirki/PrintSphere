@@ -125,6 +125,19 @@ bool ensure_storage_ready_locked() {
   return &error_lookup_tsv_end[0] > &error_lookup_tsv_start[0];
 }
 
+// Embedded TSV may start with a UTF-8 BOM. Treating that as a domain byte makes
+// the sorted scan break immediately (0xEF > 'E'/'H'), so every lookup fails.
+const char* lookup_tsv_data_start() {
+  const char* cursor = error_lookup_tsv_start;
+  const char* const end = error_lookup_tsv_end;
+  if (end - cursor >= 3 && static_cast<unsigned char>(cursor[0]) == 0xEF &&
+      static_cast<unsigned char>(cursor[1]) == 0xBB &&
+      static_cast<unsigned char>(cursor[2]) == 0xBF) {
+    return cursor + 3;
+  }
+  return cursor;
+}
+
 ParsedLookupLine parse_lookup_line(std::string_view line) {
   ParsedLookupLine parsed{};
   if (line.empty() || line[0] == '#') {
@@ -141,8 +154,13 @@ ParsedLookupLine parse_lookup_line(std::string_view line) {
   std::string_view domain_field = line.substr(0, tab1);
   if (domain_field.empty()) return parsed;
 
+  const char domain = domain_field[0];
+  if (domain != 'E' && domain != 'H') {
+    return parsed;
+  }
+
   parsed.valid = true;
-  parsed.domain = domain_field[0];
+  parsed.domain = domain;
   parsed.code = line.substr(tab1 + 1, tab2 - tab1 - 1);
   parsed.models = line.substr(tab2 + 1, tab3 - tab2 - 1);
   parsed.message = line.substr(tab3 + 1);
@@ -183,7 +201,7 @@ std::string lookup_error_text_uncached(ErrorLookupDomain domain, uint64_t code, 
   std::string matched_message;
   std::string fallback_message;
 
-  const char* cursor = error_lookup_tsv_start;
+  const char* cursor = lookup_tsv_data_start();
   const char* const end = error_lookup_tsv_end;
 
   while (cursor < end) {

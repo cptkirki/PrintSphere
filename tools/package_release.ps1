@@ -16,6 +16,12 @@ $variants = @(
         BuildDir = "build-lcd_2_8c"
         ReleaseRoot = "release/2.8c"
         Version = "$Version-2.8c"
+    },
+    @{
+        Name = "knomi_v2"
+        BuildDir = "build-knomi_v2"
+        ReleaseRoot = "release/knomi_v2"
+        Version = "$Version-knomi_v2"
     }
 )
 
