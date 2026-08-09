@@ -1,0 +1,24 @@
+version: 1.0.0
+description: Board Support Package for BigTreeTech Knomi v2 (GC9A01 + CST816S)
+targets:
+  - esp32s3
+tags:
+  - bsp
+dependencies:
+  idf:
+    version: ">=5.5"
+  espressif/esp_lcd_gc9a01:
+    version: "^2.0.1"
+    public: true
+  espressif/esp_lcd_touch:
+    version: "^1.2.0"
+    public: true
+  espressif/esp_lcd_touch_cst816s:
+    version: "^1.1.1"
+    public: true
+  espressif/esp_lvgl_adapter:
+    version: "0.6.0"
+    public: true
+  espressif/esp_codec_dev:
+    version: "~1.5"
+    public: true

@@ -320,6 +320,42 @@ PowerSnapshot PmuManager::sample() const {
 
 }  // namespace printsphere
 
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+
+#include "esp_log.h"
+
+namespace printsphere {
+
+namespace {
+constexpr char kTag[] = "printsphere.pmu";
+}
+
+esp_err_t PmuManager::initialize() {
+  if (initialized_) {
+    return ESP_OK;
+  }
+  // Knomi v2 is DC/USB powered with no battery gauge IC.
+  initialized_ = true;
+  ESP_LOGI(kTag, "PMU stub ready (Knomi v2 USB-powered, no battery sense)");
+  return ESP_OK;
+}
+
+PowerSnapshot PmuManager::sample() const {
+  PowerSnapshot snapshot;
+  if (!initialized_) {
+    return snapshot;
+  }
+  snapshot.available = true;
+  snapshot.battery_present = false;
+  snapshot.usb_present = true;
+  snapshot.charging = false;
+  snapshot.temperature_c = 0.0f;
+  snapshot.battery_percent = 0;
+  return snapshot;
+}
+
+}  // namespace printsphere
+
 #else
 #error "Unknown PrintSphere hardware variant"
 #endif

@@ -499,7 +499,7 @@
           </div>
           <div class="detail">
             <h2>Device</h2>
-            <p>Use this for the Waveshare ESP32-S3 AMOLED hardware used by PrintSphere.</p>
+            <p>Select the firmware that matches your hardware: Waveshare AMOLED 1.75, Waveshare LCD 2.8C, or BTT Knomi v2.</p>
           </div>
           <div class="detail">
             <h2>Next Step</h2>
@@ -543,6 +543,15 @@
           displayPath: "release/2.8c/initial/printsphere_full.bin",
           otaUrl: "https://github.com/cptkirki/PrintSphere/blob/main/release/2.8c/ota/printsphere_ota.bin",
           note: 'Factory flash image for the ESP32-S3-Touch-LCD-2.8C hardware variant on v1.6.2. Keep the USB cable connected after the flash: the Wi-Fi picker appears automatically, so the setup hotspot is only needed as a fallback.',
+        },
+        {
+          label: "Stable v1.6.2 (Knomi v2)",
+          channel: "Stable",
+          version: "v1.6.2-knomi_v2",
+          path: "../release/knomi_v2/initial/printsphere_full.bin",
+          displayPath: "release/knomi_v2/initial/printsphere_full.bin",
+          otaUrl: "https://github.com/cptkirki/PrintSphere/blob/main/release/knomi_v2/ota/printsphere_ota.bin",
+          note: "Factory flash image for the BigTreeTech Knomi v2 (GC9A01 240x240). Hold BOOT while connecting USB if the serial port does not appear. Keep the USB cable connected after the flash for Wi-Fi setup.",
         },
       ];
 

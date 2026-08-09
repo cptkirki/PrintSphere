@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "btt_knomi_v2.c"
+    INCLUDE_DIRS
+        "include"
+        "include/bsp"
+    REQUIRES
+        driver
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_spi
+        esp_lcd
+        esp_lcd_gc9a01
+        esp_lcd_touch
+        esp_lcd_touch_cst816s
+        esp_lvgl_adapter
+        esp_codec_dev
+)

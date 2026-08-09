@@ -33,6 +33,10 @@ elseif("${PRINTSPHERE_HW_COMPILE_DEFINE}" STREQUAL "PRINTSPHERE_HW_VARIANT_LCD_2
         esp_adc
         esp32_s3_touch_lcd_2_8c
     )
+elseif("${PRINTSPHERE_HW_COMPILE_DEFINE}" STREQUAL "PRINTSPHERE_HW_VARIANT_KNOMI_V2=1")
+    list(APPEND PRINTSPHERE_MAIN_PRIV_REQUIRES
+        btt_knomi_v2
+    )
 endif()
 
 idf_component_register(
@@ -105,6 +109,15 @@ elseif("${PRINTSPHERE_HW_COMPILE_DEFINE}" STREQUAL "PRINTSPHERE_HW_VARIANT_LCD_2
     target_link_libraries(${COMPONENT_LIB} PRIVATE
         ${PRINTSPHERE_BSP_LIB}
         ${PRINTSPHERE_ADC_LIB}
+    )
+elseif("${PRINTSPHERE_HW_COMPILE_DEFINE}" STREQUAL "PRINTSPHERE_HW_VARIANT_KNOMI_V2=1")
+    idf_component_get_property(PRINTSPHERE_BSP_DIR btt_knomi_v2 COMPONENT_DIR)
+    idf_component_get_property(PRINTSPHERE_BSP_LIB btt_knomi_v2 COMPONENT_LIB)
+    target_include_directories(${COMPONENT_LIB} PRIVATE
+        "${PRINTSPHERE_BSP_DIR}/include"
+    )
+    target_link_libraries(${COMPONENT_LIB} PRIVATE
+        ${PRINTSPHERE_BSP_LIB}
     )
 endif()
 

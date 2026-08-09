@@ -30,8 +30,9 @@ Always select the hardware explicitly. Each variant must use its own build direc
 | --- | --- | --- | --- |
 | Waveshare ESP32-S3 Touch AMOLED 1.75 | `amoled_1_75` | `build-amoled_1_75` | `release/` |
 | Waveshare ESP32-S3 Touch LCD 2.8C | `lcd_2_8c` | `build-lcd_2_8c` | `release/2.8c/` |
+| BigTreeTech Knomi v2 | `knomi_v2` | `build-knomi_v2` | `release/knomi_v2/` |
 
-Do not reuse one variant's build directory for the other variant.
+Do not reuse one variant's build directory for another variant.
 
 ## Build the AMOLED 1.75 variant
 
@@ -61,6 +62,20 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c -p COM7 build flash m
 
 Replace `COM7` with the correct port on your system.
 
+## Build the Knomi v2 variant
+
+```powershell
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 reconfigure build
+```
+
+Build, flash and open the serial monitor:
+
+```powershell
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 -p COM5 build flash monitor
+```
+
+Knomi v2 uses a GC9A01 SPI 240×240 panel with CST816S touch and AW9364 pulse backlight. Hold the BOOT button while connecting USB if the port does not appear. OTA images are only compatible within the `knomi_v2` variant.
+
 ## Flash or monitor without rebuilding
 
 AMOLED 1.75:
@@ -77,20 +92,28 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c -p COM7 flash
 idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c -p COM7 monitor
 ```
 
-## Package both release variants
+Knomi v2:
 
-Build both variants first. Then run:
+```powershell
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 -p COM5 flash
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 -p COM5 monitor
+```
+
+## Package all release variants
+
+Build all variants first. Then run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/package_release.ps1 -Version v1.6.2
 ```
 
-The script creates the four current release images plus versioned archive copies:
+The script creates the current release images plus versioned archive copies:
 
 | Hardware | Initial USB image | OTA image |
 | --- | --- | --- |
 | AMOLED 1.75 | `release/initial/printsphere_full.bin` | `release/ota/printsphere_ota.bin` |
 | LCD 2.8C | `release/2.8c/initial/printsphere_full.bin` | `release/2.8c/ota/printsphere_ota.bin` |
+| Knomi v2 | `release/knomi_v2/initial/printsphere_full.bin` | `release/knomi_v2/ota/printsphere_ota.bin` |
 
 Versioned copies are stored below the corresponding `archive/` directories.
 
@@ -106,6 +129,12 @@ LCD 2.8C:
 
 ```powershell
 python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.6.2-2.8c
+```
+
+Knomi v2:
+
+```powershell
+python tools/package_initial_flash.py --build-dir build-knomi_v2 --release-root release/knomi_v2 --version v1.6.2-knomi_v2
 ```
 
 ## Initial image versus OTA image
@@ -131,6 +160,12 @@ LCD 2.8C:
 esptool.exe --chip esp32s3 --port COM7 write_flash 0x0 release/2.8c/initial/printsphere_full.bin
 ```
 
+Knomi v2:
+
+```powershell
+esptool.exe --chip esp32s3 --port COM5 write_flash 0x0 release/knomi_v2/initial/printsphere_full.bin
+```
+
 The merged image already contains the bootloader and partition table.
 
 ## Reconfigure and clean builds
@@ -140,6 +175,7 @@ Use `reconfigure` first when CMake settings, dependencies or hardware options ch
 ```powershell
 idf.py -B build-amoled_1_75 -DPRINTSPHERE_HW_VARIANT=amoled_1_75 reconfigure
 idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c reconfigure
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 reconfigure
 ```
 
 `fullclean` is normally unnecessary. If a build cache is genuinely broken, remove or recreate only the affected variant's build directory.
@@ -152,7 +188,8 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c reconfigure
 | `main/CMakeLists.txt` | Application sources and ESP-IDF component dependencies |
 | `sdkconfig.defaults` | Shared ESP-IDF project defaults |
 | `partitions.csv` | NVS, OTA and LittleFS partition layout |
-| `tools/package_release.ps1` | Packages both hardware variants |
+| `tools/package_release.ps1` | Packages all hardware variants |
+| `components/btt_knomi_v2/` | BSP for BigTreeTech Knomi v2 (GC9A01 + CST816S) |
 | `tools/package_initial_flash.py` | Creates merged initial and OTA images |
 | `flash/index.html` | Browser installer page |
 | `release/` | Published firmware images and release notes |

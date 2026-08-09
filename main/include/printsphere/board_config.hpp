@@ -40,6 +40,25 @@ constexpr gpio_num_t kQspiData3 = GPIO_NUM_47;
 
 constexpr int kAxp2101Address = 0;
 constexpr char kBoardName[] = "ESP32-S3-Touch-LCD-2.8C";
+#elif defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
+constexpr int kDisplayWidth = 240;
+constexpr int kDisplayHeight = 240;
+
+constexpr gpio_num_t kI2cScl = GPIO_NUM_1;
+constexpr gpio_num_t kI2cSda = GPIO_NUM_2;
+
+constexpr gpio_num_t kTouchInterrupt = GPIO_NUM_17;
+constexpr gpio_num_t kTouchReset = GPIO_NUM_16;
+
+constexpr gpio_num_t kSpiSclk = GPIO_NUM_18;
+constexpr gpio_num_t kSpiMosi = GPIO_NUM_14;
+constexpr gpio_num_t kSpiCs = GPIO_NUM_20;
+constexpr gpio_num_t kSpiDc = GPIO_NUM_19;
+constexpr gpio_num_t kLcdRst = GPIO_NUM_21;
+constexpr gpio_num_t kLcdBacklight = GPIO_NUM_12;
+
+constexpr int kAxp2101Address = 0;
+constexpr char kBoardName[] = "BTT Knomi v2";
 #else
 #error "Unknown PrintSphere hardware variant"
 #endif

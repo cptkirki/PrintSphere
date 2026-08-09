@@ -1,133 +1,105 @@
-# PrintSphere
+# PrintSphere (Knomi & Waveshare)
 
-PrintSphere is a round ESP32-S3 companion display for Bambu Lab printers. It shows print progress, temperatures, remaining time, AMS information, errors, cover previews and supported camera snapshots.
+Round ESP32-S3 companion display for Bambu Lab printers — print progress, temperatures, remaining time, AMS, errors, cover previews, and supported camera snapshots.
 
-It works directly with Bambu Cloud, the printer's local connection, or both. Home Assistant is not required.
+Works with **Bambu Cloud**, the printer’s **local** connection, or both. Home Assistant is not required.
 
-<img width="400" height="300" alt="PrintSphere AMOLED display" src="https://github.com/user-attachments/assets/820c2e9b-10a7-4430-949c-e8b0adc1357d" /> <img width="400" height="300" alt="PrintSphere interface" src="https://github.com/user-attachments/assets/5923dc59-0123-4df1-b54d-673c6dbad23b" />
+> **Based on [PrintSphere by cptkirki](https://github.com/cptkirki/PrintSphere).**  
+> This repository is a derivative under the [Federation Non-Commercial License (FNCL) v1.1](LICENSE).  
+> See [NOTICE.md](NOTICE.md) for attribution and a summary of changes (notably **BigTreeTech Knomi v2** support).
 
-Latest stable version: **v1.6.2**
+Latest packaged line: **v1.6.2** (+ Knomi v2 variant)
 
 ## Supported hardware
 
-Choose the correct hardware in the installer:
-
-| Hardware | Installer name | Battery support |
+| Hardware | Variant id | Battery |
 | --- | --- | --- |
-| Waveshare ESP32-S3 Touch AMOLED 1.75 | `1.75 AMOLED` | Yes, including charging and USB detection |
-| Waveshare ESP32-S3 Touch LCD 2.8C | `2.8" LCD` | Yes, using the board's battery measurement |
+| Waveshare ESP32-S3 Touch AMOLED 1.75 | `amoled_1_75` | Yes (charging / USB detection) |
+| Waveshare ESP32-S3 Touch LCD 2.8C | `lcd_2_8c` | Yes (board measurement) |
+| BigTreeTech Knomi v2 | `knomi_v2` | No (USB/DC); dim / screen-off still apply |
 
-Firmware for one variant must not be installed on the other variant.
+Flash **only** the firmware built for your board. Variants are not interchangeable.
 
-## Install PrintSphere
+## Install
 
-You need a USB data cable and a desktop version of Chrome or Edge.
+You need a USB data cable and desktop Chrome or Edge.
 
-1. Open the **[PrintSphere Web Installer](https://cptkirki.github.io/PrintSphere/flash/)**.
+1. Open the **Web Installer** for this fork (GitHub Pages / Releases — see below).
 2. Select your hardware variant.
-3. Connect the device by USB and choose **Install selected firmware**.
-4. Keep the USB cable connected after installation.
-5. The installer searches for nearby Wi-Fi networks and sends your Wi-Fi details directly to PrintSphere over USB.
-6. Open Web Config using the IP address shown by PrintSphere and connect your Bambu printer.
+3. Connect the device and install the matching full image.
+4. Keep USB connected so Wi‑Fi can be provisioned over serial.
+5. Open **Web Config** on the IP shown on the display and connect your printer.
 
-### Wi-Fi fallback
+Upstream installer (original project): [cptkirki Web Installer](https://cptkirki.github.io/PrintSphere/flash/)
 
-If USB Wi-Fi setup is unavailable, connect to the fallback access point:
+### Wi‑Fi fallback
 
-- Wi-Fi name: `PrintSphere-Setup`
+- SSID: `PrintSphere-Setup`
 - Password: `printsphere`
-- Setup page: [http://192.168.4.1](http://192.168.4.1)
-
-Select your home Wi-Fi there. After PrintSphere connects, continue through Web Config on its home-network IP address.
+- Setup: [http://192.168.4.1](http://192.168.4.1)
 
 ## Connect your printer
 
-Web Config offers three connection modes:
+Web Config modes:
 
-- **Hybrid (recommended):** combines cloud and local data and automatically uses the better status path. Local camera snapshots remain available on supported printers.
-- **Cloud only:** uses Bambu Cloud for status and cover previews. Local MQTT and local camera snapshots are disabled.
-- **Local only:** connects directly to the printer without requiring a Bambu Cloud account. Cloud cover previews are unavailable.
+- **Hybrid (recommended)** — cloud + local; picks the better status path; local JPEG camera when supported  
+- **Cloud only** — Bambu Cloud status & covers; no local MQTT / local camera  
+- **Local only** — direct printer MQTT; no cloud covers  
 
-For Bambu Cloud, enter your account details and complete an email-code or 2FA step if requested.
+Local connection needs printer IP/hostname, serial, and access code.
 
-For a local connection, enter:
+## Updates (OTA)
 
-- Printer IP address or hostname
-- Printer serial number
-- Printer access code
+Use an **OTA** image so Wi‑Fi and printer settings stay in NVS.
 
-Cloud and local printer settings can normally be connected without restarting PrintSphere.
+1. Install or download the matching `printsphere_ota-*.bin` from [Releases](../../releases).
+2. In Web Config → Firmware Update, flash from file or URL.
 
-## Update without losing your settings
+Full USB images (`printsphere_full-*.bin`) are for first install or recovery.
 
-Use an **OTA update** for an already configured PrintSphere. OTA keeps Wi-Fi, printer profiles and display settings.
+## What’s in the box (features)
 
-1. Open the [PrintSphere Web Installer](https://cptkirki.github.io/PrintSphere/flash/).
-2. Select the same hardware variant currently installed on your device.
-3. In **OTA Update**, enter the IP address shown by PrintSphere.
-4. Open the OTA updater and confirm **Flash from URL** in Web Config.
+- Progress, remaining time, layers, nozzle/bed temps  
+- AMS + external spool  
+- Cloud cover + job title  
+- Local JPEG camera on supported models (A1 / A1 Mini / A2L / P1P / P1S)  
+- Chamber light on supported models  
+- Multi-printer profiles  
+- HMS / print-error text from the embedded lookup table  
+- Display rotation, status colors, sounds, portal PIN  
+- Battery-aware power policy on Waveshare boards  
 
-You can also open Web Config directly and use its **Firmware Update** section. It accepts either a matching OTA `.bin` file or a GitHub firmware URL.
+## Printer notes
 
-The public installer performs the initial USB flash. OTA itself runs through Web Config so the firmware can safely update the inactive application slot and retain the configuration.
-
-> Devices running v1.5.x or older need one initial USB flash before using v1.6.x OTA images because v1.6 introduced a new partition layout.
-
-## Main features
-
-- Print progress, remaining time, layers and temperatures
-- AMS and external-spool information
-- Cloud cover preview and project title
-- Local JPEG camera snapshots on supported printers
-- Pause, resume and stop controls
-- Chamber-light control on supported printers
-- Multi-printer profiles and live printer switching
-- Bambu HMS and error descriptions on the device
-- Adjustable display rotation and status colors
-- Battery-aware dimming and screen-off settings
-- Configurable sound notifications and custom WAV files
-- Secure Web Config access using a temporary PIN
-- OTA firmware updates that retain the device configuration
-
-## Printer and camera support
-
-PrintSphere contains status paths for:
-
+Status paths exist for:  
 `A1`, `A1 Mini`, `A2L`, `P1P`, `P1S`, `P2S`, `H2C`, `H2D`, `H2D Pro`, `H2S`, `X1`, `X1C`, `X1E`, `X2D`
 
-Local JPEG snapshots are available on `A1`, `A1 Mini`, `A2L`, `P1P` and `P1S`.
+RTSP cameras (X1 / H2 / P2S / X2D families) are **not** shown as live video on ESP32-S3. Cloud covers can still appear.
 
-`P2S`, the `H2` family, the `X1` family and `X2D` use RTSP video. The ESP32-S3 cannot decode these streams, so their live camera view is not available in PrintSphere. Cloud cover previews can still be shown.
+## Build from source
 
-The `H2` family and `X2D` require Developer Mode for local printer status. Availability of individual values can differ between printer models and firmware versions.
+ESP-IDF **v5.5.4**, Windows or Linux. See [docs/Build/README.md](docs/Build/README.md).
 
-## Web Config
+```bash
+# Example: Knomi v2
+idf.py -B build-knomi_v2 -DPRINTSPHERE_HW_VARIANT=knomi_v2 -p COMx build flash
+```
 
-Web Config includes:
+## Releases
 
-- Wi-Fi scanning and configuration
-- Cloud and local printer connections
-- Connection mode and printer selection
-- Display rotation, colors and time zone
-- Battery, USB and screen power-saving options
-- AMS display behavior
-- Sound notification settings
-- Portal PIN protection
-- Firmware updates by file upload or URL
+GitHub Releases publish:
 
-After initial setup, Web Config can be protected with a temporary six-digit PIN. Long-press the PrintSphere display for about one second to request a PIN.
+| File | Use |
+| --- | --- |
+| `printsphere_full-*-knomi_v2.bin` | USB first flash / recovery (Knomi) |
+| `printsphere_ota-*-knomi_v2.bin` | OTA (Knomi) |
+| `printsphere_full-*-2.8c.bin` / `…-amoled…` | Waveshare variants when packaged |
 
-## Known limitations
+## Credits
 
-- RTSP camera streams cannot be displayed on the ESP32-S3.
-- Newer printer families have received less real-world testing than `P1S` and `P1P`.
-- Some local V2 protocol values can differ from the older V1 printer fields.
-- Cloud features require internet access and a working Bambu Cloud account.
+- **Upstream:** [cptkirki/PrintSphere](https://github.com/cptkirki/PrintSphere) — core firmware, Web Config, cloud/local paths, Waveshare BSPs  
+- **This fork:** Knomi v2 port, layout fixes, rotation/HMS fixes — see [NOTICE.md](NOTICE.md)
 
-## Links
+## License
 
-- [PrintSphere Web Installer](https://cptkirki.github.io/PrintSphere/flash/)
-- [MakerWorld model](https://makerworld.com/de/models/2517189-printsphere-bambu-status-display-standalone-1-75)
-- [v1.6.2 release notes](release/RELEASE_NOTES_v1.6.2.md)
-- [Building, cloning and manual flashing](docs/Build/README.md)
-- [License](LICENSE)
+[Federation Non-Commercial License (FNCL) v1.1](LICENSE) — non-commercial use; keep license + mark modifications. Commercial use needs a separate license from the copyright holder.
