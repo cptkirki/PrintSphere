@@ -77,6 +77,8 @@ constexpr int kLayerY = 40;
 constexpr int kRemainingRowY = 85;
 // Keep detail above the round-panel clip zone (center+102 was unreadable).
 constexpr int kDetailY = 58;
+// AP / MQTT / portal link copy uses the layer band until the printer is online.
+constexpr int kDetailSetupY = 40;
 constexpr int kBadgeSize = 44;
 constexpr int kLogoBadgeSize = 52;
 constexpr int kLogoScale = 100;
@@ -98,11 +100,13 @@ constexpr int kPage2PrintButtonY = 88;
 #endif
 constexpr int kPage2EmptyNoteY = -7;      // ui_px(-14) ≈ -7 on 240
 constexpr int kPage2EmptySubnoteY = 9;    // ui_px(18) ≈ 9
-constexpr int kPage3CameraHeight = 120;
+// Fit inside the round 240 bezel with room for status/subnote labels.
+constexpr int kPage3CameraWidth = 200;
+constexpr int kPage3CameraHeight = 112;
 constexpr int kPage3CameraYOffset = 0;
 constexpr int kPage3StatusAboveImageY = -78;
 constexpr int kPage3SubnoteWithImageY = 78;
-constexpr int kPage3EmptySubnoteY = 14;   // ui_px(28) ≈ 14
+constexpr int kPage3EmptySubnoteY = 28;  // below centered "Tap for new image"
 // AMS geometry (dedicated; keep inside round bezel / under progress ring).
 constexpr int kAmsShelfW = 168;
 constexpr int kAmsShelfH = 48;
@@ -176,6 +180,7 @@ constexpr int kBedValueX = 108;
 constexpr int kLayerY = 70;
 constexpr int kRemainingRowY = 172;
 constexpr int kDetailY = 114;
+constexpr int kDetailSetupY = 70;
 constexpr int kBadgeSize = 86;
 constexpr int kLogoBadgeSize = 120;
 constexpr int kLogoScale = 183;
@@ -196,6 +201,7 @@ constexpr int kPage2PrintButtonY = 110;
 #endif
 constexpr int kPage2EmptyNoteY = -14;
 constexpr int kPage2EmptySubnoteY = 18;
+constexpr int kPage3CameraWidth = board::kDisplayWidth;
 constexpr int kPage3CameraHeight = 224;
 constexpr int kPage3CameraYOffset = 0;
 constexpr int kPage3StatusAboveImageY = -138;
@@ -1328,9 +1334,8 @@ std::string camera_subnote_text(const PrinterSnapshot& snapshot) {
     }
     return {};
   }
-  if (!snapshot.job_name.empty()) {
-    return snapshot.job_name;
-  }
+  // Empty / loading: never put the job filename here. On 240px it wraps into
+  // the centered "Tap for new image" / status note and covers it.
   return "Auto-refresh every 2s";
 }
 
@@ -1408,6 +1413,11 @@ bool should_show_logo(const PrinterSnapshot& snapshot) {
     default:
       return true;
   }
+}
+
+// Layer / print metrics only make sense once MQTT (or cloud) reports online.
+bool printer_link_ready(const PrinterSnapshot& snapshot) {
+  return snapshot.connection == PrinterConnectionState::kOnline;
 }
 
 // Micro-interaction: uniform scale on card tap (256 = 100% in LVGL 9)
@@ -2172,35 +2182,34 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   }
   detail_visible_ = !detail.empty();
   if (detail_visible_) {
-    // Scroll long error / HMS messages so the full TSV-resolved text is
-    // readable on the narrow label.  Warnings (HMS codes without `has_error`)
-    // also scroll: the user otherwise only sees a wrapped/truncated bare
-    // code where the lookup text would not fit on a single line.
+    // Scroll long HMS/error text and long job filenames so they stay readable
+    // on the narrow detail label. Portal/setup copy keeps WRAP so IPs/URLs
+    // remain fully visible on multiple lines.
     const bool has_hms_or_error = snapshot.has_error ||
                                   snapshot.print_error_code != 0 ||
                                   !snapshot.hms_codes.empty() ||
                                   snapshot.hms_alert_count > 0;
-    // LVGL's circular-scroll long mode triggers continuous widget invalidation
-    // for the running marquee animation. That work happens regardless of the
-    // detail label being on screen, so on the AMS / preview pages it just
-    // burns LVGL-lock time. Only enable scrolling when the main page is
-    // actually settled in front of the user — every other state falls back
-    // to the cheaper LV_LABEL_LONG_WRAP, which renders once and is silent.
+    const bool is_job_filename =
+        !snapshot.job_name.empty() && detail == snapshot.job_name;
+    // Circular-scroll permanently invalidates the label; only enable it when
+    // the main status page is settled in front of the user.
     const bool main_page_visible = !scrolling_ && active_page_ == kPageIdxMain;
-#if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
-    // WRAP so portal IPs stay fully readable; scroll only for long error text.
     const lv_label_long_mode_t desired_mode =
-        (has_hms_or_error && main_page_visible) ? LV_LABEL_LONG_SCROLL_CIRCULAR
-                                                 : LV_LABEL_LONG_WRAP;
-#else
-    const lv_label_long_mode_t desired_mode =
-        (has_hms_or_error && main_page_visible) ? LV_LABEL_LONG_SCROLL_CIRCULAR
-                                                 : LV_LABEL_LONG_WRAP;
-#endif
+        (main_page_visible && (has_hms_or_error || is_job_filename))
+            ? LV_LABEL_LONG_SCROLL_CIRCULAR
+            : LV_LABEL_LONG_WRAP;
     if (lv_label_get_long_mode(detail_label_) != desired_mode) {
       lv_label_set_long_mode(detail_label_, desired_mode);
     }
     set_label_text_if_changed(detail_label_, detail);
+  }
+  // AP / MQTT / portal messages sit higher and reclaim the Layer row until linked.
+  {
+    const int detail_y = printer_link_ready(snapshot) ? kDetailY : kDetailSetupY;
+    lv_obj_align(detail_label_, LV_ALIGN_CENTER, 0, detail_y);
+    if (portal_hint_label_ != nullptr) {
+      lv_obj_align(portal_hint_label_, LV_ALIGN_CENTER, 0, detail_y);
+    }
   }
 
   const std::string layer = layer_text(snapshot);
@@ -2358,18 +2367,24 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     set_label_text_if_changed(page2_note_, preview_note);
   }
   set_hidden(page2_subnote_, preview_subnote.empty());
-  if (!preview_subnote.empty()) {
-    set_label_text_if_changed(page2_subnote_, preview_subnote);
-  }
-  // Avoid LV_LABEL_LONG_SCROLL_CIRCULAR here. It is a permanent LVGL animation
-  // and on the preview page it competes with large image redraws under the
-  // display lock. Use a static dotted title instead.
+  // Long job filenames (.3mf / .stl) scroll when the preview page is settled.
+  // Off-page / while swiping: fall back to DOT/WRAP so the marquee animation
+  // does not keep invalidating under the display lock (same pattern as HMS).
   {
-    const bool image_title = active_page_ == kPageIdxPreview && has_page2_image;
-    const lv_label_long_mode_t desired = image_title ? LV_LABEL_LONG_DOT : LV_LABEL_LONG_WRAP;
+    const bool preview_page_visible = !scrolling_ && active_page_ == kPageIdxPreview;
+    const bool image_title = cover_layout && !preview_subnote.empty();
+    lv_label_long_mode_t desired = LV_LABEL_LONG_WRAP;
+    if (image_title && preview_page_visible) {
+      desired = LV_LABEL_LONG_SCROLL_CIRCULAR;
+    } else if (image_title) {
+      desired = LV_LABEL_LONG_DOT;
+    }
     if (lv_label_get_long_mode(page2_subnote_) != desired) {
       lv_label_set_long_mode(page2_subnote_, desired);
     }
+  }
+  if (!preview_subnote.empty()) {
+    set_label_text_if_changed(page2_subnote_, preview_subnote);
   }
 
   update_print_buttons_locked(snapshot);
@@ -3589,8 +3604,9 @@ esp_err_t Ui::build_dashboard() {
 #endif  // CONFIG_PRINTSPHERE_EXPERIMENTAL_PRINT_CONTROL
 
   page3_image_ = lv_image_create(page3_);
-  lv_obj_set_size(page3_image_, board::kDisplayWidth, kPage3CameraHeight);
-  lv_image_set_inner_align(page3_image_, LV_IMAGE_ALIGN_CENTER);
+  lv_obj_set_size(page3_image_, kPage3CameraWidth, kPage3CameraHeight);
+  // Scale to fit the widget (camera JPEGs are often much larger than the panel).
+  lv_image_set_inner_align(page3_image_, LV_IMAGE_ALIGN_CONTAIN);
   lv_obj_align(page3_image_, LV_ALIGN_CENTER, 0, kPage3CameraYOffset);
   lv_obj_add_flag(page3_image_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(page3_image_, LV_OBJ_FLAG_CLICKABLE);
@@ -3671,7 +3687,7 @@ void Ui::apply_page_visibility() {
   set_hidden(page3_, !camera_page_available_);
   set_hidden(status_label_, !on_page1);
   set_hidden(detail_label_, !on_page1 || !detail_visible_ || show_portal_hint);
-  set_hidden(layer_row_, !on_page1);
+  set_hidden(layer_row_, !on_page1 || !printer_link_ready(last_snapshot_));
 #if defined(PRINTSPHERE_HW_VARIANT_KNOMI_V2)
   set_hidden(battery_icon_label_, true);
   set_hidden(battery_pct_label_, true);
