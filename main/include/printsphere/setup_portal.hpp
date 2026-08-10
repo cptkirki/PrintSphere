@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -87,6 +88,7 @@ class SetupPortal {
 #endif
   static void ota_url_task(void* context);
   static void reboot_task(void* context);
+  bool schedule_reboot();
   bool is_provisioning_complete() const;
   bool is_lock_required() const;
   bool is_request_authorized(httpd_req_t* request);
@@ -106,7 +108,7 @@ class SetupPortal {
   const PmuManager& pmu_manager_;
   AudioNotifier& audio_notifier_;
   httpd_handle_t server_ = nullptr;
-  bool reboot_requested_ = false;
+  std::atomic<bool> reboot_requested_{false};
   std::mutex access_mutex_{};
   // OTA URL state (protected by ota_url_mutex_)
   enum class OtaUrlState { kIdle, kDownloading, kDone, kFailed };

@@ -40,6 +40,8 @@ class Application {
   SourceMode last_source_mode_ = SourceMode::kHybrid;
   bool last_wifi_connected_ = false;
   bool last_camera_page_active_ = false;
+  bool last_config_page_active_ = false;
+  bool last_config_local_connected_ = false;
   bool hybrid_local_gate_open_ = false;
   TickType_t hybrid_camera_cooldown_deadline_ = 0;
   std::atomic<TickType_t> local_mqtt_handoff_until_tick_{0};

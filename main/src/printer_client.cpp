@@ -829,6 +829,8 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
   const int count = cJSON_GetArraySize(info_array);
   float first_temp = -1000.0f;
   float fallback_secondary = -1000.0f;
+  bool matched_active = false;
+  bool matched_secondary = false;
   for (int i = 0; i < count; ++i) {
     const cJSON* item = cJSON_GetArrayItem(info_array, i);
     if (!cJSON_IsObject(item)) {
@@ -847,19 +849,25 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
       first_temp = temp;
     }
 
-    if (id == active_nozzle_index) {
+    if (active_nozzle_index >= 0 && id == active_nozzle_index) {
       *active_temp = temp;
-    } else if (id >= 0 && *secondary_temp <= 0.0f) {
+      matched_active = true;
+    } else if (active_nozzle_index >= 0 && id >= 0) {
       *secondary_temp = temp;
-    } else if (fallback_secondary < -999.0f) {
+      matched_secondary = true;
+    } else if (active_nozzle_index >= 0 && fallback_secondary < -999.0f) {
       fallback_secondary = temp;
     }
   }
 
-  if (*active_temp <= 0.0f && first_temp > -999.0f) {
+  // Do not use the previous runtime temperature to decide whether this payload
+  // is allowed to update it. Some V2 payloads omit an id (or use an id other
+  // than zero for a single nozzle), so the first fresh sample is the active
+  // hotend when no explicit active-id match was found.
+  if (!matched_active && first_temp > -999.0f) {
     *active_temp = first_temp;
   }
-  if (*secondary_temp <= 0.0f && fallback_secondary > -999.0f) {
+  if (!matched_secondary && fallback_secondary > -999.0f) {
     *secondary_temp = fallback_secondary;
   }
 }
@@ -917,10 +925,9 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
   const cJSON* extruder = child_object_local(device, "extruder");
   const int active_nozzle_index = extract_active_nozzle_index(device);
   bundle.active_nozzle_index = active_nozzle_index;
-  const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
   merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                               merge_index, &bundle.active, &bundle.secondary);
-  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), merge_index,
+                               active_nozzle_index, &bundle.active, &bundle.secondary);
+  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), active_nozzle_index,
                                &bundle.active, &bundle.secondary);
   ESP_LOGD(kTag, "[DBG] nozzle bundle final: active=%.1f secondary=%.1f active_nozzle_idx=%d",
            bundle.active, bundle.secondary, active_nozzle_index);

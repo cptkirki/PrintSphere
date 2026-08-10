@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -179,6 +180,9 @@ class ConfigStore {
   // callers (HTTP handlers on httpd task + main loop) cannot race and clobber
   // `prn_count` / profile slot assignments (see /api/printers/save upsert).
   mutable std::mutex printer_profile_mutex_{};
+  // -1 until first load; subsequent main-loop reads are served without opening
+  // NVS, while portal saves update the cached value immediately.
+  mutable std::atomic<int> cached_source_mode_{-1};
 };
 
 }  // namespace printsphere

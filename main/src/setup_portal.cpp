@@ -76,6 +76,44 @@ std::string json_escape(const std::string& input) {
   return output;
 }
 
+std::string html_escape(const std::string& input) {
+  std::string output;
+  output.reserve(input.size());
+  for (const char ch : input) {
+    switch (ch) {
+      case '&': output += "&amp;"; break;
+      case '<': output += "&lt;"; break;
+      case '>': output += "&gt;"; break;
+      case '"': output += "&quot;"; break;
+      case '\'': output += "&#39;"; break;
+      default: output.push_back(ch); break;
+    }
+  }
+  return output;
+}
+
+// Escapes a value placed inside a quoted JavaScript string in an inline
+// <script>. Escaping '<' prevents a value containing "</script>" from ending
+// the element before the JavaScript parser sees the string literal.
+std::string script_string_escape(const std::string& input) {
+  std::string output;
+  output.reserve(input.size());
+  for (const unsigned char ch : input) {
+    switch (ch) {
+      case '\\': output += "\\\\"; break;
+      case '"': output += "\\\""; break;
+      case '\n': output += "\\n"; break;
+      case '\r': output += "\\r"; break;
+      case '\t': output += "\\t"; break;
+      case '<': output += "\\u003C"; break;
+      case '>': output += "\\u003E"; break;
+      case '&': output += "\\u0026"; break;
+      default: output.push_back(static_cast<char>(ch)); break;
+    }
+  }
+  return output;
+}
+
 std::string read_string_field(const cJSON* object, const char* key) {
   const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
   if (!cJSON_IsString(item) || item->valuestring == nullptr) {
@@ -985,7 +1023,7 @@ esp_err_t SetupPortal::send_unlock_page(httpd_req_t* request) {
   html += ".status{margin:10px 0 0;color:#f0a64b;font-weight:700;}.micro{margin-top:18px;font-size:14px;color:#94a3b8;}</style></head><body><main class=\"card\">";
   html += "<h1>Portal Locked</h1>";
   html += "<p id=\"detail\">";
-  html += json_escape(access.detail);
+  html += html_escape(access.detail);
   html += "</p>";
   html += "<form id=\"unlock-form\"><label for=\"pin\">Unlock PIN</label><input id=\"pin\" inputmode=\"numeric\" autocomplete=\"one-time-code\" maxlength=\"6\" placeholder=\"000000\">";
   html += "<button type=\"submit\" id=\"unlock-button\">Unlock Web Config</button></form>";
@@ -1451,6 +1489,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       bat_policy.dim_enabled || bat_policy.screen_off_enabled ? "info" : "idle";
   const PowerSnapshot power = portal->pmu_manager_.sample();
   std::string html;
+  html.reserve(48U * 1024U);
 
   const auto add_badge = [](std::string* html, const char* id, const std::string& label,
                             const std::string& value, const char* state_class) {
@@ -1465,7 +1504,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     *html += "><span class=\"badge-label\">";
     *html += label;
     *html += "</span><span class=\"badge-value\">";
-    *html += json_escape(value);
+    *html += html_escape(value);
     *html += "</span></div>";
   };
   const auto add_summary_pill = [](std::string* html, const std::string& value,
@@ -1479,7 +1518,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       *html += "\"";
     }
     *html += ">";
-    *html += json_escape(value);
+    *html += html_escape(value);
     *html += "</span>";
   };
   const auto begin_collapsible_section =
@@ -1627,7 +1666,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
 
   html += "<section class=\"hero\">";
   html += "<div class=\"hero-top\"><div class=\"hero-brand\"><div class=\"eyebrow\">PrintSphere</div><a class=\"hero-version\" href=\"https://github.com/cptkirki/PrintSphere\" target=\"_blank\" rel=\"noopener noreferrer\">";
-  html += json_escape(kPortalReleaseVersion);
+  html += html_escape(kPortalReleaseVersion);
   html += "</a></div><div id=\"portal-timer\" style=\"display:none\" title=\"Click to extend session by 5 minutes\"></div></div>";
   html += "<h1 class=\"title\">Web Config</h1>";
   html += "<p class=\"subtitle\">";
@@ -1659,14 +1698,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"wifi-scan-button\">Scan Networks</button>";
     html += "<div class=\"micro\" id=\"wifi-scan-detail\">Scan for visible networks or type an SSID manually.</div></div>";
     html += "<div class=\"field\" id=\"wifi-ssid-manual-field\"><label for=\"wifi_ssid\">Wi-Fi SSID</label><input id=\"wifi_ssid\" value=\"";
-    html += json_escape(wifi.ssid);
+    html += html_escape(wifi.ssid);
     html += "\" autocomplete=\"off\"></div>";
     html += "<div class=\"field\" id=\"wifi-ssid-scan-field\" style=\"display:none\"><label for=\"wifi_ssid_select\">Detected Networks</label><select id=\"wifi_ssid_select\"><option value=\"\">Select detected Wi-Fi...</option></select></div>";
     html += "<div class=\"field\"><label for=\"wifi_password\">Wi-Fi Password</label><input id=\"wifi_password\" type=\"password\" value=\"\" placeholder=\"";
-    html += json_escape(wifi_password_placeholder);
+    html += html_escape(wifi_password_placeholder);
     html += "\" autocomplete=\"off\"></div>";
     html += "<p class=\"micro\">Current network status: <span id=\"wifi-detail\">";
-    html += json_escape(wifi_badge_value);
+    html += html_escape(wifi_badge_value);
     html += "</span></p>";
     end_collapsible_section();
   };
@@ -1677,10 +1716,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         cloud_badge_value, cloud_badge_class, cloud_section_open, "cloud-section-pill");
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_email\">Bambu Email / Phone</label><input id=\"cloud_email\" value=\"";
-    html += json_escape(cloud.email);
+    html += html_escape(cloud.email);
     html += "\" autocomplete=\"username\"></div>";
     html += "<div class=\"field\"><label for=\"cloud_password\">Bambu Password</label><input id=\"cloud_password\" type=\"password\" value=\"\" placeholder=\"";
-    html += json_escape(cloud_password_placeholder);
+    html += html_escape(cloud_password_placeholder);
     html += "\" autocomplete=\"current-password\"></div>";
     html += "</div>";
     html += "<div class=\"field\"><label for=\"cloud_region\">Cloud Region</label><select id=\"cloud_region\">";
@@ -1700,15 +1739,15 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     }
     html += ">CN</option></select></div>";
     html += "<div class=\"hint-box\"><strong>Printer Status:</strong> <span id=\"cloud-detail\">";
-    html += json_escape(cloud_snapshot.detail);
+    html += html_escape(cloud_snapshot.detail);
     html += "</span><div class=\"micro\" id=\"mqtt-cloud-telemetry\" style=\"margin-top:4px;color:#666;\"></div></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"cloud-connect-button\">Connect Cloud</button>";
     html += "<div class=\"micro\">This saves the cloud credentials immediately. In Hybrid and Cloud only it also starts the login without rebooting.</div></div>";
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"cloud_verification_code\" id=\"cloud-verification-label\">";
-    html += json_escape(cloud_code_label);
+    html += html_escape(cloud_code_label);
     html += "</label><input id=\"cloud_verification_code\" value=\"\" autocomplete=\"one-time-code\" placeholder=\"";
-    html += json_escape(cloud_code_placeholder);
+    html += html_escape(cloud_code_placeholder);
     html += "\"></div>";
     html += "<div class=\"field\"><label>&nbsp;</label><button type=\"button\" class=\"secondary\" id=\"verify-button\">Submit Code</button></div>";
     html += "</div>";
@@ -1717,7 +1756,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += " hidden";
     }
     html += "\" id=\"cloud-verify-note\">";
-    html += json_escape(cloud_code_note);
+    html += html_escape(cloud_code_note);
     html += "</p>";
     end_collapsible_section();
   };
@@ -1728,17 +1767,17 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
         local_badge_value, local_badge_class, local_section_open, "local-section-pill");
     html += "<div class=\"grid-2\">";
     html += "<div class=\"field\"><label for=\"printer_host\">Printer IP or Hostname</label><input id=\"printer_host\" value=\"";
-    html += json_escape(printer.host);
+    html += html_escape(printer.host);
     html += "\" autocomplete=\"off\"></div>";
     html += "<div class=\"field\"><label for=\"printer_serial\">Printer Serial Number</label><input id=\"printer_serial\" value=\"";
-    html += json_escape(effective_printer_serial);
+    html += html_escape(effective_printer_serial);
     html += "\" autocomplete=\"off\"></div>";
     html += "</div>";
     html += "<div class=\"field\"><label for=\"printer_access_code\">Access Code</label><input id=\"printer_access_code\" type=\"password\" value=\"\" placeholder=\"";
-    html += json_escape(printer_access_code_placeholder);
+    html += html_escape(printer_access_code_placeholder);
     html += "\" autocomplete=\"off\"></div>";
     html += "<div class=\"hint-box\"><strong>Local Status:</strong> <span id=\"local-detail\">";
-    html += json_escape(local_snapshot.detail);
+    html += html_escape(local_snapshot.detail);
     html += "</span><div class=\"micro\" id=\"mqtt-local-telemetry\" style=\"margin-top:4px;color:#666;\"></div></div>";
     html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"local-connect-button\">Connect Local</button>";
     html += "<div class=\"micro\">This saves the local printer credentials immediately. In Hybrid and Local only it also reconnects MQTT and camera without rebooting.</div></div>";
@@ -1793,7 +1832,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += "<div class=\"actions\"><button type=\"button\" class=\"primary hidden\" id=\"display-rotation-apply-button\">Apply + Restart</button>";
     html += "<div class=\"micro hidden\" id=\"display-rotation-apply-hint\">The new panel orientation is applied on the next boot so display and touch stay in sync.</div></div>";
     html += "<p class=\"micro\">Current orientation: ";
-    html += json_escape(display_rotation_badge_value(display_rotation));
+    html += html_escape(display_rotation_badge_value(display_rotation));
     html += "</p>";
     end_settings_panel();
 
@@ -2186,18 +2225,18 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += "\" data-index=\"";
       html += std::to_string(p.index);
       html += "\" data-serial=\"";
-      html += json_escape(p.serial);
+      html += html_escape(p.serial);
       html += "\">";
       html += "<div class=\"printer-card-header\">";
       html += "<input type=\"text\" class=\"printer-name-input\" data-index=\"";
       html += std::to_string(p.index);
       html += "\" data-serial=\"";
-      html += json_escape(p.serial);
+      html += html_escape(p.serial);
       html += "\" value=\"";
       const std::string card_name = p.display_name.empty()
           ? (!p.model.empty() ? p.model : ("Printer " + std::to_string(p.index + 1)))
           : p.display_name;
-      html += json_escape(card_name);
+      html += html_escape(card_name);
       html += "\" placeholder=\"Profile name\">";
       html += "<span class=\"summary-pill ";
       html += is_active ? "ok" : "idle";
@@ -2207,12 +2246,12 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += "<div class=\"printer-card-body\">";
       if (!p.model.empty()) {
         html += "<span class=\"printer-tag\">";
-        html += json_escape(p.model);
+        html += html_escape(p.model);
         html += "</span>";
       }
       if (p.has_local_config()) {
         html += "<span class=\"printer-tag\">Local: ";
-        html += json_escape(p.host);
+        html += html_escape(p.host);
         html += "</span>";
       }
       if (has_cloud) {
@@ -2220,7 +2259,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       }
       if (!p.serial.empty()) {
         html += "<span class=\"printer-tag\">";
-        html += json_escape(p.serial.substr(0, 6) + "...");
+        html += html_escape(p.serial.substr(0, 6) + "...");
         html += "</span>";
       }
       html += "</div>";
@@ -2247,10 +2286,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       }
       if (already_saved) continue;
       html += "<div class=\"printer-card cloud-only\" data-serial=\"";
-      html += json_escape(cd.serial);
+      html += html_escape(cd.serial);
       html += "\">";
       html += "<div class=\"printer-card-header\"><strong>";
-      html += json_escape(cd.display_name.empty() ? to_string(cd.model) : cd.display_name);
+      html += html_escape(cd.display_name.empty() ? to_string(cd.model) : cd.display_name);
       html += "</strong><span class=\"summary-pill info\">Cloud only</span></div>";
       html += "<div class=\"printer-card-body\">";
       html += "<span class=\"printer-tag\">";
@@ -2260,13 +2299,13 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       html += cd.online ? "Online" : "Offline";
       html += "</span>";
       html += "<span class=\"printer-tag\">";
-      html += json_escape(cd.serial.substr(0, 6) + "...");
+      html += html_escape(cd.serial.substr(0, 6) + "...");
       html += "</span></div>";
       html += "<div class=\"printer-card-actions\">";
       html += "<button type=\"button\" class=\"secondary printer-add-cloud-btn\" data-serial=\"";
-      html += json_escape(cd.serial);
+      html += html_escape(cd.serial);
       html += "\" data-name=\"";
-      html += json_escape(cd.display_name);
+      html += html_escape(cd.display_name);
       html += "\" data-model=\"";
       html += to_string(cd.model);
       html += "\">Add to Profiles</button></div></div>";
@@ -2383,16 +2422,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "<section class=\"footer-card\">";
   html += "<div class=\"actions\">";
   html += "<button type=\"submit\" class=\"primary\" id=\"save-button\">";
-  html += json_escape(save_button_label);
+  html += html_escape(save_button_label);
   html += "</button>";
   html += "<div class=\"micro\">";
-  html += json_escape(save_button_hint);
+  html += html_escape(save_button_hint);
   html += "</div>";
   html += "</div>";
   html += "<div class=\"status-line\" id=\"status\">";
-  html += json_escape(initial_status_line);
+  html += html_escape(initial_status_line);
   html += "</div><div class=\"status-detail\" id=\"status-detail\">";
-  html += json_escape(initial_status_detail);
+  html += html_escape(initial_status_detail);
   html += "</div>";
   html += "</section>";
   html += "</form>";
@@ -2465,9 +2504,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "let wifiScanInFlight=false;";
   html += "document.querySelectorAll('.settings-accordion').forEach(group=>{group.querySelectorAll('.settings-panel').forEach(panel=>{panel.addEventListener('toggle',()=>{if(!panel.open)return;group.querySelectorAll('.settings-panel').forEach(other=>{if(other!==panel)other.open=false;});});});});";
   html += "const savedConfig={cloud_email:\"";
-  html += json_escape(cloud.email);
+  html += script_string_escape(cloud.email);
   html += "\",cloud_region:\"";
-  html += json_escape(to_string(cloud.region));
+  html += script_string_escape(to_string(cloud.region));
   html += "\",source_mode:\"";
   html += to_string(source_mode);
   html += "\",display_rotation:\"";
@@ -2475,9 +2514,9 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "\",portal_lock_enabled:";
   html += portal_lock_enabled ? "true" : "false";
   html += ",printer_host:\"";
-  html += json_escape(printer.host);
+  html += script_string_escape(printer.host);
   html += "\",printer_serial:\"";
-  html += json_escape(effective_printer_serial);
+  html += script_string_escape(effective_printer_serial);
   html += "\",wifi_password_saved:";
   html += wifi_password_saved ? "true" : "false";
   html += ",cloud_password_saved:";
@@ -2505,7 +2544,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += ",filament_anim:";
   html += filament_anim ? "true" : "false";
   html += ",tz_iana:\"";
-  html += json_escape(portal->config_store_.load_timezone_iana());
+  html += script_string_escape(portal->config_store_.load_timezone_iana());
   html += "\"";
   html += "};";
   html += "function setStatus(line,detail,lockMs){statusEl.textContent=line||'';statusDetailEl.textContent=detail||'';"
@@ -3606,9 +3645,11 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_battery_display_policy(bat_policy_post), kTag,
                       "save battery display policy failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Settings were saved, but the restart task could not be started. Restart the device manually.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3687,9 +3728,11 @@ esp_err_t SetupPortal::handle_source_mode_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_source_mode(source_mode), kTag,
                       "save source mode failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Connection mode was saved, but the restart task could not be started.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3718,9 +3761,11 @@ esp_err_t SetupPortal::handle_display_rotation_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_display_rotation(rotation), kTag,
                       "save display rotation failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Display rotation was saved, but the restart task could not be started.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3779,9 +3824,11 @@ esp_err_t SetupPortal::handle_battery_display_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_battery_display_policy(policy), kTag,
                       "save battery display policy failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Power settings were saved, but the restart task could not be started.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3812,9 +3859,11 @@ esp_err_t SetupPortal::handle_portal_access_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_portal_lock_enabled(portal_lock_enabled), kTag,
                       "save portal lock failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Portal access was saved, but the restart task could not be started.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3849,9 +3898,11 @@ esp_err_t SetupPortal::handle_ams_display_post(httpd_req_t* request) {
   ESP_RETURN_ON_ERROR(portal->config_store_.save_filament_anim_enabled(filament_anim), kTag,
                       "save filament anim failed");
 
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"AMS display settings were saved, but the restart task could not be started.\"}");
+    return ESP_OK;
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -4075,23 +4126,34 @@ bool parse_wav_pcm(const uint8_t* data, size_t len, std::vector<int16_t>& sample
   size_t pcm_bytes = 0;
 
   size_t pos = 12;
-  while (pos + 8 <= len) {
+  while (pos <= len && len - pos >= 8) {
     uint32_t chunk_size = 0;
     std::memcpy(&chunk_size, data + pos + 4, 4);
+    const size_t available = len - pos - 8;
+    if (static_cast<size_t>(chunk_size) > available) {
+      error_out = "truncated WAV chunk";
+      return false;
+    }
     if (std::memcmp(data + pos, "fmt ", 4) == 0 && chunk_size >= 16) {
       std::memcpy(&audio_format, data + pos + 8, 2);
       std::memcpy(&channels, data + pos + 10, 2);
       std::memcpy(&sample_rate, data + pos + 12, 4);
       std::memcpy(&bits_per_sample, data + pos + 22, 2);
     } else if (std::memcmp(data + pos, "data", 4) == 0) {
-      if (pos + 8 <= len) {
-        pcm_data = data + pos + 8;
-        pcm_bytes = std::min(static_cast<size_t>(chunk_size), len - pos - 8);
-      }
+      pcm_data = data + pos + 8;
+      pcm_bytes = static_cast<size_t>(chunk_size);
     }
-    pos += 8 + chunk_size;
-    if (chunk_size & 1U) pos++;  // RIFF pads odd-length chunks to 2-byte boundary
-    if (pos == 0) break;  // guard against chunk_size wrap
+    const size_t padded_size = static_cast<size_t>(chunk_size) + (chunk_size & 1U);
+    if (padded_size > available) {
+      // A final odd-sized chunk may omit its optional RIFF padding byte.
+      if ((chunk_size & 1U) == 0U || static_cast<size_t>(chunk_size) != available) {
+        error_out = "truncated WAV padding";
+        return false;
+      }
+      pos = len;
+    } else {
+      pos += 8 + padded_size;
+    }
   }
 
   if (pcm_data == nullptr) { error_out = "data chunk not found"; return false; }
@@ -4846,16 +4908,28 @@ esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
 
   ESP_LOGI(kTag, "OTA upload complete: %d bytes written, scheduling reboot", received);
   send_json(request, "{\"status\":\"success\",\"rebooting\":true}");
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
-  }
+  portal->schedule_reboot();
   return ESP_OK;
 }
 
 void SetupPortal::reboot_task(void*) {
   vTaskDelay(pdMS_TO_TICKS(1500));
   esp_restart();
+}
+
+bool SetupPortal::schedule_reboot() {
+  bool expected = false;
+  if (!reboot_requested_.compare_exchange_strong(expected, true)) {
+    return true;
+  }
+  const BaseType_t created =
+      xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, this, 4, nullptr);
+  if (created != pdPASS) {
+    reboot_requested_.store(false);
+    ESP_LOGE(kTag, "Failed to create reboot task");
+    return false;
+  }
+  return true;
 }
 
 esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
@@ -4919,7 +4993,19 @@ esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
   }
 
   ESP_LOGI(kTag, "Starting OTA URL task: %s", url.c_str());
-  xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr);
+  const BaseType_t created =
+      xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr);
+  if (created != pdPASS) {
+    {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error = "Not enough memory to start OTA";
+    }
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    send_json(request,
+              "{\"error\":\"OTA task unavailable\",\"detail\":\"Not enough memory to start the firmware download.\"}");
+    return ESP_OK;
+  }
 
   std::string body = "{\"status\":\"started\",\"url\":\"";
   body += json_escape(url);
@@ -5044,10 +5130,7 @@ void SetupPortal::ota_url_task(void* context) {
     portal->ota_url_status_.state = OtaUrlState::kDone;
     portal->ota_url_status_.progress_percent = 100;
   }
-  if (!portal->reboot_requested_) {
-    portal->reboot_requested_ = true;
-    xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, portal, 4, nullptr);
-  }
+  portal->schedule_reboot();
   vTaskDelete(nullptr);
 }
 

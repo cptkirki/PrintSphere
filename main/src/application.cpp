@@ -361,24 +361,30 @@ void Application::run() {
       cloud_client_.configure(config_store_.load_cloud_credentials(), new_conn.serial);
       ESP_LOGI(kTag, "Switched active printer to profile %d", switch_idx);
     }
-    if (ui_.is_config_page_active()) {
-      const auto profiles = config_store_.load_printer_profiles();
-      const uint8_t active_idx = config_store_.load_active_printer_index();
+    const bool config_page_active = ui_.is_config_page_active();
+    if (config_page_active) {
       const bool local_connected = printer_client_.snapshot().local_connected;
-      std::vector<Ui::PrinterCardInfo> cards;
-      cards.reserve(profiles.size());
-      for (const auto& p : profiles) {
-        Ui::PrinterCardInfo ci;
-        ci.index = p.index;
-        ci.name = p.display_name;
-        ci.model = p.model;
-        ci.host = p.host;
-        ci.active = (p.index == active_idx);
-        ci.connected = ci.active && local_connected;
-        cards.push_back(std::move(ci));
+      if (!last_config_page_active_ || local_connected != last_config_local_connected_ ||
+          switch_idx >= 0) {
+        const auto profiles = config_store_.load_printer_profiles();
+        const uint8_t active_idx = config_store_.load_active_printer_index();
+        std::vector<Ui::PrinterCardInfo> cards;
+        cards.reserve(profiles.size());
+        for (const auto& p : profiles) {
+          Ui::PrinterCardInfo ci;
+          ci.index = p.index;
+          ci.name = p.display_name;
+          ci.model = p.model;
+          ci.host = p.host;
+          ci.active = (p.index == active_idx);
+          ci.connected = ci.active && local_connected;
+          cards.push_back(std::move(ci));
+        }
+        ui_.update_printer_cards(cards);
       }
-      ui_.update_printer_cards(cards);
+      last_config_local_connected_ = local_connected;
     }
+    last_config_page_active_ = config_page_active;
     const PortalAccessSnapshot portal_access = setup_portal_.access_snapshot();
     const bool wifi_connected = wifi_manager_.is_station_connected();
     const std::string wifi_ip = wifi_manager_.station_ip();
