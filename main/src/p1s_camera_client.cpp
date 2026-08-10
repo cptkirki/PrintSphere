@@ -14,6 +14,7 @@
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
+#include "mbedtls/ssl.h"
 
 namespace printsphere {
 
@@ -243,6 +244,10 @@ bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
       return false;
     }
     const ssize_t read = esp_tls_conn_read(tls, out + offset, length - offset);
+    if (read == MBEDTLS_ERR_SSL_WANT_READ || read == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     if (read <= 0) {
       return false;
     }
@@ -260,6 +265,10 @@ bool P1sCameraClient::write_all(esp_tls_t* tls, const void* buffer, size_t lengt
       return false;
     }
     const ssize_t written = esp_tls_conn_write(tls, data + offset, length - offset);
+    if (written == MBEDTLS_ERR_SSL_WANT_WRITE || written == MBEDTLS_ERR_SSL_WANT_READ) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     if (written <= 0) {
       return false;
     }

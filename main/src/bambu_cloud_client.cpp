@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/ssl.h"
 
 namespace printsphere {
 
@@ -64,6 +65,7 @@ constexpr int64_t kCloudAuthRetryBackoffUs =
     static_cast<int64_t>(kCloudAuthRetryBackoffSeconds) * 1000000LL;
 constexpr uint64_t kCloudLiveDataFreshMs = 120000ULL;
 constexpr uint64_t kCloudOptimisticLightMs = 8000ULL;
+constexpr int64_t kCloudIoRetryDeadlineUs = 10000000LL;
 constexpr size_t kMaxCloudMqttPayloadBytes = 64U * 1024U;
 constexpr size_t kMaxJsonResponseBytes = 96U * 1024U;
 constexpr int kCloudPrintErrorTaskCanceled = 0x0300400C;
@@ -311,6 +313,60 @@ struct ParsedHttpsUrl {
   std::string target;
   int port = 443;
 };
+
+bool http_client_write_all(esp_http_client_handle_t client, const std::string& body) {
+  size_t offset = 0;
+  const int64_t deadline_us = esp_timer_get_time() + kCloudIoRetryDeadlineUs;
+  while (offset < body.size()) {
+    if (esp_timer_get_time() >= deadline_us) {
+      return false;
+    }
+    const int written = esp_http_client_write(
+        client, body.data() + offset, static_cast<int>(body.size() - offset));
+    if (written <= 0) {
+      return false;
+    }
+    offset += static_cast<size_t>(written);
+  }
+  return true;
+}
+
+bool tls_write_all(esp_tls_t* tls, const std::string& data) {
+  size_t offset = 0;
+  const int64_t deadline_us = esp_timer_get_time() + kCloudIoRetryDeadlineUs;
+  while (offset < data.size()) {
+    if (esp_timer_get_time() >= deadline_us) {
+      return false;
+    }
+    const ssize_t written = esp_tls_conn_write(tls, data.data() + offset, data.size() - offset);
+    if (written == MBEDTLS_ERR_SSL_WANT_WRITE || written == MBEDTLS_ERR_SSL_WANT_READ) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    if (written <= 0) {
+      return false;
+    }
+    offset += static_cast<size_t>(written);
+  }
+  return true;
+}
+
+ssize_t tls_read_with_retry(esp_tls_t* tls, void* buffer, size_t length,
+                            int64_t deadline_us) {
+  while (esp_timer_get_time() < deadline_us) {
+    const ssize_t read = esp_tls_conn_read(tls, buffer, length);
+    if (read == MBEDTLS_ERR_SSL_WANT_READ || read == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    return read;
+  }
+  return -1;
+}
+
+bool tick_deadline_active(TickType_t deadline, TickType_t now) {
+  return deadline != 0 && static_cast<int32_t>(deadline - now) > 0;
+}
 
 std::string preview_cache_key(const std::string& url) {
   const std::string::size_type query_pos = url.find('?');
@@ -1437,6 +1493,8 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
   const int count = cJSON_GetArraySize(info_array);
   float first_temp = -1000.0f;
   float fallback_secondary = -1000.0f;
+  bool matched_active = false;
+  bool matched_secondary = false;
   for (int i = 0; i < count; ++i) {
     const cJSON* item = cJSON_GetArrayItem(info_array, i);
     if (!cJSON_IsObject(item)) {
@@ -1454,22 +1512,24 @@ void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_ind
     }
 
     const int id = json_int_local(item, "id", -1);
-    if (id == active_nozzle_index) {
+    if (active_nozzle_index >= 0 && id == active_nozzle_index) {
       *active_temp = temp;
       *active_present = true;
-    } else if (id >= 0 && *secondary_temp <= 0.0f) {
+      matched_active = true;
+    } else if (active_nozzle_index >= 0 && id >= 0) {
       *secondary_temp = temp;
       *secondary_present = true;
-    } else if (fallback_secondary < -999.0f) {
+      matched_secondary = true;
+    } else if (active_nozzle_index >= 0 && fallback_secondary < -999.0f) {
       fallback_secondary = temp;
     }
   }
 
-  if (*active_temp <= 0.0f && first_temp > -999.0f) {
+  if (!matched_active && first_temp > -999.0f) {
     *active_temp = first_temp;
     *active_present = true;
   }
-  if (*secondary_temp <= 0.0f && fallback_secondary > -999.0f) {
+  if (!matched_secondary && fallback_secondary > -999.0f) {
     *secondary_temp = fallback_secondary;
     *secondary_present = true;
   }
@@ -1501,12 +1561,11 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
 
     const int active_nozzle_index = extract_active_nozzle_index(device);
     bundle.active_nozzle_index = active_nozzle_index;
-    const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                                 merge_index, &bundle.active, &bundle.active_present,
+                                 active_nozzle_index, &bundle.active, &bundle.active_present,
                                  &bundle.secondary, &bundle.secondary_present);
     merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "extruder"), "info"),
-                                 merge_index, &bundle.active, &bundle.active_present,
+                                 active_nozzle_index, &bundle.active, &bundle.active_present,
                                  &bundle.secondary, &bundle.secondary_present);
   }
 
@@ -3613,7 +3672,7 @@ void BambuCloudClient::task_loop() {
     const bool preview_missing =
         preview_snapshot.preview_url.empty() || preview_snapshot.preview_blob == nullptr;
     const bool preview_backoff_active =
-        preview_retry_not_before_tick != 0 && now_tick < preview_retry_not_before_tick;
+        tick_deadline_active(preview_retry_not_before_tick, now_tick);
     const bool preview_due =
         preview_fetch_enabled && initial_preview_window_open &&
         !preview_backoff_active &&
@@ -3950,9 +4009,7 @@ bool BambuCloudClient::authenticate_with_tfa_code(const std::string& code) {
     return false;
   }
 
-  const int written =
-      esp_http_client_write(client, request_body.c_str(), static_cast<int>(request_body.size()));
-  if (written < 0) {
+  if (!http_client_write_all(client, request_body)) {
     ESP_LOGW(kTag, "HTTP write failed for TFA");
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
@@ -4636,23 +4693,19 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
       "\r\nUser-Agent: PrintSphere/1.0\r\nAccept: image/png,image/*;q=0.9,*/*;q=0.1\r\n"
       "Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
-  size_t written_total = 0;
-  while (written_total < request.size()) {
-    const ssize_t written =
-        esp_tls_conn_write(tls, request.data() + written_total, request.size() - written_total);
-    if (written <= 0) {
-      ESP_LOGW(kTag, "Preview TLS fallback write failed");
-      esp_tls_conn_destroy(tls);
-      return nullptr;
-    }
-    written_total += static_cast<size_t>(written);
+  if (!tls_write_all(tls, request)) {
+    ESP_LOGW(kTag, "Preview TLS fallback write failed");
+    esp_tls_conn_destroy(tls);
+    return nullptr;
   }
 
   std::vector<uint8_t> response;
   response.reserve(kPreviewPersistentReserveBytes);
   char read_buffer[1024];
+  const int64_t read_deadline_us = esp_timer_get_time() + 20000000LL;
   while (response.size() < (kMaxPreviewBytes + 8192)) {
-    const ssize_t read = esp_tls_conn_read(tls, read_buffer, sizeof(read_buffer));
+    const ssize_t read =
+        tls_read_with_retry(tls, read_buffer, sizeof(read_buffer), read_deadline_us);
     if (read > 0) {
       response.insert(response.end(), read_buffer, read_buffer + read);
       continue;
@@ -4780,9 +4833,7 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
   }
 
   if (!request_body.empty()) {
-    const int written =
-        esp_http_client_write(client, request_body.c_str(), static_cast<int>(request_body.size()));
-    if (written < 0) {
+    if (!http_client_write_all(client, request_body)) {
       ESP_LOGW(kTag, "HTTP write failed for %s", url.c_str());
       esp_http_client_close(client);
       esp_http_client_cleanup(client);

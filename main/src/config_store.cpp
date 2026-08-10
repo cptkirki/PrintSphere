@@ -222,11 +222,18 @@ std::string ConfigStore::load_cloud_access_token() const {
 }
 
 SourceMode ConfigStore::load_source_mode() const {
+  const int cached = cached_source_mode_.load(std::memory_order_acquire);
+  if (cached >= static_cast<int>(SourceMode::kCloudOnly) &&
+      cached <= static_cast<int>(SourceMode::kHybrid)) {
+    return static_cast<SourceMode>(cached);
+  }
   std::string value = load_string("source_mode");
   if (value.empty()) {
     value = load_string("state_source");
   }
-  return parse_source_mode(value);
+  const SourceMode mode = parse_source_mode(value);
+  cached_source_mode_.store(static_cast<int>(mode), std::memory_order_release);
+  return mode;
 }
 
 DisplayRotation ConfigStore::load_display_rotation() const {
@@ -339,6 +346,7 @@ esp_err_t ConfigStore::clear_cloud_access_token() const {
 
 esp_err_t ConfigStore::save_source_mode(SourceMode mode) const {
   ESP_RETURN_ON_ERROR(save_string("source_mode", to_string(mode)), kTag, "save source mode failed");
+  cached_source_mode_.store(static_cast<int>(mode), std::memory_order_release);
   return save_string("state_source", "");
 }
 
@@ -470,6 +478,11 @@ std::string profile_key(uint8_t index, const char* suffix) {
   std::snprintf(key, sizeof(key), "prn_%u_%s", static_cast<unsigned>(index), suffix);
   return key;
 }
+
+esp_err_t set_nvs_string(nvs_handle_t handle, const std::string& key,
+                         const std::string& value) {
+  return nvs_set_str(handle, key.c_str(), value.c_str());
+}
 }  // namespace
 
 uint8_t ConfigStore::load_printer_profile_count() const {
@@ -515,26 +528,25 @@ esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const
   std::lock_guard<std::mutex> lock(printer_profile_mutex_);
   const uint8_t idx = profile.index;
   if (idx >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
-
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "ser").c_str(), profile.serial), kTag,
-                      "save profile serial");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "host").c_str(), profile.host), kTag,
-                      "save profile host");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "acc").c_str(), profile.access_code), kTag,
-                      "save profile access");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "name").c_str(), profile.display_name), kTag,
-                      "save profile name");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "mdl").c_str(), profile.model), kTag,
-                      "save profile model");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "cld").c_str(), profile.cloud_bound ? "1" : "0"), kTag,
-                      "save profile cloud_bound");
-
   const uint8_t count = load_printer_profile_count();
-  if (idx >= count) {
-    ESP_RETURN_ON_ERROR(save_string("prn_count", std::to_string(idx + 1)), kTag,
-                        "save profile count");
+
+  nvs_handle_t handle = 0;
+  ESP_RETURN_ON_ERROR(nvs_open(kNamespace, NVS_READWRITE, &handle), kTag,
+                      "open profile storage");
+  esp_err_t err = set_nvs_string(handle, profile_key(idx, "ser"), profile.serial);
+  if (err == ESP_OK) err = set_nvs_string(handle, profile_key(idx, "host"), profile.host);
+  if (err == ESP_OK) err = set_nvs_string(handle, profile_key(idx, "acc"), profile.access_code);
+  if (err == ESP_OK) err = set_nvs_string(handle, profile_key(idx, "name"), profile.display_name);
+  if (err == ESP_OK) err = set_nvs_string(handle, profile_key(idx, "mdl"), profile.model);
+  if (err == ESP_OK) {
+    err = set_nvs_string(handle, profile_key(idx, "cld"), profile.cloud_bound ? "1" : "0");
   }
-  return ESP_OK;
+  if (err == ESP_OK && idx >= count) {
+    err = nvs_set_str(handle, "prn_count", std::to_string(idx + 1).c_str());
+  }
+  if (err == ESP_OK) err = nvs_commit(handle);
+  nvs_close(handle);
+  return err;
 }
 
 esp_err_t ConfigStore::delete_printer_profile(uint8_t index) const {
@@ -543,40 +555,53 @@ esp_err_t ConfigStore::delete_printer_profile(uint8_t index) const {
   const uint8_t count = load_printer_profile_count();
   if (index >= count) return ESP_ERR_NOT_FOUND;
 
-  // Shift all profiles above index down by one.
-  // Inline writes only — save_printer_profile() would re-acquire the mutex and deadlock.
+  struct StoredProfileFields {
+    std::string serial;
+    std::string host;
+    std::string access;
+    std::string name;
+    std::string model;
+    std::string cloud;
+  };
+  std::vector<StoredProfileFields> shifted;
+  shifted.reserve(count - index - 1);
   for (uint8_t i = index; i + 1 < count; ++i) {
-    const std::string serial = load_string(profile_key(i + 1, "ser").c_str());
-    const std::string host = load_string(profile_key(i + 1, "host").c_str());
-    const std::string access = load_string(profile_key(i + 1, "acc").c_str());
-    const std::string name = load_string(profile_key(i + 1, "name").c_str());
-    const std::string model = load_string(profile_key(i + 1, "mdl").c_str());
-    const std::string cloud = load_string(profile_key(i + 1, "cld").c_str());
-    save_string(profile_key(i, "ser").c_str(), serial);
-    save_string(profile_key(i, "host").c_str(), host);
-    save_string(profile_key(i, "acc").c_str(), access);
-    save_string(profile_key(i, "name").c_str(), name);
-    save_string(profile_key(i, "mdl").c_str(), model);
-    save_string(profile_key(i, "cld").c_str(), cloud);
+    StoredProfileFields fields;
+    fields.serial = load_string(profile_key(i + 1, "ser").c_str());
+    fields.host = load_string(profile_key(i + 1, "host").c_str());
+    fields.access = load_string(profile_key(i + 1, "acc").c_str());
+    fields.name = load_string(profile_key(i + 1, "name").c_str());
+    fields.model = load_string(profile_key(i + 1, "mdl").c_str());
+    fields.cloud = load_string(profile_key(i + 1, "cld").c_str());
+    shifted.push_back(std::move(fields));
   }
-  // Clear the last slot
-  const uint8_t last = count - 1;
-  save_string(profile_key(last, "ser").c_str(), "");
-  save_string(profile_key(last, "host").c_str(), "");
-  save_string(profile_key(last, "acc").c_str(), "");
-  save_string(profile_key(last, "name").c_str(), "");
-  save_string(profile_key(last, "mdl").c_str(), "");
-  save_string(profile_key(last, "cld").c_str(), "");
-  save_string("prn_count", std::to_string(count - 1));
 
-  // Adjust active index if needed
   const uint8_t active = load_active_printer_index();
-  if (active == index) {
-    save_active_printer_index(0);
-  } else if (active > index && active > 0) {
-    save_active_printer_index(active - 1);
+  const uint8_t next_active = active == index ? 0 : (active > index ? active - 1 : active);
+  nvs_handle_t handle = 0;
+  ESP_RETURN_ON_ERROR(nvs_open(kNamespace, NVS_READWRITE, &handle), kTag,
+                      "open profile storage for delete");
+  esp_err_t err = ESP_OK;
+  for (size_t offset = 0; offset < shifted.size() && err == ESP_OK; ++offset) {
+    const uint8_t target = static_cast<uint8_t>(index + offset);
+    const StoredProfileFields& fields = shifted[offset];
+    err = set_nvs_string(handle, profile_key(target, "ser"), fields.serial);
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(target, "host"), fields.host);
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(target, "acc"), fields.access);
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(target, "name"), fields.name);
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(target, "mdl"), fields.model);
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(target, "cld"), fields.cloud);
   }
-  return ESP_OK;
+
+  const uint8_t last = count - 1;
+  for (const char* suffix : {"ser", "host", "acc", "name", "mdl", "cld"}) {
+    if (err == ESP_OK) err = set_nvs_string(handle, profile_key(last, suffix), "");
+  }
+  if (err == ESP_OK) err = nvs_set_str(handle, "prn_count", std::to_string(count - 1).c_str());
+  if (err == ESP_OK) err = nvs_set_str(handle, "prn_active", std::to_string(next_active).c_str());
+  if (err == ESP_OK) err = nvs_commit(handle);
+  nvs_close(handle);
+  return err;
 }
 
 PrinterProfile ConfigStore::load_active_printer_profile() const {

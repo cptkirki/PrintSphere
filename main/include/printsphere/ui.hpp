@@ -47,7 +47,9 @@ class Ui {
   void update_power_save(bool on_battery, bool keep_awake, bool print_active);
   void set_battery_display_policy(const BatteryDisplayPolicy& policy);
   bool is_low_power_mode_active() const;
-  ScreenPowerMode screen_power_mode() const { return screen_power_mode_; }
+  ScreenPowerMode screen_power_mode() const {
+    return screen_power_mode_.load(std::memory_order_relaxed);
+  }
   bool is_config_page_active() const {
     return !page_scrolling_snapshot_.load(std::memory_order_relaxed) &&
            active_page_snapshot_.load(std::memory_order_relaxed) == kPageIdxPrinterSelect;
@@ -169,7 +171,7 @@ class Ui {
   };
   std::vector<PrinterCardWidgets> page0_cards_;
   std::vector<PrinterCardInfo>    last_printer_cards_;  // change-detection cache
-  int pending_printer_switch_ = -1;
+  std::atomic<int> pending_printer_switch_{-1};
 
   void rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards);
   void replay_card_animations_locked();
@@ -258,8 +260,8 @@ class Ui {
   lv_obj_t* portal_overlay_value_ = nullptr;
   lv_obj_t* portal_overlay_detail_ = nullptr;
   lv_timer_t* ring_anim_timer_ = nullptr;  // unused, ambient sweep timer removed
-  int user_brightness_percent_ = 80;
-  int applied_brightness_percent_ = -1;
+  std::atomic<int> user_brightness_percent_{80};
+  std::atomic<int> applied_brightness_percent_{-1};
   bool gesture_active_ = false;
   bool overlay_visible_ = false;
   bool scrolling_ = false;
@@ -302,7 +304,8 @@ class Ui {
   uint32_t last_ring_text_hex_ = UINT32_MAX;
   uint32_t last_rendered_ams_signature_ = UINT32_MAX;
   std::atomic<uint32_t> last_activity_tick_ms_{0};
-  ScreenPowerMode screen_power_mode_ = ScreenPowerMode::kAwake;
+  std::atomic<ScreenPowerMode> screen_power_mode_{ScreenPowerMode::kAwake};
+  std::atomic<bool> wake_display_requested_{false};
   std::string last_ui_status_;
   bool last_print_active_ = false;
   std::string last_diag_status_;
@@ -340,6 +343,7 @@ class Ui {
   PrinterSnapshot deferred_snapshot_{};
   PrinterSnapshot last_snapshot_{};
   DisplayRotation display_rotation_ = DisplayRotation::k0;
+  mutable std::mutex battery_display_policy_mutex_{};
   BatteryDisplayPolicy battery_display_policy_{};
 };
 

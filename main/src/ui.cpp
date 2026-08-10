@@ -1299,9 +1299,9 @@ esp_err_t Ui::initialize() {
   ESP_RETURN_ON_ERROR(bsp_display_rotation_set(bsp_rotation_for(display_rotation_)), kTag,
                       "apply display rotation failed");
 
-  user_brightness_percent_ = -1;
-  applied_brightness_percent_ = -1;
-  screen_power_mode_ = ScreenPowerMode::kAwake;
+  user_brightness_percent_.store(-1, std::memory_order_relaxed);
+  applied_brightness_percent_.store(-1, std::memory_order_relaxed);
+  screen_power_mode_.store(ScreenPowerMode::kAwake, std::memory_order_relaxed);
   last_activity_tick_ms_.store(lv_tick_get());
   set_brightness_percent(kDefaultBrightnessPercent);
   ESP_RETURN_ON_ERROR(build_dashboard(), kTag, "build_dashboard failed");
@@ -1439,7 +1439,7 @@ void Ui::printer_card_click_cb(lv_event_t* event) {
   lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(event));
   for (const auto& cw : self->page0_cards_) {
     if (cw.card == target) {
-      self->pending_printer_switch_ = cw.profile_index;
+      self->pending_printer_switch_.store(cw.profile_index, std::memory_order_release);
       self->note_activity(true);
 
       // Micro-interaction: quick scale bounce (100% → 91% → 100%)
@@ -1458,9 +1458,7 @@ void Ui::printer_card_click_cb(lv_event_t* event) {
 }
 
 int Ui::consume_printer_switch_request() {
-  int val = pending_printer_switch_;
-  pending_printer_switch_ = -1;
-  return val;
+  return pending_printer_switch_.exchange(-1, std::memory_order_acq_rel);
 }
 
 void Ui::apply_page0_parallax(bool force) {
@@ -3618,7 +3616,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 
   if (code == LV_EVENT_PRESSED) {
     set_pager_scroll_locked(false);
-    if (screen_power_mode_ == ScreenPowerMode::kOff) {
+    if (screen_power_mode_.load(std::memory_order_acquire) == ScreenPowerMode::kOff) {
       // First touch wakes the screen; a second touch performs UI actions.
       note_activity(true);
       gesture_active_ = false;
@@ -3633,7 +3631,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
     overlay_visible_ = false;
     gesture_start_x_ = point.x;
     gesture_start_y_ = point.y;
-    gesture_start_brightness_ = user_brightness_percent_;
+    gesture_start_brightness_ = user_brightness_percent_.load(std::memory_order_acquire);
     return;
   }
 
@@ -3678,7 +3676,8 @@ void Ui::handle_screen_event(lv_event_t* event) {
     set_brightness_percent(new_brightness);
 
     char buffer[8] = {};
-    std::snprintf(buffer, sizeof(buffer), "%d%%", user_brightness_percent_);
+    std::snprintf(buffer, sizeof(buffer), "%d%%",
+                  user_brightness_percent_.load(std::memory_order_acquire));
     set_label_text_if_changed(brightness_overlay_, buffer);
     lv_obj_clear_flag(brightness_overlay_, LV_OBJ_FLAG_HIDDEN);
     overlay_visible_ = true;
@@ -3835,30 +3834,27 @@ void Ui::update_print_buttons_locked(const PrinterSnapshot& snapshot) {
 
 void Ui::set_brightness_percent(int brightness_percent) {
   const int clamped = std::clamp(brightness_percent, 0, 100);
-  if (user_brightness_percent_ == clamped) {
+  if (user_brightness_percent_.exchange(clamped, std::memory_order_acq_rel) == clamped) {
     return;
   }
-
-  user_brightness_percent_ = clamped;
   apply_brightness_policy();
 }
 
 void Ui::note_activity(bool wake_display_now) {
   last_activity_tick_ms_.store(lv_tick_get());
   if (wake_display_now) {
-    wake_display();
+    wake_display_requested_.store(true, std::memory_order_release);
   }
 }
 
 void Ui::wake_display() {
-  if (screen_power_mode_ == ScreenPowerMode::kAwake) {
+  const ScreenPowerMode previous =
+      screen_power_mode_.exchange(ScreenPowerMode::kAwake, std::memory_order_acq_rel);
+  if (previous == ScreenPowerMode::kAwake) {
     return;
   }
-
-  const bool was_off = screen_power_mode_ == ScreenPowerMode::kOff;
-  screen_power_mode_ = ScreenPowerMode::kAwake;
   apply_brightness_policy();
-  if (was_off) {
+  if (previous == ScreenPowerMode::kOff) {
     esp_lv_adapter_resume();
   }
 }
@@ -3868,26 +3864,33 @@ void Ui::request_wake_display() {
 }
 
 void Ui::set_battery_display_policy(const BatteryDisplayPolicy& policy) {
+  std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
   battery_display_policy_ = policy;
 }
 
 void Ui::apply_brightness_policy() {
-  int target_brightness = user_brightness_percent_;
-  if (screen_power_mode_ == ScreenPowerMode::kDimmed) {
-    if (battery_display_policy_.dim_brightness_percent > 0) {
-      target_brightness = std::clamp(battery_display_policy_.dim_brightness_percent, 1, 100);
+  const int user_brightness = user_brightness_percent_.load(std::memory_order_acquire);
+  const ScreenPowerMode power_mode = screen_power_mode_.load(std::memory_order_acquire);
+  int dim_brightness_percent = 0;
+  {
+    std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
+    dim_brightness_percent = battery_display_policy_.dim_brightness_percent;
+  }
+  int target_brightness = user_brightness;
+  if (power_mode == ScreenPowerMode::kDimmed) {
+    if (dim_brightness_percent > 0) {
+      target_brightness = std::clamp(dim_brightness_percent, 1, 100);
     } else {
-      target_brightness = std::max(8, std::min(18, std::max(1, user_brightness_percent_ / 3)));
+      target_brightness = std::max(8, std::min(18, std::max(1, user_brightness / 3)));
     }
-  } else if (screen_power_mode_ == ScreenPowerMode::kOff) {
+  } else if (power_mode == ScreenPowerMode::kOff) {
     target_brightness = 0;
   }
 
-  if (applied_brightness_percent_ == target_brightness) {
+  if (applied_brightness_percent_.exchange(target_brightness, std::memory_order_acq_rel) ==
+      target_brightness) {
     return;
   }
-
-  applied_brightness_percent_ = target_brightness;
   bsp_display_brightness_set(target_brightness);
 }
 
@@ -3895,38 +3898,51 @@ void Ui::update_power_save(bool on_battery, bool keep_awake, bool print_active) 
   const uint32_t now = lv_tick_get();
   const uint32_t idle_ms = now - last_activity_tick_ms_.load();
 
+  if (wake_display_requested_.exchange(false, std::memory_order_acq_rel)) {
+    wake_display();
+    return;
+  }
+
+  BatteryDisplayPolicy policy;
+  {
+    std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
+    policy = battery_display_policy_;
+  }
+
   // While the LVGL worker is paused (screen off), LVGL touch events are not
   // processed.  Poll the raw touch-interrupt GPIO so a finger press can still
   // wake the display.  CST9217 pulls INT (GPIO 11) low on contact.
-  if (screen_power_mode_ == ScreenPowerMode::kOff &&
+  if (screen_power_mode_.load(std::memory_order_acquire) == ScreenPowerMode::kOff &&
       gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
-    note_activity(true);  // updates last_activity_tick_ms_ + calls wake_display()
-    return;               // re-evaluate on next call with fresh idle_ms
+    note_activity(false);
+    wake_display();
+    return;
   }
 
   // print_active only selects the "during print" timeouts — it must NOT
   // suppress dimming/screen-off (v1.6 regression: print_active was folded
   // into keep_awake, which made the *_active_s policy timeouts dead code).
   const uint32_t dim_timeout = (print_active
-      ? battery_display_policy_.dim_timeout_active_s
-      : battery_display_policy_.dim_timeout_idle_s) * 1000U;
+      ? policy.dim_timeout_active_s
+      : policy.dim_timeout_idle_s) * 1000U;
   const uint32_t off_timeout = (print_active
-      ? battery_display_policy_.off_timeout_active_s
-      : battery_display_policy_.off_timeout_idle_s) * 1000U;
+      ? policy.off_timeout_active_s
+      : policy.off_timeout_idle_s) * 1000U;
 
   ScreenPowerMode target_mode = ScreenPowerMode::kAwake;
-  if (!keep_awake && (on_battery || battery_display_policy_.usb_power_save_enabled)) {
-    if (battery_display_policy_.screen_off_enabled && idle_ms >= off_timeout) {
+  if (!keep_awake && (on_battery || policy.usb_power_save_enabled)) {
+    if (policy.screen_off_enabled && idle_ms >= off_timeout) {
       target_mode = ScreenPowerMode::kOff;
-    } else if (battery_display_policy_.dim_enabled && idle_ms >= dim_timeout) {
+    } else if (policy.dim_enabled && idle_ms >= dim_timeout) {
       target_mode = ScreenPowerMode::kDimmed;
     }
   }
 
-  if (screen_power_mode_ != target_mode) {
-    const bool was_off = screen_power_mode_ == ScreenPowerMode::kOff;
+  const ScreenPowerMode current_mode = screen_power_mode_.load(std::memory_order_acquire);
+  if (current_mode != target_mode) {
+    const bool was_off = current_mode == ScreenPowerMode::kOff;
     const bool going_off = target_mode == ScreenPowerMode::kOff;
-    screen_power_mode_ = target_mode;
+    screen_power_mode_.store(target_mode, std::memory_order_release);
 
     // IMPORTANT: When turning the screen off, pause the LVGL worker BEFORE
     // setting brightness to 0.  The AMOLED panel stops generating the TE
@@ -3946,7 +3962,8 @@ void Ui::update_power_save(bool on_battery, bool keep_awake, bool print_active) 
         // Treat a failed screen-off attempt like fresh activity so we don't
         // immediately hammer pause() again on the next main-loop iteration.
         last_activity_tick_ms_.store(now);
-        screen_power_mode_ = was_off ? ScreenPowerMode::kOff : ScreenPowerMode::kAwake;
+        screen_power_mode_.store(was_off ? ScreenPowerMode::kOff : ScreenPowerMode::kAwake,
+                                 std::memory_order_release);
         return;
       }
     }
@@ -3960,7 +3977,7 @@ void Ui::update_power_save(bool on_battery, bool keep_awake, bool print_active) 
 }
 
 bool Ui::is_low_power_mode_active() const {
-  return screen_power_mode_ != ScreenPowerMode::kAwake;
+  return screen_power_mode_.load(std::memory_order_relaxed) != ScreenPowerMode::kAwake;
 }
 
 void Ui::pager_event_cb(lv_event_t* event) {

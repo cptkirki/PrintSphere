@@ -17,6 +17,7 @@ set(PRINTSPHERE_MAIN_REQUIRES
     esp_wifi
     libpng
     lvgl
+    mbedtls
     nvs_flash
     joltwallet__littlefs
 )
