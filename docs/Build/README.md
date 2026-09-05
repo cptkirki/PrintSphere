@@ -82,7 +82,7 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c -p COM7 monitor
 Build both variants first. Then run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/package_release.ps1 -Version v1.6.2
+powershell -ExecutionPolicy Bypass -File tools/package_release.ps1 -Version v1.6.3
 ```
 
 The script creates the four current release images plus versioned archive copies:
@@ -99,13 +99,13 @@ Versioned copies are stored below the corresponding `archive/` directories.
 AMOLED 1.75:
 
 ```powershell
-python tools/package_initial_flash.py --build-dir build-amoled_1_75 --release-root release --version v1.6.2
+python tools/package_initial_flash.py --build-dir build-amoled_1_75 --release-root release --version v1.6.3
 ```
 
 LCD 2.8C:
 
 ```powershell
-python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.6.2-2.8c
+python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.6.3-2.8c
 ```
 
 ## Initial image versus OTA image

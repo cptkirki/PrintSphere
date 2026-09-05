@@ -14,7 +14,7 @@ tools/*
 !tools/package_release.ps1
 !tools/generate_fonts.ps1
 release/*
-!release/RELEASE_NOTES_v1.6.2.md
+!release/RELEASE_NOTES_v*.md
 !release/archive/
 release/archive/*
 !release/archive/firmware-v*.bin
