@@ -7,6 +7,7 @@
 
 #include "printsphere/bambu_status.hpp"
 #include "printsphere/error_lookup.hpp"
+#include "printsphere/utf8.hpp"
 
 namespace printsphere {
 
@@ -27,11 +28,9 @@ std::string shorten(std::string value, size_t max_len) {
     return value;
   }
   if (max_len <= 3U) {
-    return value.substr(0, max_len);
+    return utf8_truncate_bytes(value, max_len);
   }
-  value.resize(max_len - 3U);
-  value += "...";
-  return value;
+  return utf8_truncate_bytes(value, max_len - 3U) + "...";
 }
 
 std::string titlecase_words(std::string value) {
