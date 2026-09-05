@@ -6,7 +6,7 @@ It works directly with Bambu Cloud, the printer's local connection, or both. Hom
 
 <img width="400" height="300" alt="PrintSphere AMOLED display" src="https://github.com/user-attachments/assets/820c2e9b-10a7-4430-949c-e8b0adc1357d" /> <img width="400" height="300" alt="PrintSphere interface" src="https://github.com/user-attachments/assets/5923dc59-0123-4df1-b54d-673c6dbad23b" />
 
-Latest stable version: **v1.6.2**
+Latest stable version: **v1.6.3**
 
 ## Supported hardware
 
@@ -128,6 +128,6 @@ After initial setup, Web Config can be protected with a temporary six-digit PIN.
 
 - [PrintSphere Web Installer](https://cptkirki.github.io/PrintSphere/flash/)
 - [MakerWorld model](https://makerworld.com/de/models/2517189-printsphere-bambu-status-display-standalone-1-75)
-- [v1.6.2 release notes](release/RELEASE_NOTES_v1.6.2.md)
+- [v1.6.3 release notes](release/RELEASE_NOTES_v1.6.3.md)
 - [Building, cloning and manual flashing](docs/Build/README.md)
 - [License](LICENSE)

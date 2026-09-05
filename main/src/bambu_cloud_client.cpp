@@ -17,6 +17,7 @@
 #include "printsphere/bambu_status.hpp"
 #include "printsphere/error_lookup.hpp"
 #include "printsphere/status_resolver.hpp"
+#include "printsphere/utf8.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -493,7 +494,7 @@ void copy_text(std::array<char, N>* target, const std::string& value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value.c_str(), target->size());
+  utf8_copy_c_str(target->data(), target->size(), value);
 }
 
 template <size_t N>
@@ -501,7 +502,7 @@ void copy_text(std::array<char, N>* target, const char* value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value != nullptr ? value : "", target->size());
+  utf8_copy_c_str(target->data(), target->size(), value != nullptr ? value : "");
 }
 
 template <size_t N>
