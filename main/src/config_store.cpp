@@ -1,5 +1,6 @@
 #include "printsphere/config_store.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -10,6 +11,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "cJSON.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -19,6 +21,19 @@ namespace {
 constexpr char kTag[] = "printsphere.cfg";
 constexpr char kNamespace[] = "printsphere";
 constexpr char kDeviceName[] = "PrintSphere";
+
+std::string record_string(const cJSON* root, const char* key) {
+  const cJSON* value = cJSON_GetObjectItemCaseSensitive(root, key);
+  return cJSON_IsString(value) && value->valuestring ? value->valuestring : "";
+}
+std::string serialize_record(cJSON* record) {
+  if (!record) return {};
+  char* text = cJSON_PrintUnformatted(record);
+  std::string result = text ? text : "";
+  cJSON_free(text);
+  cJSON_Delete(record);
+  return result;
+}
 
 std::string color_to_html_hex(uint32_t color) {
   char buffer[8] = {};
@@ -157,6 +172,12 @@ esp_err_t ConfigStore::initialize() {
   if (err == ESP_OK) {
     ESP_LOGI(kTag, "NVS ready");
     migrate_legacy_printer_profile();
+    // Migrate existing devices even when the printer/cloud is currently offline.
+    if (!load_portal_provisioned() &&
+        (load_cloud_credentials().has_identity() || !load_cloud_access_token().empty() ||
+         load_printer_profile_count() > 0)) {
+      ESP_RETURN_ON_ERROR(mark_portal_provisioned(), kTag, "persist portal lock failed");
+    }
   }
 
   return err;
@@ -203,23 +224,54 @@ void ConfigStore::migrate_legacy_printer_profile() {
 std::string ConfigStore::load_device_name() const { return kDeviceName; }
 
 WifiCredentials ConfigStore::load_wifi_credentials() const {
-  WifiCredentials credentials;
-  credentials.ssid = load_string("wifi_ssid");
-  credentials.password = load_string("wifi_pass");
-  return credentials;
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const std::string stored = load_string("wifi_cfg");
+  if (!stored.empty()) {
+    cJSON* record = cJSON_Parse(stored.c_str());
+    WifiCredentials result{record_string(record, "ssid"), record_string(record, "password")};
+    cJSON_Delete(record);
+    return result;
+  }
+  return {load_string("wifi_ssid"), load_string("wifi_pass")};
 }
 
 BambuCloudCredentials ConfigStore::load_cloud_credentials() const {
-  BambuCloudCredentials credentials;
-  credentials.email = load_string("cloud_email");
-  credentials.password = load_string("cloud_pass");
-  credentials.region = parse_cloud_region(load_string("cloud_region"));
-  return credentials;
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const std::string stored = load_string("cloud_cfg");
+  if (!stored.empty()) {
+    cJSON* record = cJSON_Parse(stored.c_str());
+    BambuCloudCredentials result{record_string(record, "email"), record_string(record, "password"),
+                                parse_cloud_region(record_string(record, "region"))};
+    cJSON_Delete(record);
+    return result;
+  }
+  return {load_string("cloud_email"), load_string("cloud_pass"), parse_cloud_region(load_string("cloud_region"))};
 }
 
 std::string ConfigStore::load_cloud_access_token() const {
-  return load_string("cloud_token");
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const std::string stored = load_string("cloud_sess");
+  if (stored.empty()) return load_string("cloud_token");
+  cJSON* record = cJSON_Parse(stored.c_str());
+  const auto credentials = load_cloud_credentials();
+  const bool matches = record_string(record, "email") == credentials.email &&
+                       record_string(record, "region") == to_string(credentials.region);
+  const std::string token = matches ? record_string(record, "token") : "";
+  cJSON_Delete(record);
+  return token;
 }
+
+int64_t ConfigStore::load_cloud_token_expiry() const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  cJSON* record = cJSON_Parse(load_string("cloud_sess").c_str());
+  const cJSON* expiry = cJSON_GetObjectItemCaseSensitive(record, "expiry");
+  const int64_t result = cJSON_IsNumber(expiry) ? static_cast<int64_t>(expiry->valuedouble) : 0;
+  cJSON_Delete(record);
+  return result;
+}
+
+bool ConfigStore::load_portal_provisioned() const { return load_string("portal_done") == "1"; }
+esp_err_t ConfigStore::mark_portal_provisioned() const { return save_string("portal_done", "1"); }
 
 SourceMode ConfigStore::load_source_mode() const {
   std::string value = load_string("source_mode");
@@ -309,31 +361,63 @@ BatteryDisplayPolicy ConfigStore::load_battery_display_policy() const {
 }
 
 esp_err_t ConfigStore::save_wifi_credentials(const WifiCredentials& credentials) const {
-  ESP_RETURN_ON_ERROR(save_string("wifi_ssid", credentials.ssid), kTag, "save ssid failed");
-  return save_string("wifi_pass", credentials.password);
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  cJSON* record = cJSON_CreateObject();
+  if (!record) return ESP_ERR_NO_MEM;
+  if (!cJSON_AddStringToObject(record, "ssid", credentials.ssid.c_str()) ||
+      !cJSON_AddStringToObject(record, "password", credentials.password.c_str())) {
+    cJSON_Delete(record); return ESP_ERR_NO_MEM;
+  }
+  const std::string json = serialize_record(record);
+  return json.empty() ? ESP_ERR_NO_MEM : save_string("wifi_cfg", json);
 }
 
 esp_err_t ConfigStore::save_cloud_credentials(const BambuCloudCredentials& credentials) const {
-  const BambuCloudCredentials previous = load_cloud_credentials();
-  ESP_RETURN_ON_ERROR(save_string("cloud_email", credentials.email), kTag, "save cloud email failed");
-  ESP_RETURN_ON_ERROR(save_string("cloud_pass", credentials.password), kTag, "save cloud password failed");
-  ESP_RETURN_ON_ERROR(save_string("cloud_region", to_string(credentials.region)), kTag,
-                      "save cloud region failed");
-  const bool email_changed = previous.email != credentials.email;
-  const bool password_changed =
-      !credentials.password.empty() && previous.password != credentials.password;
-  const bool region_changed = previous.region != credentials.region;
-  if (!email_changed && !password_changed && !region_changed) {
-    return ESP_OK;
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const auto previous = load_cloud_credentials();
+  const bool identity_changed = previous.email != credentials.email || previous.region != credentials.region;
+  const bool password_changed = !credentials.password.empty() && previous.password != credentials.password;
+  // Invalidate before publishing another identity. Session records also bind the
+  // token to its account/region, so interrupted writes cannot cross accounts.
+  if (identity_changed || password_changed) {
+    ESP_RETURN_ON_ERROR(clear_cloud_access_token(), kTag, "clear old session failed");
   }
-  return clear_cloud_access_token();
+  cJSON* record = cJSON_CreateObject();
+  if (!record) return ESP_ERR_NO_MEM;
+  if (!cJSON_AddStringToObject(record, "email", credentials.email.c_str()) ||
+      !cJSON_AddStringToObject(record, "password", credentials.password.c_str()) ||
+      !cJSON_AddStringToObject(record, "region", to_string(credentials.region))) {
+    cJSON_Delete(record); return ESP_ERR_NO_MEM;
+  }
+  const std::string json = serialize_record(record);
+  return json.empty() ? ESP_ERR_NO_MEM : save_string("cloud_cfg", json);
 }
 
-esp_err_t ConfigStore::save_cloud_access_token(const std::string& token) const {
-  return save_string("cloud_token", token);
+esp_err_t ConfigStore::save_cloud_access_token(const std::string& token, int64_t expires_at,
+                                              const BambuCloudCredentials* owner) const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const auto credentials = load_cloud_credentials();
+  if (owner && (owner->email != credentials.email || owner->region != credentials.region))
+    return ESP_ERR_INVALID_STATE;
+  cJSON* record = cJSON_CreateObject();
+  if (!record) return ESP_ERR_NO_MEM;
+  if (!cJSON_AddStringToObject(record, "email", credentials.email.c_str()) ||
+      !cJSON_AddStringToObject(record, "region", to_string(credentials.region)) ||
+      !cJSON_AddStringToObject(record, "token", token.c_str()) ||
+      !cJSON_AddNumberToObject(record, "expiry", static_cast<double>(expires_at))) {
+    cJSON_Delete(record); return ESP_ERR_NO_MEM;
+  }
+  const std::string json = serialize_record(record);
+  return json.empty() ? ESP_ERR_NO_MEM : save_string("cloud_sess", json);
 }
 
-esp_err_t ConfigStore::clear_cloud_access_token() const {
+esp_err_t ConfigStore::clear_cloud_access_token(const BambuCloudCredentials* owner) const {
+  std::lock_guard<std::recursive_mutex> identity_lock(configuration_mutex_);
+  const auto current = load_cloud_credentials();
+  if (owner && (owner->email != current.email || owner->region != current.region))
+    return ESP_ERR_INVALID_STATE;
+  // A valid empty session record prevents fallback to legacy tokens.
+  ESP_RETURN_ON_ERROR(save_cloud_access_token(""), kTag, "clear session failed");
   return save_string("cloud_token", "");
 }
 
@@ -423,10 +507,11 @@ esp_err_t ConfigStore::save_battery_display_policy(const BatteryDisplayPolicy& p
 }
 
 esp_err_t ConfigStore::save_string(const char* key, const std::string& value) const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   nvs_handle_t handle = 0;
   ESP_RETURN_ON_ERROR(nvs_open(kNamespace, NVS_READWRITE, &handle), kTag, "nvs_open failed");
 
-  const esp_err_t set_err = nvs_set_str(handle, key, value.c_str());
+  const esp_err_t set_err = nvs_set_blob(handle, key, value.c_str(), value.size() + 1);
   if (set_err != ESP_OK) {
     nvs_close(handle);
     return set_err;
@@ -438,26 +523,20 @@ esp_err_t ConfigStore::save_string(const char* key, const std::string& value) co
 }
 
 std::string ConfigStore::load_string(const char* key) const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   nvs_handle_t handle = 0;
-  if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) {
-    return {};
-  }
-
+  if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) return {};
   size_t required = 0;
-  esp_err_t err = nvs_get_str(handle, key, nullptr, &required);
-  if (err != ESP_OK || required == 0) {
-    nvs_close(handle);
-    return {};
-  }
-
-  std::vector<char> buffer(required, 0);
-  err = nvs_get_str(handle, key, buffer.data(), &required);
+  bool blob = true;
+  esp_err_t err = nvs_get_blob(handle, key, nullptr, &required);
+  if (err != ESP_OK) { blob = false; err = nvs_get_str(handle, key, nullptr, &required); }
+  if (err != ESP_OK || required == 0 || required > 128 * 1024) { nvs_close(handle); return {}; }
+  std::vector<char> buffer(required);
+  err = blob ? nvs_get_blob(handle, key, buffer.data(), &required)
+             : nvs_get_str(handle, key, buffer.data(), &required);
   nvs_close(handle);
-  if (err != ESP_OK) {
-    return {};
-  }
-
-  return std::string(buffer.data());
+  if (err != ESP_OK || buffer.back() != 0) return {};
+  return std::string(buffer.data(), buffer.size() - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,119 +552,156 @@ std::string profile_key(uint8_t index, const char* suffix) {
 }  // namespace
 
 uint8_t ConfigStore::load_printer_profile_count() const {
-  const std::string count_str = load_string("prn_count");
-  if (count_str.empty()) return 0;
-  const long parsed = std::strtol(count_str.c_str(), nullptr, 10);
-  return (parsed >= 0 && parsed <= kMaxPrinterProfiles) ? static_cast<uint8_t>(parsed) : 0;
+  return static_cast<uint8_t>(load_printer_profiles().size());
 }
 
 uint8_t ConfigStore::load_active_printer_index() const {
-  const std::string idx_str = load_string("prn_active");
-  if (idx_str.empty()) return 0;
-  const long parsed = std::strtol(idx_str.c_str(), nullptr, 10);
-  return (parsed >= 0 && parsed < kMaxPrinterProfiles) ? static_cast<uint8_t>(parsed) : 0;
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const std::string stored = load_string("prn_cfg");
+  if (!stored.empty()) {
+    cJSON* root = cJSON_Parse(stored.c_str());
+    const cJSON* active = cJSON_GetObjectItemCaseSensitive(root, "active");
+    const int index = cJSON_IsNumber(active) ? active->valueint : 0;
+    cJSON_Delete(root);
+    return index >= 0 && index < kMaxPrinterProfiles ? index : 0;
+  }
+  const long index = std::strtol(load_string("prn_active").c_str(), nullptr, 10);
+  return index >= 0 && index < kMaxPrinterProfiles ? index : 0;
+}
+
+esp_err_t ConfigStore::save_profiles_record(const std::vector<PrinterProfile>& profiles,
+                                           uint8_t active) const {
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return ESP_ERR_NO_MEM;
+  cJSON* list = cJSON_AddArrayToObject(root, "profiles");
+  bool ok = list && cJSON_AddNumberToObject(root, "active", active);
+  for (const auto& profile : profiles) {
+    cJSON* item = cJSON_CreateObject();
+    if (!item) { ok = false; break; }
+    if (!cJSON_AddItemToArray(list, item)) { cJSON_Delete(item); ok = false; break; }
+    ok = ok && cJSON_AddStringToObject(item, "serial", profile.serial.c_str()) &&
+        cJSON_AddStringToObject(item, "host", profile.host.c_str()) &&
+        cJSON_AddStringToObject(item, "access", profile.access_code.c_str()) &&
+        cJSON_AddStringToObject(item, "name", profile.display_name.c_str()) &&
+        cJSON_AddStringToObject(item, "model", profile.model.c_str()) &&
+        cJSON_AddBoolToObject(item, "cloud", profile.cloud_bound);
+  }
+  if (!ok) { cJSON_Delete(root); return ESP_ERR_NO_MEM; }
+  const std::string json = serialize_record(root);
+  return json.empty() ? ESP_ERR_NO_MEM : save_string("prn_cfg", json);
 }
 
 esp_err_t ConfigStore::save_active_printer_index(uint8_t index) const {
-  return save_string("prn_active", std::to_string(index));
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  auto profiles = load_printer_profiles();
+  if (index >= profiles.size() && !(index == 0 && profiles.empty())) return ESP_ERR_INVALID_ARG;
+  return save_profiles_record(profiles, index);
 }
 
 std::vector<PrinterProfile> ConfigStore::load_printer_profiles() const {
-  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
-  const uint8_t count = load_printer_profile_count();
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   std::vector<PrinterProfile> profiles;
-  profiles.reserve(count);
-  for (uint8_t i = 0; i < count; ++i) {
-    PrinterProfile p;
-    p.index = i;
-    p.serial = load_string(profile_key(i, "ser").c_str());
-    p.host = load_string(profile_key(i, "host").c_str());
-    p.access_code = load_string(profile_key(i, "acc").c_str());
-    p.display_name = load_string(profile_key(i, "name").c_str());
-    p.model = load_string(profile_key(i, "mdl").c_str());
-    p.cloud_bound = load_string(profile_key(i, "cld").c_str()) == "1";
-    if (!p.serial.empty() || !p.host.empty()) {
-      profiles.push_back(std::move(p));
+  const std::string stored = load_string("prn_cfg");
+  if (!stored.empty()) {
+    cJSON* root = cJSON_Parse(stored.c_str());
+    const cJSON* list = cJSON_GetObjectItemCaseSensitive(root, "profiles");
+    const cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, list) {
+      if (profiles.size() >= kMaxPrinterProfiles) break;
+      PrinterProfile profile;
+      profile.index = static_cast<uint8_t>(profiles.size());
+      profile.serial = record_string(item, "serial");
+      profile.host = record_string(item, "host");
+      profile.access_code = record_string(item, "access");
+      profile.display_name = record_string(item, "name");
+      profile.model = record_string(item, "model");
+      profile.cloud_bound = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "cloud"));
+      profiles.push_back(std::move(profile));
     }
+    cJSON_Delete(root);
+    return profiles;
+  }
+  const long count = std::strtol(load_string("prn_count").c_str(), nullptr, 10);
+  for (uint8_t i = 0; i < count && i < kMaxPrinterProfiles; ++i) {
+    PrinterProfile profile;
+    profile.index = i;
+    profile.serial = load_string(profile_key(i, "ser").c_str());
+    profile.host = load_string(profile_key(i, "host").c_str());
+    profile.access_code = load_string(profile_key(i, "acc").c_str());
+    profile.display_name = load_string(profile_key(i, "name").c_str());
+    profile.model = load_string(profile_key(i, "mdl").c_str());
+    profile.cloud_bound = load_string(profile_key(i, "cld").c_str()) == "1";
+    profiles.push_back(std::move(profile));
   }
   return profiles;
 }
 
 esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const {
-  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
-  const uint8_t idx = profile.index;
-  if (idx >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  auto profiles = load_printer_profiles();
+  if (profile.index >= kMaxPrinterProfiles || profile.index > profiles.size()) return ESP_ERR_INVALID_ARG;
+  if (profile.index == profiles.size()) profiles.push_back(profile);
+  else profiles[profile.index] = profile;
+  return save_profiles_record(profiles, load_active_printer_index());
+}
 
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "ser").c_str(), profile.serial), kTag,
-                      "save profile serial");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "host").c_str(), profile.host), kTag,
-                      "save profile host");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "acc").c_str(), profile.access_code), kTag,
-                      "save profile access");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "name").c_str(), profile.display_name), kTag,
-                      "save profile name");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "mdl").c_str(), profile.model), kTag,
-                      "save profile model");
-  ESP_RETURN_ON_ERROR(save_string(profile_key(idx, "cld").c_str(), profile.cloud_bound ? "1" : "0"), kTag,
-                      "save profile cloud_bound");
+esp_err_t ConfigStore::sync_cloud_printer_profiles(
+    const std::vector<PrinterProfile>& discovered, const BambuCloudCredentials& owner) const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  const auto current = load_cloud_credentials();
+  if (!owner.has_identity() || owner.email != current.email || owner.region != current.region)
+    return ESP_ERR_INVALID_STATE;
 
-  const uint8_t count = load_printer_profile_count();
-  if (idx >= count) {
-    ESP_RETURN_ON_ERROR(save_string("prn_count", std::to_string(idx + 1)), kTag,
-                        "save profile count");
+  auto profiles = load_printer_profiles();
+  bool changed = false;
+  for (const auto& device : discovered) {
+    if (device.serial.empty()) continue;
+    auto found = std::find_if(profiles.begin(), profiles.end(), [&](const auto& profile) {
+      return profile.serial == device.serial;
+    });
+    if (found == profiles.end()) {
+      // Keep the complete merge atomic, including the capacity failure case.
+      if (profiles.size() >= kMaxPrinterProfiles) return ESP_ERR_NO_MEM;
+      PrinterProfile profile;
+      profile.index = static_cast<uint8_t>(profiles.size());
+      profile.serial = device.serial;
+      profile.display_name = device.display_name;
+      profile.model = device.model;
+      profile.cloud_bound = true;
+      profiles.push_back(std::move(profile));
+      changed = true;
+      continue;
+    }
+    // Account discovery must never overwrite local credentials or user names.
+    if (!found->cloud_bound) { found->cloud_bound = true; changed = true; }
+    if (found->display_name.empty() && !device.display_name.empty()) {
+      found->display_name = device.display_name;
+      changed = true;
+    }
+    if (found->model.empty() && !device.model.empty()) {
+      found->model = device.model;
+      changed = true;
+    }
   }
-  return ESP_OK;
+  return changed ? save_profiles_record(profiles, load_active_printer_index()) : ESP_OK;
 }
 
 esp_err_t ConfigStore::delete_printer_profile(uint8_t index) const {
-  std::lock_guard<std::mutex> lock(printer_profile_mutex_);
-  if (index >= kMaxPrinterProfiles) return ESP_ERR_INVALID_ARG;
-  const uint8_t count = load_printer_profile_count();
-  if (index >= count) return ESP_ERR_NOT_FOUND;
-
-  // Shift all profiles above index down by one.
-  // Inline writes only — save_printer_profile() would re-acquire the mutex and deadlock.
-  for (uint8_t i = index; i + 1 < count; ++i) {
-    const std::string serial = load_string(profile_key(i + 1, "ser").c_str());
-    const std::string host = load_string(profile_key(i + 1, "host").c_str());
-    const std::string access = load_string(profile_key(i + 1, "acc").c_str());
-    const std::string name = load_string(profile_key(i + 1, "name").c_str());
-    const std::string model = load_string(profile_key(i + 1, "mdl").c_str());
-    const std::string cloud = load_string(profile_key(i + 1, "cld").c_str());
-    save_string(profile_key(i, "ser").c_str(), serial);
-    save_string(profile_key(i, "host").c_str(), host);
-    save_string(profile_key(i, "acc").c_str(), access);
-    save_string(profile_key(i, "name").c_str(), name);
-    save_string(profile_key(i, "mdl").c_str(), model);
-    save_string(profile_key(i, "cld").c_str(), cloud);
-  }
-  // Clear the last slot
-  const uint8_t last = count - 1;
-  save_string(profile_key(last, "ser").c_str(), "");
-  save_string(profile_key(last, "host").c_str(), "");
-  save_string(profile_key(last, "acc").c_str(), "");
-  save_string(profile_key(last, "name").c_str(), "");
-  save_string(profile_key(last, "mdl").c_str(), "");
-  save_string(profile_key(last, "cld").c_str(), "");
-  save_string("prn_count", std::to_string(count - 1));
-
-  // Adjust active index if needed
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  auto profiles = load_printer_profiles();
+  if (index >= profiles.size()) return ESP_ERR_NOT_FOUND;
   const uint8_t active = load_active_printer_index();
-  if (active == index) {
-    save_active_printer_index(0);
-  } else if (active > index && active > 0) {
-    save_active_printer_index(active - 1);
-  }
-  return ESP_OK;
+  profiles.erase(profiles.begin() + index);
+  for (uint8_t i = 0; i < profiles.size(); ++i) profiles[i].index = i;
+  const uint8_t new_active = active == index ? 0 : (active > index ? active - 1 : active);
+  return save_profiles_record(profiles, new_active);
 }
 
 PrinterProfile ConfigStore::load_active_printer_profile() const {
-  const uint8_t active = load_active_printer_index();
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   const auto profiles = load_printer_profiles();
-  for (const auto& p : profiles) {
-    if (p.index == active) return p;
-  }
-  return PrinterProfile{};
+  const uint8_t index = load_active_printer_index();
+  return index < profiles.size() ? profiles[index] : PrinterProfile{};
 }
 
 // ---------------------------------------------------------------------------

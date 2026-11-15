@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <ctime>
+#include <mutex>
 #include <string>
 
 #include "esp_log.h"
@@ -14,6 +15,7 @@ namespace printsphere::time_sync {
 namespace {
 constexpr char kTag[] = "printsphere.time";
 
+std::mutex g_timezone_mutex;
 bool g_sntp_started = false;
 std::string g_current_iana{};
 
@@ -117,6 +119,7 @@ std::vector<std::string_view> supported_iana_zones() {
 }
 
 void set_timezone_iana(const std::string& iana_name) {
+  std::lock_guard<std::mutex> lock(g_timezone_mutex);
   std::string posix = iana_to_posix(iana_name);
   if (posix.empty()) {
     if (!iana_name.empty()) {
@@ -131,7 +134,9 @@ void set_timezone_iana(const std::string& iana_name) {
            iana_name.empty() ? "UTC" : iana_name.c_str(), posix.c_str());
 }
 
-const std::string& current_iana() { return g_current_iana; }
+std::string current_iana() { std::lock_guard<std::mutex> lock(g_timezone_mutex); return g_current_iana; }
+
+bool clock_ready() { return std::time(nullptr) >= 1735689600; }
 
 void start_sntp_if_needed() {
   if (g_sntp_started) {

@@ -1,4 +1,5 @@
 #include "printsphere/status_resolver.hpp"
+#include "esp_timer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -263,7 +264,9 @@ bool cloud_preview_available(const BambuCloudSnapshot& snapshot, uint64_t now_ms
 }
 
 bool cloud_temperature_known(uint64_t last_update_ms, bool cloud_connected) {
-  return cloud_connected && last_update_ms != 0;
+  const uint64_t current_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
+  return cloud_connected && last_update_ms != 0 && current_ms >= last_update_ms &&
+         current_ms - last_update_ms <= 300000;
 }
 
 bool local_camera_available(const PrinterSnapshot& snapshot) {
@@ -543,15 +546,15 @@ void apply_local_metrics_bundle(PrinterSnapshot& target, const PrinterSnapshot& 
 
 void apply_local_temperature_bundle(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot) {
   target.nozzle_temp_c = local_snapshot.nozzle_temp_c;
-  target.nozzle_temp_known = local_snapshot.nozzle_temp_known || local_snapshot.nozzle_temp_c > 0.0f;
+  target.nozzle_temp_known = local_snapshot.nozzle_temp_known;
   target.bed_temp_c = local_snapshot.bed_temp_c;
-  target.bed_temp_known = local_snapshot.bed_temp_known || local_snapshot.bed_temp_c > 0.0f;
+  target.bed_temp_known = local_snapshot.bed_temp_known;
   target.chamber_temp_c = local_snapshot.chamber_temp_c;
   target.chamber_temp_known =
-      local_snapshot.chamber_temp_known || local_snapshot.chamber_temp_c > 0.0f;
+      local_snapshot.chamber_temp_known;
   target.secondary_nozzle_temp_c = local_snapshot.secondary_nozzle_temp_c;
   target.secondary_nozzle_temp_known =
-      local_snapshot.secondary_nozzle_temp_known || local_snapshot.secondary_nozzle_temp_c > 0.0f;
+      local_snapshot.secondary_nozzle_temp_known;
   if (local_snapshot.active_nozzle_index >= 0) {
     target.active_nozzle_index = local_snapshot.active_nozzle_index;
   }
@@ -940,10 +943,35 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,
                                      const BambuCloudSnapshot& cloud_snapshot,
                                      SourceMode source_mode, uint64_t now_ms,
-                                     bool wifi_connected, const std::string& wifi_ip) {
+                                     bool wifi_connected, const std::string& wifi_ip,
+                                     const std::string& selected_serial) {
+  if (!selected_serial.empty()) {
+    const bool local_matches = policy::same_printer(selected_serial, local_snapshot.resolved_serial);
+    const bool cloud_matches = policy::same_printer(selected_serial, cloud_snapshot.resolved_serial);
+    if ((!local_matches && local_printer_enabled) || (!cloud_matches && cloud_snapshot.configured)) {
+      PrinterSnapshot local = local_matches ? local_snapshot : PrinterSnapshot{};
+      local.resolved_serial = selected_serial;
+      BambuCloudSnapshot cloud = cloud_matches ? cloud_snapshot : BambuCloudSnapshot{};
+      return merge_status_sources(local, local_printer_enabled && local_matches, cloud,
+          source_mode, now_ms, wifi_connected, wifi_ip, {});
+    }
+  }
+  const bool conflicting_identity = local_printer_enabled &&
+      !local_snapshot.resolved_serial.empty() && !cloud_snapshot.resolved_serial.empty() &&
+      local_snapshot.resolved_serial != cloud_snapshot.resolved_serial;
+  if (conflicting_identity && source_mode == SourceMode::kHybrid) {
+    BambuCloudSnapshot excluded;
+    return merge_status_sources(local_snapshot, local_printer_enabled, excluded, source_mode,
+                           now_ms, wifi_connected, wifi_ip);
+  }
   PrinterSnapshot snapshot;
   const bool local_enabled = source_mode != SourceMode::kCloudOnly && local_printer_enabled;
   const bool cloud_enabled = source_mode != SourceMode::kLocalOnly && cloud_snapshot.configured;
+  const bool use_local_command = !local_snapshot.command_detail.empty() && local_enabled;
+  snapshot.command_pending = use_local_command ? local_snapshot.command_pending :
+      (cloud_enabled && cloud_snapshot.command_pending);
+  snapshot.command_detail = use_local_command ? local_snapshot.command_detail :
+      (cloud_enabled ? cloud_snapshot.command_detail : "");
   copy_source_metadata(snapshot, local_snapshot, local_printer_enabled, cloud_snapshot,
                        wifi_connected, wifi_ip);
   apply_base_state_for_mode(snapshot, source_mode, local_snapshot, local_enabled, cloud_snapshot,

@@ -10,15 +10,12 @@
 #include "lvgl.h"
 #include "esp_err.h"
 #include "printsphere/config_store.hpp"
+#include "printsphere/display_power.hpp"
+#include "printsphere/latest_mailbox.hpp"
+#include "printsphere/ui_performance.hpp"
 #include "printsphere/printer_state.hpp"
 
 namespace printsphere {
-
-enum class ScreenPowerMode : uint8_t {
-  kAwake,
-  kDimmed,
-  kOff,
-};
 
 class Ui {
  public:
@@ -84,6 +81,7 @@ class Ui {
 
   struct PrinterCardInfo {
     uint8_t index = 0;
+    std::string serial;
     std::string name;
     std::string model;
     std::string host;
@@ -92,10 +90,29 @@ class Ui {
   };
   void update_printer_cards(const std::vector<PrinterCardInfo>& cards);
   int consume_printer_switch_request();
+  bool has_printer_switch_request() const { return pending_printer_switch_.load() >= 0; }
   void request_wake_display();
+  bool has_wake_display_request() const { return wake_display_requested_.load(); }
+  bool has_snapshot_refresh_request() const { return snapshot_refresh_requested_.load(); }
+  bool has_pending_snapshot() const { return static_cast<bool>(snapshot_mailbox_.peek()); }
+  std::shared_ptr<const UiPerformanceSnapshot> performance_snapshot() const { return performance_mailbox_.peek(); }
+  UiWorkPhase work_phase() const { return power_io_since_us_.load() ? UiWorkPhase::kPower : work_phase_.load(); }
+  int64_t work_phase_since_us() const {
+    const auto power = power_io_since_us_.load();
+    return power ? power : work_phase_since_us_.load();
+  }
+  int64_t last_frame_us() const { return last_frame_us_.load(); }
+  const char* display_output_phase() const;
+  int64_t display_output_since_us() const;
 
  private:
   esp_err_t build_dashboard();
+  void process_updates_locked();
+  void apply_printer_cards_locked(const std::vector<PrinterCardInfo>& cards);
+  static void update_timer_cb(lv_timer_t* timer);
+  static void performance_event_cb(lv_event_t* event);
+  void set_work_phase(UiWorkPhase phase);
+  void publish_performance_locked(int64_t now_us);
   void apply_ring_visual_locked(const PrinterSnapshot& snapshot);
   void apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_refresh,
                              std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw = nullptr,
@@ -109,8 +126,7 @@ class Ui {
   void apply_logo_visibility();
   void update_page_availability_locked(const PrinterSnapshot& snapshot);
   void note_activity(bool wake_display);
-  void wake_display();
-  void apply_brightness_policy();
+  bool apply_brightness_policy(ScreenPowerMode mode);
   void set_pager_scroll_locked(bool locked);
   void set_active_page(int page);
   void publish_page_state_snapshot();
@@ -149,7 +165,7 @@ class Ui {
   static void remaining_row_event_cb(lv_event_t* event);
   void handle_remaining_row_click();
 
-  bool initialized_ = false;
+  std::atomic<bool> initialized_{false};
   lv_display_t* display_ = nullptr;
   lv_obj_t* screen_ = nullptr;
   lv_obj_t* pager_ = nullptr;
@@ -166,14 +182,14 @@ class Ui {
     lv_obj_t* host_label = nullptr;
     lv_obj_t* status_dot = nullptr;
     uint8_t profile_index = 0;
+    std::string serial;
   };
   std::vector<PrinterCardWidgets> page0_cards_;
   std::vector<PrinterCardInfo>    last_printer_cards_;  // change-detection cache
-  int pending_printer_switch_ = -1;
+  std::atomic<int> pending_printer_switch_{-1};
 
   void rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards);
-  void replay_card_animations_locked();
-  void apply_page0_parallax(bool force = false);
+  void apply_page0_parallax();
   static void printer_card_click_cb(lv_event_t* event);
 
   // --- AMS pages (page indices 1..kMaxAmsUnits) ---
@@ -249,6 +265,7 @@ class Ui {
   lv_obj_t* page2_pause_button_label_ = nullptr;
   lv_obj_t* page2_stop_button_ = nullptr;
   lv_obj_t* page2_stop_button_label_ = nullptr;
+  int last_buttons_pending_ = -1;
   lv_obj_t* page3_image_ = nullptr;
   lv_obj_t* page3_note_ = nullptr;
   lv_obj_t* page3_subnote_ = nullptr;
@@ -258,12 +275,11 @@ class Ui {
   lv_obj_t* portal_overlay_value_ = nullptr;
   lv_obj_t* portal_overlay_detail_ = nullptr;
   lv_timer_t* ring_anim_timer_ = nullptr;  // unused, ambient sweep timer removed
-  int user_brightness_percent_ = 80;
+  std::atomic<int> user_brightness_percent_{80};
   int applied_brightness_percent_ = -1;
   bool gesture_active_ = false;
   bool overlay_visible_ = false;
   bool scrolling_ = false;
-  bool deferred_snapshot_pending_ = false;
   bool detail_visible_ = true;
   bool show_logo_ = false;
   bool accent_initialized_ = false;
@@ -302,7 +318,9 @@ class Ui {
   uint32_t last_ring_text_hex_ = UINT32_MAX;
   uint32_t last_rendered_ams_signature_ = UINT32_MAX;
   std::atomic<uint32_t> last_activity_tick_ms_{0};
-  ScreenPowerMode screen_power_mode_ = ScreenPowerMode::kAwake;
+  std::atomic<ScreenPowerMode> screen_power_mode_{ScreenPowerMode::kAwake};
+  std::atomic<bool> wake_display_requested_{false};
+  bool display_worker_paused_ = false; // application task owns transitions
   std::string last_ui_status_;
   bool last_print_active_ = false;
   std::string last_diag_status_;
@@ -337,7 +355,34 @@ class Ui {
   std::atomic<bool> chamber_light_toggle_requested_{false};
   std::atomic<uint8_t> print_command_request_{static_cast<uint8_t>(PrintCommand::kNone)};
   std::atomic<bool> portal_unlock_requested_{false};
-  PrinterSnapshot deferred_snapshot_{};
+  struct PreparedSnapshot {
+    PrinterSnapshot snapshot;
+    std::shared_ptr<std::vector<uint8_t>> preview_raw;
+    lv_image_dsc_t preview_dsc{};
+  };
+  struct PortalInput {
+    bool lock_enabled, authorized, session_active, pin_active;
+    std::string pin;
+    uint32_t pin_remaining_s, session_remaining_s;
+  };
+  LatestMailbox<PreparedSnapshot> snapshot_mailbox_;
+  LatestMailbox<PortalInput> portal_mailbox_;
+  LatestMailbox<std::vector<PrinterCardInfo>> cards_mailbox_;
+  LatestMailbox<ArcColorScheme> colors_mailbox_;
+  // Only apply_snapshot(), on the application task, touches this decode cache.
+  std::shared_ptr<std::vector<uint8_t>> prepared_preview_source_, prepared_preview_raw_;
+  lv_image_dsc_t prepared_preview_dsc_{};
+  int64_t preview_decode_retry_us_ = 0;
+  bool render_refresh_pending_ = false; // LVGL task only
+  std::atomic<bool> snapshot_refresh_requested_{false};
+  lv_timer_t* update_timer_ = nullptr;
+  LatestMailbox<UiPerformanceSnapshot> performance_mailbox_;
+  UiTimingAccumulator render_timing_, flush_timing_, flush_wait_timing_, update_timing_, scroll_timing_;
+  int64_t performance_window_us_ = 0, render_started_us_ = 0, flush_started_us_ = 0, flush_wait_started_us_ = 0;
+  bool render_was_scrolling_ = false;
+  std::atomic<UiWorkPhase> work_phase_{UiWorkPhase::kIdle};
+  std::atomic<int64_t> work_phase_since_us_{0}, last_frame_us_{0};
+  std::atomic<int64_t> power_io_since_us_{0};
   PrinterSnapshot last_snapshot_{};
   DisplayRotation display_rotation_ = DisplayRotation::k0;
   BatteryDisplayPolicy battery_display_policy_{};

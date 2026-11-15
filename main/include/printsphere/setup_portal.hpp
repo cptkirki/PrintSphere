@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -72,6 +73,7 @@ class SetupPortal {
   static esp_err_t handle_timezone_post(httpd_req_t* request);
   static esp_err_t handle_cloud_connect(httpd_req_t* request);
   static esp_err_t handle_cloud_verify(httpd_req_t* request);
+  static esp_err_t handle_cloud_token(httpd_req_t* request);
   static esp_err_t handle_local_connect(httpd_req_t* request);
   static esp_err_t handle_printers_get(httpd_req_t* request);
   static esp_err_t handle_printers_select(httpd_req_t* request);
@@ -106,8 +108,9 @@ class SetupPortal {
   const PmuManager& pmu_manager_;
   AudioNotifier& audio_notifier_;
   httpd_handle_t server_ = nullptr;
-  bool reboot_requested_ = false;
-  std::mutex access_mutex_{};
+  std::atomic<bool> reboot_requested_{false};
+  std::atomic<bool> ota_in_progress_{false};
+  mutable std::recursive_mutex access_mutex_{};
   // OTA URL state (protected by ota_url_mutex_)
   enum class OtaUrlState { kIdle, kDownloading, kDone, kFailed };
   struct OtaUrlStatus {

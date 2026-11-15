@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -22,16 +23,22 @@ class WifiManager {
   esp_err_t initialize_network_stack();
   esp_err_t start_setup_access_point(std::string_view device_name);
   esp_err_t connect_station(const WifiCredentials& credentials);
-  bool is_station_connected() const { return sta_connected_; }
-  std::string station_ip() const { return sta_ip_; }
-  bool is_setup_access_point_active() const { return setup_ap_active_; }
-  std::string setup_access_point_ssid() const { return ap_ssid_; }
+  struct Snapshot { bool connected; bool setup_ap_active; std::string ip; std::string ap_ssid; };
+  Snapshot snapshot() const {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+    return {sta_connected_, setup_ap_active_, sta_ip_, ap_ssid_};
+  }
+  bool is_station_connected() const { return snapshot().connected; }
+  std::string station_ip() const { return snapshot().ip; }
+  bool is_setup_access_point_active() const { return snapshot().setup_ap_active; }
+  std::string setup_access_point_ssid() const { return snapshot().ap_ssid; }
   std::string setup_access_point_password() const;
   std::string setup_access_point_ip() const;
   std::vector<std::string> scan_visible_networks() const;
   std::vector<VisibleWifiNetwork> scan_visible_network_details() const;
 
  private:
+  mutable std::recursive_mutex state_mutex_{};
   static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id,
                             void* event_data);
   esp_err_t ensure_wifi_started();

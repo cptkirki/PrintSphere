@@ -23,6 +23,7 @@ constexpr uint8_t kSetupApRetryThreshold = 3;
 }  // namespace
 
 esp_err_t WifiManager::initialize_network_stack() {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   if (!netif_ready_) {
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -67,6 +68,7 @@ esp_err_t WifiManager::initialize_network_stack() {
 }
 
 esp_err_t WifiManager::start_setup_access_point(std::string_view device_name) {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   if (!wifi_ready_) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -101,6 +103,7 @@ esp_err_t WifiManager::start_setup_access_point(std::string_view device_name) {
 }
 
 esp_err_t WifiManager::connect_station(const WifiCredentials& credentials) {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   if (!wifi_ready_) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -181,8 +184,8 @@ std::vector<std::string> WifiManager::scan_visible_networks() const {
 
 std::vector<VisibleWifiNetwork> WifiManager::scan_visible_network_details() const {
   std::vector<VisibleWifiNetwork> networks;
-  if (!wifi_started_) {
-    return networks;
+  { std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+    if (!wifi_started_) return networks;
   }
 
   wifi_scan_config_t scan_config = {};
@@ -249,6 +252,7 @@ void WifiManager::event_handler(void* arg, esp_event_base_t event_base, int32_t 
 }
 
 esp_err_t WifiManager::ensure_wifi_started() {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), kTag, "esp_wifi_set_mode failed");
   if (!wifi_started_) {
     ESP_RETURN_ON_ERROR(esp_wifi_start(), kTag, "esp_wifi_start failed");
@@ -258,6 +262,7 @@ esp_err_t WifiManager::ensure_wifi_started() {
 }
 
 esp_err_t WifiManager::set_setup_access_point_enabled(bool enabled) {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   if (!wifi_started_) {
     return ESP_OK;
   }
@@ -284,6 +289,7 @@ esp_err_t WifiManager::set_setup_access_point_enabled(bool enabled) {
 }
 
 void WifiManager::on_wifi_event(int32_t event_id, void* event_data) {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   switch (event_id) {
     case WIFI_EVENT_STA_START:
       if (sta_should_connect_ && station_credentials_.is_configured()) {
@@ -319,6 +325,7 @@ void WifiManager::on_wifi_event(int32_t event_id, void* event_data) {
 }
 
 void WifiManager::on_ip_event(int32_t event_id, void* event_data) {
+  std::lock_guard<std::recursive_mutex> lock(state_mutex_);
   if (event_id != IP_EVENT_STA_GOT_IP || event_data == nullptr) {
     return;
   }
