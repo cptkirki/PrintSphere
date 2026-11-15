@@ -1,0 +1,44 @@
+name: host-tests
+
+on:
+  push:
+    paths:
+      - "main/include/printsphere/printer_state.hpp"
+      - "main/include/printsphere/bambu_status.hpp"
+      - "main/include/printsphere/status_resolver.hpp"
+      - "main/include/printsphere/error_lookup.hpp"
+      - "main/src/printer_state.cpp"
+      - "main/src/bambu_status.cpp"
+      - "main/src/status_resolver.cpp"
+      - "tests/host/**"
+      - ".github/workflows/host-tests.yml"
+  pull_request:
+    paths:
+      - "main/include/printsphere/printer_state.hpp"
+      - "main/include/printsphere/bambu_status.hpp"
+      - "main/include/printsphere/status_resolver.hpp"
+      - "main/include/printsphere/error_lookup.hpp"
+      - "main/src/printer_state.cpp"
+      - "main/src/bambu_status.cpp"
+      - "main/src/status_resolver.cpp"
+      - "tests/host/**"
+      - ".github/workflows/host-tests.yml"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure
+        run: cmake -S tests/host -B tests/host/build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build tests/host/build --parallel
+
+      - name: Run tests
+        working-directory: tests/host/build
+        run: ctest --output-on-failure
