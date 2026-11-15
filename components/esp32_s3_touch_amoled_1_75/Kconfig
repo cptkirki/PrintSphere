@@ -69,7 +69,7 @@ menu "Board Support Package"
     menu "Display"
         config BSP_LCD_TRANS_QUEUE_DEPTH
             int "Set The depth of the SPI transmission task queue for the SPI screen"
-            default 10
+            default 1
             range 1 10
             help
                 Cache the SPI screen instruction/pixel data transmission tasks, implement asynchronous non-blocking screen refreshing, and the CPU can execute other logic after submitting the task.

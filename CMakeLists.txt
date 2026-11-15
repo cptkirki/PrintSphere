@@ -4,7 +4,8 @@ set(IDF_TARGET "esp32s3")
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(PRINTSPHERE_RELEASE_VERSION "v1.6.3")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" PRINTSPHERE_RELEASE_VERSION LIMIT_COUNT 1)
 set(PROJECT_VER "${PRINTSPHERE_RELEASE_VERSION}")
 set(PRINTSPHERE_HW_VARIANT "lcd_2_8c" CACHE STRING
     "PrintSphere hardware variant: lcd_2_8c or amoled_1_75")
@@ -30,8 +31,40 @@ else()
         "Use 'lcd_2_8c' or 'amoled_1_75'.")
 endif()
 
+if(NOT DEFINED SDKCONFIG)
+    set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig" CACHE FILEPATH "Board-specific sdkconfig")
+endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(printsphere_idf)
+if(PRINTSPHERE_HW_VARIANT STREQUAL "lcd_2_8c")
+    set(PRINTSPHERE_PROJECT_ID "printsphere_2_8c_p2")
+else()
+    set(PRINTSPHERE_PROJECT_ID "printsphere_1_75_p2")
+endif()
+project(${PRINTSPHERE_PROJECT_ID})
+if(CONFIG_LV_USE_FREERTOS_TASK_NOTIFY OR CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES LESS 2)
+    message(FATAL_ERROR
+        "Unsafe display synchronization in cached sdkconfig: disable "
+        "CONFIG_LV_USE_FREERTOS_TASK_NOTIFY and set "
+        "CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES=2.")
+endif()
+if(CONFIG_MBEDTLS_DEBUG AND NOT PRINTSPHERE_RELEASE_VERSION MATCHES "[-_]debug")
+    message(FATAL_ERROR
+        "TLS tracing is enabled in the cached sdkconfig. Disable CONFIG_MBEDTLS_DEBUG "
+        "(Component config > mbedTLS > Enable mbedTLS debugging). "
+        "Tracing is only allowed for an explicitly named -debug/_debug version.")
+endif()
+if(NOT "${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH}" STREQUAL "5.5.4")
+    message(FATAL_ERROR "PrintSphere requires tested ESP-IDF v5.5.4")
+endif()
+
+# Managed components are available after project(). Fail the build if the
+# required display safety patch cannot be applied to the pinned dependency.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/patches/apply_adapter_patches.py"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" RESULT_VARIABLE PRINTSPHERE_PATCH_RESULT)
+if(NOT PRINTSPHERE_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Required LVGL adapter safety patch failed")
+endif()
 
 # Work around an Xtensa GCC ICE seen in ESP-IDF 5.5.2 while compiling
 # esp_lcd_panel_rgb.c with the default debug/-Og flags on Windows.

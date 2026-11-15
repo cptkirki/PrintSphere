@@ -1,4 +1,5 @@
 #pragma once
+#include "printsphere/connection_policy.hpp"
 
 #include <array>
 #include <cstdint>
@@ -78,7 +79,7 @@ struct SourceCapabilities {
 };
 
 static constexpr int kMaxAmsTrays = 4;
-static constexpr int kMaxAmsUnits = 4;
+static constexpr int kMaxAmsUnits = policy::kAmsUnits;
 
 struct AmsTrayInfo {
   bool present = false;
@@ -90,6 +91,7 @@ struct AmsTrayInfo {
 };
 
 struct AmsUnitInfo {
+  int protocol_id = -1;
   bool present = false;
   int humidity_pct = -1;       // 0-100% relative humidity, -1 = unknown
   float temperature_c = 0.0f;
@@ -103,6 +105,8 @@ struct AmsSnapshot {
 };
 
 struct PrinterSnapshot {
+  bool command_pending = false;
+  std::string command_detail;
   PrinterConnectionState connection = PrinterConnectionState::kBooting;
   PrintLifecycleState lifecycle = PrintLifecycleState::kUnknown;
   std::string stage = "boot";
@@ -140,7 +144,6 @@ struct PrinterSnapshot {
   // Pending print-control command (pause/resume/stop). Non-kNone for the brief
   // window between issuing the command and the printer's next status report.
   // The UI uses this to render a spinner / disabled state on the relevant button.
-  PrintCommand print_command_pending_kind = PrintCommand::kNone;
   uint32_t remaining_seconds = 0;
   uint16_t current_layer = 0;
   uint16_t total_layers = 0;
@@ -189,7 +192,7 @@ struct PrinterSnapshot {
   int tray_now = -1;
   int tray_tar = -1;
   int ams_status_main = -1;
-  std::shared_ptr<AmsSnapshot> ams;
+  std::shared_ptr<const AmsSnapshot> ams;
 };
 
 class PrinterStateStore {

@@ -1,8 +1,11 @@
 param(
-    [string]$Version = "v1.6.3"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Version) {
+    $Version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '../VERSION') -Raw).Trim()
+}
 
 $variants = @(
     @{

@@ -137,20 +137,6 @@ static esp_err_t bsp_rotation_panel_del(esp_lcd_panel_t *panel)
     return esp_lcd_panel_del(ctx->target);
 }
 
-static bool bsp_rotation_panel_ensure_buffer(bsp_rotation_panel_t *ctx, size_t pixels)
-{
-    if (ctx->rotation_buffer_pixels >= pixels && ctx->rotation_buffer != NULL)
-    {
-        return true;
-    }
-
-    free(ctx->rotation_buffer);
-    ctx->rotation_buffer = heap_caps_malloc(pixels * sizeof(uint16_t),
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    ctx->rotation_buffer_pixels = ctx->rotation_buffer ? pixels : 0;
-    return ctx->rotation_buffer != NULL;
-}
-
 // Ensure the large PSRAM scratch used for the rotated frame is sized to fit
 // `pixels` (RGB565). PSRAM is plentiful (8 MB on this board) and cheaper than
 // the internal-RAM scratch which can't hold a full-screen rotated bitmap.
@@ -206,70 +192,7 @@ static void bsp_rotation_panel_rotate_region_270(const uint16_t *src, uint16_t *
     }
 }
 
-static esp_err_t bsp_rotation_panel_draw_staged(bsp_rotation_panel_t *ctx, int x_start, int y_start,
-                                                int x_end, int y_end, const uint16_t *src)
-{
-    const int width = x_end - x_start;
-    const int height = y_end - y_start;
-    if (width <= 0 || height <= 0)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const size_t pixels = (size_t)width * height;
-    // Use the chunked DMA staging path whenever:
-    //   * TE-sync mode is active (need ping-pong slots to overlap CPU/DMA), OR
-    //   * The source bitmap lives in PSRAM (cannot be DMA'd directly, and a
-    //     full-frame rotated buffer is far too large for internal heap).
-    const bool src_in_psram = src != NULL && esp_ptr_external_ram(src);
-    const bool use_chunked =
-        (ctx->te_sync_mode || src_in_psram) && height > BSP_LCD_DMA_STAGING_ROWS;
-    if (use_chunked)
-    {
-        const int max_rows = BSP_LCD_DMA_STAGING_ROWS;
-        const size_t max_pixels = (size_t)width * max_rows;
-        if (!bsp_rotation_panel_ensure_buffer(ctx, max_pixels * 2))
-        {
-            ESP_LOGE(TAG, "Unable to allocate %" PRIu32 " px DMA staging buffer",
-                     (uint32_t)(max_pixels * 2));
-            return ESP_ERR_NO_MEM;
-        }
-
-        for (int y = 0; y < height;)
-        {
-            const int rows = (height - y) > max_rows ? max_rows : (height - y);
-            const size_t chunk_pixels = (size_t)width * rows;
-            uint16_t *staging = ctx->rotation_buffer + ((size_t)ctx->staging_slot * max_pixels);
-            ctx->staging_slot ^= 1;
-            memcpy(staging, src + ((size_t)y * width),
-                   chunk_pixels * sizeof(uint16_t));
-            esp_err_t err = esp_lcd_panel_draw_bitmap(ctx->target,
-                                                      x_start,
-                                                      y_start + y,
-                                                      x_end,
-                                                      y_start + y + rows,
-                                                      staging);
-            if (err != ESP_OK)
-            {
-                return err;
-            }
-            y += rows;
-        }
-
-        return ESP_OK;
-    }
-
-    if (!bsp_rotation_panel_ensure_buffer(ctx, pixels))
-    {
-        ESP_LOGE(TAG, "Unable to allocate %" PRIu32 " px DMA staging buffer",
-                 (uint32_t)pixels);
-        return ESP_ERR_NO_MEM;
-    }
-
-    memcpy(ctx->rotation_buffer, src, pixels * sizeof(uint16_t));
-    return esp_lcd_panel_draw_bitmap(ctx->target, x_start, y_start, x_end, y_end,
-                                     ctx->rotation_buffer);
-}
+#include "bsp_dma_staging.h"
 
 static esp_err_t bsp_rotation_panel_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int y_start,
                                                 int x_end, int y_end, const void *color_data)
@@ -671,8 +594,7 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 
 esp_err_t bsp_display_brightness_init(void)
 {
-    bsp_display_brightness_set(100);
-    return ESP_OK;
+    return bsp_display_brightness_set(100);
 }
 
 esp_err_t bsp_display_brightness_set(int brightness_percent)
@@ -689,16 +611,21 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
         return ESP_ERR_INVALID_ARG;
     }
 
-    brightness = (uint8_t)(brightness_percent * 255 / 100);
+    // SPI panel IO is not thread-safe for the same device. Serialize command
+    // writes with LVGL's whole flush, including every DMA staging chunk.
+    // This mutex is recursive, so calls from an LVGL callback are safe too.
+    esp_err_t ret = bsp_display_lock(250);
+    if (ret != ESP_OK) return ret;
 
     uint32_t lcd_cmd = 0x51;
     lcd_cmd &= 0xff;
     lcd_cmd <<= 8;
     lcd_cmd |= 0x02 << 24;
-    uint8_t param = brightness;
-    esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &param, 1);
-
-    return ESP_OK;
+    uint8_t param = (uint8_t)(brightness_percent * 255 / 100);
+    ret = esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &param, 1);
+    if (ret == ESP_OK) brightness = param;
+    bsp_display_unlock();
+    return ret;
 }
 
 int bsp_display_brightness_get(void)
@@ -1034,7 +961,8 @@ esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation)
         return ESP_ERR_INVALID_ARG;
     }
 
-    rotation_panel.rotation = rotation;
+    esp_err_t ret = bsp_display_lock(250);
+    if (ret != ESP_OK) return ret;
 
     // Re-apply the draw offset expected by the current panel orientation.
     esp_lcd_panel_set_gap(panel_handle, x_gap, y_gap);
@@ -1047,7 +975,10 @@ esp_err_t bsp_display_rotation_set(bsp_display_rotation_t rotation)
     ESP_LOGI(TAG, "Set display rotation: %d (MADCTL=0x%02X gap=%d,%d)",
              rotation, madctl, x_gap, y_gap);
 
-    return esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &madctl, 1);
+    ret = esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &madctl, 1);
+    if (ret == ESP_OK) rotation_panel.rotation = rotation;
+    bsp_display_unlock();
+    return ret;
 }
 
 esp_err_t bsp_display_lock(uint32_t timeout_ms)

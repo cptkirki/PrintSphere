@@ -14,6 +14,8 @@
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
+#include "printsphere/bambu_tls.hpp"
+#include "printsphere/time_sync.hpp"
 
 namespace printsphere {
 
@@ -269,6 +271,7 @@ bool P1sCameraClient::write_all(esp_tls_t* tls, const void* buffer, size_t lengt
 }
 
 bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
+  if (!time_sync::clock_ready()) return false;
   if (tls_ != nullptr) {
     return true;
   }
@@ -277,6 +280,9 @@ bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
 
   esp_tls_cfg_t tls_cfg = {};
   tls_cfg.timeout_ms = 7000;
+  const auto& ca = bambu_ca_bundle();
+  tls_cfg.cacert_buf = reinterpret_cast<const unsigned char*>(ca.c_str());
+  tls_cfg.cacert_bytes = ca.size() + 1;
   tls_cfg.skip_common_name = true;
   tls_cfg.addr_family = ESP_TLS_AF_INET;
   tls_cfg.tls_version = ESP_TLS_VER_TLS_1_2;

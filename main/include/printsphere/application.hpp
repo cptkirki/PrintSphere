@@ -48,11 +48,6 @@ class Application {
   bool chamber_light_override_active_ = false;
   bool chamber_light_override_on_ = false;
   uint64_t chamber_light_override_until_ms_ = 0;
-  // Optimistic UI override for the most recently issued pause/resume/stop
-  // command. Active until the printer reports the corresponding lifecycle
-  // transition or the timeout expires (whichever comes first).
-  PrintCommand print_command_override_kind_ = PrintCommand::kNone;
-  uint64_t print_command_override_until_ms_ = 0;
   // Edge-detection state for AudioNotifier — captured from the previous
   // PrinterSnapshot every loop iteration so we only beep on real transitions.
   PrintLifecycleState audio_last_lifecycle_ = PrintLifecycleState::kUnknown;
