@@ -17,8 +17,12 @@ jobs:
           idf.py -B "build-${{ matrix.board }}" -DPRINTSPHERE_HW_VARIANT=${{ matrix.board }} build
       - name: Run host regression tests
         shell: bash
-        run: python tools/test_host.py
+        run: |
+          . "$IDF_PATH/export.sh"
+          python tools/test_host.py
       - name: Run actual LVGL UI regressions for both layouts
         if: matrix.board == 'amoled_1_75'
         shell: bash
-        run: python tools/test_lvgl_host.py
+        run: |
+          . "$IDF_PATH/export.sh"
+          python tools/test_lvgl_host.py
