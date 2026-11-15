@@ -12,7 +12,8 @@ foreach(board IN ITEMS amoled lcd)
   add_executable(ui-${board}-tests ui_tests.cpp mock_board.cpp
       "${REPO}/main/src/ui.cpp" "${REPO}/main/src/printer_state.cpp"
       "${REPO}/main/include/font/dosis_20.c" "${REPO}/main/include/font/dosis_32.c"
-      "${REPO}/main/include/font/dosis_40.c" "${REPO}/main/include/font/mdi_30.c"
+      "${REPO}/main/include/font/dosis_40.c"
+      "${REPO}/main/include/font/montserrat_12.c" "${REPO}/main/include/font/montserrat_14.c" "${REPO}/main/include/font/montserrat_20.c" "${REPO}/main/include/font/mdi_30.c"
       "${REPO}/main/include/font/mdi_40.c" "${REPO}/main/include/img/bambuicon.c")
   target_include_directories(ui-${board}-tests PRIVATE stubs "${REPO}/tests/stubs" "${REPO}/main/include" "${REPO}/managed_components/lvgl__lvgl/src")
   if(board STREQUAL "amoled")

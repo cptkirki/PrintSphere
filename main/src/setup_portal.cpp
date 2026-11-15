@@ -1,3 +1,4 @@
+#include "printsphere/utf8.hpp"
 #include "printsphere/setup_portal.hpp"
 
 #include <algorithm>
@@ -4079,7 +4080,7 @@ esp_err_t SetupPortal::handle_audio_upload(httpd_req_t* request) {
 
   // Optional display name from the "name" query param (already trimmed to 7 chars by the client).
   std::string display_name = uri_query_str(request, "name");
-  if (display_name.size() > 8) display_name.resize(8);  // hard cap server-side
+  if (display_name.size() > 8) display_name = utf8_truncate_chars(display_name, 8);  // hard cap server-side
 
   std::vector<uint8_t> body;
   esp_err_t recv_err = receive_binary_body(request, body, kMaxWavBody);

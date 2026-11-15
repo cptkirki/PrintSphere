@@ -11,6 +11,10 @@
 #undef assert
 #define assert(condition) do { if (!(condition)) { std::cerr << "CHECK failed: " #condition << " at " << __LINE__ << '\n'; std::exit(2); } } while (0)
 
+extern "C" {
+extern const lv_font_t dosis_20, dosis_32, dosis_40;
+extern const lv_font_t montserrat_12, montserrat_14, montserrat_20;
+}
 lv_obj_t* find_text(lv_obj_t* object, const char* text) {
   if (lv_obj_check_type(object, &lv_label_class) && !std::strcmp(lv_label_get_text(object), text)) return object;
   for (uint32_t i=0; i<lv_obj_get_child_count(object); ++i)
@@ -41,6 +45,14 @@ void pump(unsigned ms) {
 int main() {
   using namespace printsphere;
   lv_init();
+
+  for (auto font : {&dosis_20,&dosis_32,&dosis_40,&montserrat_12,&montserrat_14,&montserrat_20}) {
+    for (uint32_t cp : {0xC4u,0xD6u,0xDCu,0xDFu,0xE4u,0xF6u,0xFCu,0x20ACu,0x2013u,0x10Cu}) {
+      lv_font_glyph_dsc_t glyph{};
+      assert(lv_font_get_glyph_dsc(font,&glyph,cp,0));
+      assert(!glyph.is_placeholder);
+    }
+  }
   host_ui_owner=std::this_thread::get_id();
   Ui ui;
   assert(ui.initialize() == ESP_OK);

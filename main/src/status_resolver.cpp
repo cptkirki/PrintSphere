@@ -1,3 +1,4 @@
+#include "printsphere/utf8.hpp"
 #include "printsphere/status_resolver.hpp"
 #include "esp_timer.h"
 
@@ -28,9 +29,9 @@ std::string shorten(std::string value, size_t max_len) {
     return value;
   }
   if (max_len <= 3U) {
-    return value.substr(0, max_len);
+    return utf8_truncate_bytes(value, max_len);
   }
-  value.resize(max_len - 3U);
+  value = utf8_truncate_bytes(value, max_len - 3U);
   value += "...";
   return value;
 }

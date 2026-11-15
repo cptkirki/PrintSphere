@@ -1,3 +1,4 @@
+#include "printsphere/utf8.hpp"
 #include "printsphere/bambu_cloud_client.hpp"
 
 #include <algorithm>
@@ -486,7 +487,7 @@ void copy_text(std::array<char, N>* target, const std::string& value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value.c_str(), target->size());
+  utf8_copy_c_str(target->data(), target->size(), value);
 }
 
 template <size_t N>
@@ -494,7 +495,7 @@ void copy_text(std::array<char, N>* target, const char* value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value != nullptr ? value : "", target->size());
+  utf8_copy_c_str(target->data(), target->size(), value != nullptr ? value : "");
 }
 
 template <size_t N>
