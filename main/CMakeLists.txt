@@ -44,6 +44,7 @@ idf_component_register(
         "src/bambu_cloud_client.cpp"
         "src/config_store.cpp"
         "src/error_lookup.cpp"
+        "src/github_update.cpp"
         "include/font/dosis_20.c"
         "include/font/dosis_32.c"
         "include/font/dosis_40.c"

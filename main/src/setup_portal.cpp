@@ -13,11 +13,14 @@
 #include "cJSON.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "strings.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "printsphere/firmware_identity.hpp"
+#include "printsphere/github_update.hpp"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -92,6 +95,89 @@ std::string json_escape(const std::string& input) {
   }
 
   return output;
+}
+
+constexpr int kOtaHttpBufferBytes = 4096;
+constexpr int kOtaHttpTimeoutMs = 60000;
+constexpr char kOtaUserAgent[] = "PrintSphere/" PRINTSPHERE_RELEASE_VERSION;
+
+esp_err_t capture_location_event(esp_http_client_event_t* event) {
+  if (event->event_id != HTTP_EVENT_ON_HEADER || event->user_data == nullptr) return ESP_OK;
+  if (event->header_key != nullptr && strcasecmp(event->header_key, "Location") == 0 &&
+      event->header_value != nullptr) {
+    static_cast<std::string*>(event->user_data)->assign(event->header_value);
+  }
+  return ESP_OK;
+}
+
+esp_err_t ota_http_init_cb(esp_http_client_handle_t client) {
+  esp_http_client_set_header(client, "User-Agent", kOtaUserAgent);
+  esp_http_client_set_header(client, "Accept", "application/octet-stream");
+  return ESP_OK;
+}
+
+void apply_ota_http_defaults(esp_http_client_config_t* config, const char* url) {
+  *config = {};
+  config->url = url;
+  config->crt_bundle_attach = esp_crt_bundle_attach;
+  config->timeout_ms = kOtaHttpTimeoutMs;
+  config->buffer_size = kOtaHttpBufferBytes;
+  config->buffer_size_tx = kOtaHttpBufferBytes;
+  config->keep_alive_enable = false;
+  config->user_agent = kOtaUserAgent;
+}
+
+// GitHub release assets 302 to a long signed CDN URL. The default 512-byte HTTP
+// buffer truncates Location and the follow-up GET, which surfaces as ESP_FAIL.
+bool follow_https_redirects(std::string url, std::string* final_url, std::string* error) {
+  for (int hop = 0; hop < 8; ++hop) {
+    std::string location;
+    esp_http_client_config_t config = {};
+    apply_ota_http_defaults(&config, url.c_str());
+    config.disable_auto_redirect = true;
+    config.event_handler = &capture_location_event;
+    config.user_data = &location;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+      *error = "http-begin";
+      return false;
+    }
+    esp_http_client_set_method(client, HTTP_METHOD_GET);
+    ota_http_init_cb(client);
+    const esp_err_t open_err = esp_http_client_open(client, 0);
+    if (open_err != ESP_OK) {
+      *error = std::string("connect: ") + esp_err_to_name(open_err);
+      esp_http_client_cleanup(client);
+      return false;
+    }
+    esp_http_client_fetch_headers(client);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status >= 200 && status < 300) {
+      *final_url = std::move(url);
+      return true;
+    }
+    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+      if (location.empty()) {
+        *error = "HTTP " + std::to_string(status) + " without Location";
+        return false;
+      }
+      if (location.rfind("https://", 0) != 0) {
+        *error = "HTTP " + std::to_string(status) + " to a non-HTTPS URL";
+        return false;
+      }
+      ESP_LOGI(kTag, "OTA redirect %d -> %s", status, location.c_str());
+      url = std::move(location);
+      continue;
+    }
+    *error = "HTTP " + std::to_string(status);
+    return false;
+  }
+  *error = "too many redirects";
+  return false;
 }
 
 std::string read_string_field(const cJSON* object, const char* key) {
@@ -1172,6 +1258,14 @@ esp_err_t SetupPortal::start() {
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &ota_status_uri), kTag,
                       "ota status handler failed");
 
+  httpd_uri_t update_check_uri = {};
+  update_check_uri.uri = "/api/update/check";
+  update_check_uri.method = HTTP_GET;
+  update_check_uri.handler = &SetupPortal::handle_update_check;
+  update_check_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &update_check_uri), kTag,
+                      "update check handler failed");
+
 #ifdef PRINTSPHERE_DEBUG_BUILD
   httpd_uri_t debug_log_uri = {};
   debug_log_uri.uri = "/api/debug/log";
@@ -1393,8 +1487,14 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   const auto begin_collapsible_section =
       [&html, &add_summary_pill](const char* title, const char* detail,
                                  const std::string& badge_value, const char* badge_class,
-                                 bool open, const char* pill_id = nullptr) {
+                                 bool open, const char* pill_id = nullptr,
+                                 const char* section_id = nullptr) {
         html += "<details class=\"section\"";
+        if (section_id != nullptr && section_id[0] != '\0') {
+          html += " id=\"";
+          html += section_id;
+          html += "\"";
+        }
         if (open) {
           html += " open";
         }
@@ -1450,7 +1550,12 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "color:#b9d4ef;} .hero-version{display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;"
           "border-radius:999px;border:1px solid #31557d;background:#111b29;color:#dceafa;font-size:12px;font-weight:700;"
           "letter-spacing:.08em;text-transform:uppercase;text-decoration:none;transition:border-color .18s ease,background .18s ease,color .18s ease;}"
-          " .hero-version:hover{border-color:#4d86c7;background:#142235;color:#f8fbff;} .title{font-size:34px;line-height:1.05;} .subtitle{max-width:720px;color:var(--muted);"
+          " .hero-version:hover{border-color:#4d86c7;background:#142235;color:#f8fbff;}"
+          " .hero-version-row{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;}"
+          " .hero-update{display:inline-flex;align-items:center;justify-content:center;padding:6px 12px;border-radius:999px;"
+          "border:1px solid #8a5a1a;background:#2a1c0a;color:#ffd07a;font-size:12px;font-weight:700;letter-spacing:.08em;"
+          "text-transform:uppercase;text-decoration:none;cursor:pointer;}"
+          " .hero-update[hidden]{display:none!important;} .title{font-size:34px;line-height:1.05;} .subtitle{max-width:720px;color:var(--muted);"
           "line-height:1.55;} .section-head p,.hint,.micro{color:var(--muted);"
           "line-height:1.5;} .micro{font-size:13px;} .section-summary{display:grid;grid-template-columns:1fr auto;"
           "gap:6px 14px;align-items:center;padding:22px;cursor:pointer;list-style:none;} .section-summary::-webkit-details-marker{display:none;}"
@@ -1534,9 +1639,11 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   };
 
   html += "<section class=\"hero\">";
-  html += "<div class=\"hero-top\"><div class=\"hero-brand\"><div class=\"eyebrow\">PrintSphere</div><a class=\"hero-version\" href=\"https://github.com/cptkirki/PrintSphere\" target=\"_blank\" rel=\"noopener noreferrer\">";
+  html += "<div class=\"hero-top\"><div class=\"hero-brand\"><div class=\"eyebrow\">PrintSphere</div><div class=\"hero-version-row\">";
+  html += "<a class=\"hero-version\" href=\"https://github.com/cptkirki/PrintSphere\" target=\"_blank\" rel=\"noopener noreferrer\">";
   html += json_escape(kPortalReleaseVersion);
-  html += "</a></div><div id=\"portal-timer\" style=\"display:none\" title=\"Click to extend session by 5 minutes\"></div></div>";
+  html += "</a><a class=\"hero-update\" id=\"heroUpdate\" href=\"#secOta\" hidden></a></div></div>";
+  html += "<div id=\"portal-timer\" style=\"display:none\" title=\"Click to extend session by 5 minutes\"></div></div>";
   html += "<h1 class=\"title\">Web Config</h1>";
   html += "<p class=\"subtitle\">";
   html += show_connection_steps
@@ -2242,8 +2349,16 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     begin_collapsible_section(
         "Firmware Update",
         "Upload a compiled PrintSphere .bin firmware image to update the device over-the-air without a USB connection.",
-        "OTA", "idle", false);
+        "OTA", "idle", false, "ota-section-pill", "secOta");
     html += "<div class=\"hint-box\"><strong>Warning:</strong> The device restarts immediately after a successful flash. Only upload firmware built for PrintSphere (ESP32-S3).</div>";
+    html += "<p class=\"micro\" id=\"ota-version-info\">Current: ";
+    html += json_escape(kPortalReleaseVersion);
+    html += "</p>";
+    html += "<div class=\"actions\"><button type=\"button\" class=\"secondary\" id=\"ota-check-button\">Check for update</button>";
+    html += "<button type=\"button\" class=\"primary\" id=\"ota-install-button\" disabled>Install update</button>";
+    html += "<button type=\"button\" class=\"secondary\" id=\"ota-reinstall-button\" disabled>Reinstall</button></div>";
+    html += "<div class=\"micro\" id=\"ota-gh-status\">The portal checks GitHub for a newer release after Wi-Fi and network time are ready.</div>";
+    html += "<hr style=\"border:none;border-top:1px solid var(--line);margin:16px 0 4px\">";
     html += "<div class=\"field\"><label for=\"ota_file\">Firmware .bin file</label>";
     html += "<input type=\"file\" id=\"ota_file\" accept=\".bin\"></div>";
     html += "<div id=\"ota-progress-wrap\" style=\"display:none;margin:4px 0;height:8px;border-radius:6px;background:#0e1620;overflow:hidden\">";
@@ -2376,6 +2491,32 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
   html += "let cloudSuccessReloadScheduled=false;";
   html += "let healthInFlight=false;";
   html += "let wifiScanInFlight=false;";
+  html += "let otaDownloadUrl='';";
+  html += "function applyGithubUpdate(upd){upd=upd||{};"
+          "const hero=document.getElementById('heroUpdate');"
+          "const pill=document.getElementById('ota-section-pill');"
+          "const info=document.getElementById('ota-version-info');"
+          "const install=document.getElementById('ota-install-button');"
+          "const reinstall=document.getElementById('ota-reinstall-button');"
+          "const status=document.getElementById('ota-gh-status');"
+          "if(upd.url)otaDownloadUrl=upd.url;"
+          "if(info){info.textContent='Current: '+(upd.current||'')+' \\u00b7 Latest: '+(upd.latest||'\\u2014');}"
+          "if(reinstall)reinstall.disabled=!otaDownloadUrl;"
+          "if(upd.available&&upd.latest){"
+          "if(hero){hero.hidden=false;hero.textContent='Update '+upd.latest;}"
+          "if(pill){pill.textContent='Update';pill.className='summary-pill warn';}"
+          "if(install)install.disabled=!otaDownloadUrl;"
+          "if(status&&!upd.checking)status.textContent='Update '+upd.latest+' is available.';"
+          "}else{"
+          "if(hero){hero.hidden=true;hero.textContent='';}"
+          "if(pill){pill.textContent='OTA';pill.className='summary-pill idle';}"
+          "if(install)install.disabled=true;"
+          "if(status&&upd.checking)status.textContent='Checking GitHub for a newer release...';"
+          "else if(status&&upd.checked)status.textContent=upd.error?('GitHub check: '+upd.error):(otaDownloadUrl?'Firmware is up to date. Reinstall flashes the same GitHub release.':'Firmware is up to date.');"
+          "}}";
+  html += "const heroUpdate=document.getElementById('heroUpdate');"
+          "if(heroUpdate){heroUpdate.addEventListener('click',function(ev){ev.preventDefault();"
+          "const sec=document.getElementById('secOta');if(sec){sec.open=true;sec.scrollIntoView({behavior:'smooth',block:'start'});}});}";
   html += "document.querySelectorAll('.settings-accordion').forEach(group=>{group.querySelectorAll('.settings-panel').forEach(panel=>{panel.addEventListener('toggle',()=>{if(!panel.open)return;group.querySelectorAll('.settings-panel').forEach(other=>{if(other!==panel)other.open=false;});});});});";
   html += "const savedConfig={cloud_email:\"";
   html += json_escape(cloud.email);
@@ -2505,6 +2646,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else{const stage=cloudSetupStage(body);setStatus(trimmedValue('cloud_email')||body.cloud_connected||cloudStageIsCodeRequired(stage)||cloudStageIsBusy(stage)?'Connect Bambu Cloud':'Setup ready',body.cloud_detail||body.detail||('ESP on home network: '+(body.wifi_ip||'')),0);}}"
           "else{setStatus('Save Wi-Fi','Save Wi-Fi and restart to continue provisioning.',0);}}"
           "syncPortalTimer(body.portal_open_remaining_s||0);"
+          "if(body.update)applyGithubUpdate(body.update);"
           "return body;}";
   html += "async function forceHealthRefresh(){try{const response=await fetch('/api/health',{cache:'no-store'});"
           "if(!response.ok)return null;const body=await response.json();if(body.portal_locked){window.location.reload();return null;}"
@@ -2994,6 +3136,28 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "catch(e){setStatus('Save failed','',6000);btn.disabled=false;}});});";
 
   html += "(function(){";
+  html += "var otaCheckBtn=document.getElementById('ota-check-button');";
+  html += "var otaInstallBtn=document.getElementById('ota-install-button');";
+  html += "var otaReinstallBtn=document.getElementById('ota-reinstall-button');";
+  html += "var otaGhStatus=document.getElementById('ota-gh-status');";
+  html += "function startGithubInstall(reinstall){"
+          "if(!otaDownloadUrl){if(otaGhStatus)otaGhStatus.textContent='No GitHub firmware URL yet.';return;}"
+          "if(otaGhStatus)otaGhStatus.textContent=reinstall?'Reinstalling the current GitHub release...':'Installing update...';"
+          "var urlInput=document.getElementById('ota_url');if(urlInput)urlInput.value=otaDownloadUrl;"
+          "var urlBtn=document.getElementById('ota-url-button');if(urlBtn)urlBtn.click();}";
+  html += "function pollGithubCheck(remaining){"
+          "fetch('/api/update/check',{cache:'no-store'})"
+          ".then(function(r){return r.json();})"
+          ".then(function(data){applyGithubUpdate(data);"
+          "if(data.checking&&remaining>0){setTimeout(function(){pollGithubCheck(remaining-1);},700);}"
+          "else if(otaCheckBtn)otaCheckBtn.disabled=false;})"
+          ".catch(function(){if(otaGhStatus)otaGhStatus.textContent='GitHub check failed.';if(otaCheckBtn)otaCheckBtn.disabled=false;});}";
+  html += "if(otaCheckBtn){otaCheckBtn.addEventListener('click',function(){"
+          "otaCheckBtn.disabled=true;if(otaGhStatus)otaGhStatus.textContent='Checking GitHub for a newer release...';"
+          "fetch('/api/update/check?refresh=1',{cache:'no-store'}).then(function(){pollGithubCheck(25);})"
+          ".catch(function(){if(otaGhStatus)otaGhStatus.textContent='GitHub check failed.';otaCheckBtn.disabled=false;});});}";
+  html += "if(otaInstallBtn){otaInstallBtn.addEventListener('click',function(){startGithubInstall(false);});}";
+  html += "if(otaReinstallBtn){otaReinstallBtn.addEventListener('click',function(){startGithubInstall(true);});}";
   html += "var otaFile=document.getElementById('ota_file');";
   html += "var otaBtn=document.getElementById('ota-upload-button');";
   html += "var otaStatus=document.getElementById('ota-status');";
@@ -3159,6 +3323,11 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
     append_local_status_fields(&body, local, portal->printer_client_.is_configured());
     append_mqtt_telemetry_fields(&body, portal->printer_client_.mqtt_telemetry(),
                                  portal->cloud_client_.mqtt_telemetry());
+    if (portal->wifi_manager_.is_station_connected() && time_sync::clock_ready()) {
+      github::Checker::instance().kick();
+    }
+    body += ",\"update\":";
+    body += github::Checker::instance().snapshot().to_json();
   }
   // These counters contain no account or portal secrets. They remain readable
   // while locked, so a stalled display cannot prevent obtaining diagnostics.
@@ -4855,7 +5024,7 @@ esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
   }
 
   ESP_LOGI(kTag, "Starting OTA URL task: %s", url.c_str());
-  if (xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr) != pdPASS) {
+  if (xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 12288, portal, 5, nullptr) != pdPASS) {
     portal->ota_in_progress_ = false;
     std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
     portal->ota_url_status_.state = OtaUrlState::kFailed;
@@ -4908,6 +5077,37 @@ esp_err_t SetupPortal::handle_ota_status(httpd_req_t* request) {
   return ESP_OK;
 }
 
+esp_err_t SetupPortal::handle_update_check(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (portal == nullptr) {
+    return ESP_FAIL;
+  }
+  if (!portal->is_request_authorized(request)) {
+    return portal->send_locked_response(request);
+  }
+
+  bool force = false;
+  char query[48] = {};
+  if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+    char refresh[8] = {};
+    if (httpd_query_key_value(query, "refresh", refresh, sizeof(refresh)) == ESP_OK &&
+        refresh[0] == '1') {
+      force = true;
+    }
+  }
+  if (portal->wifi_manager_.is_station_connected() && time_sync::clock_ready()) {
+    github::Checker::instance().kick(force);
+  }
+  github::UpdateSnapshot info = github::Checker::instance().snapshot();
+  if (!portal->wifi_manager_.is_station_connected() && !info.checking && !info.checked) {
+    info.current = kPortalReleaseVersion;
+    info.error = "no-wifi";
+    info.checked = true;
+  }
+  send_json(request, info.to_json());
+  return ESP_OK;
+}
+
 void SetupPortal::ota_url_task(void* context) {
   [context]() {
   auto* portal = static_cast<SetupPortal*>(context);
@@ -4922,14 +5122,27 @@ void SetupPortal::ota_url_task(void* context) {
 
   ESP_LOGI(kTag, "OTA URL task: %s", url.c_str());
 
+  std::string resolved = url;
+  std::string resolve_error;
+  if (!follow_https_redirects(url, &resolved, &resolve_error)) {
+    ESP_LOGE(kTag, "OTA URL resolve failed: %s", resolve_error.c_str());
+    {
+      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error = resolve_error;
+    }
+    portal->ota_in_progress_ = false;
+    lease.keep_until_reboot();
+    return;
+  }
+  ESP_LOGI(kTag, "OTA URL resolved: %s", resolved.c_str());
+
   esp_http_client_config_t http_cfg = {};
-  http_cfg.url = url.c_str();
-  http_cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  http_cfg.timeout_ms = 30000;
-  http_cfg.keep_alive_enable = true;
+  apply_ota_http_defaults(&http_cfg, resolved.c_str());
 
   esp_https_ota_config_t ota_cfg = {};
   ota_cfg.http_config = &http_cfg;
+  ota_cfg.http_client_init_cb = &ota_http_init_cb;
 
   esp_https_ota_handle_t ota_handle = nullptr;
   esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota_handle);

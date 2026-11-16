@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "printsphere/error_lookup.hpp"
+#include "printsphere/github_update.hpp"
 #include "printsphere/status_resolver.hpp"
 #include "printsphere/time_sync.hpp"
 
@@ -384,6 +385,9 @@ void Application::run() {
     const auto wifi_state = wifi_manager_.snapshot();
     const bool wifi_connected = wifi_state.connected;
     const std::string wifi_ip = wifi_state.ip;
+    if (wifi_connected && time_sync::clock_ready()) {
+      github::Checker::instance().kick();
+    }
     const bool page_transition_active = ui_.is_page_transition_active();
     const bool preview_page_active = ui_.is_page2_active();
     const bool camera_page_active = ui_.is_camera_page_active();
