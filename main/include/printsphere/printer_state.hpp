@@ -41,6 +41,9 @@ enum class PrintCommand : uint8_t {
 
 const char* to_string(PrintCommand command);
 const char* mqtt_command_token(PrintCommand command);
+// OpenBambuAPI: led_on_time/led_off_time/loop_times/interval_time are required
+// even for on/off. H2/X1 ignore the short payload and keep the lights on.
+std::string build_ledctrl_payload(const char* node, bool on);
 
 enum class PrinterModel : uint8_t {
   kUnknown,

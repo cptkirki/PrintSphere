@@ -84,6 +84,7 @@ class SetupPortal {
   static esp_err_t handle_ota_upload(httpd_req_t* request);
   static esp_err_t handle_ota_url(httpd_req_t* request);
   static esp_err_t handle_ota_status(httpd_req_t* request);
+  static esp_err_t handle_update_check(httpd_req_t* request);
 #ifdef PRINTSPHERE_DEBUG_BUILD
   static esp_err_t handle_debug_log(httpd_req_t* request);
 #endif

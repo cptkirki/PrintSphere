@@ -1128,19 +1128,6 @@ bool is_light_mode_on(const std::string& mode) {
   return mode == "on";
 }
 
-std::string build_ledctrl_payload(const char* node, bool on) {
-  if (node == nullptr || *node == '\0') {
-    return {};
-  }
-
-  char payload[192];
-  std::snprintf(payload, sizeof(payload),
-                "{\"system\":{\"sequence_id\":\"%u\",\"command\":\"ledctrl\","
-                "\"led_node\":\"%s\",\"led_mode\":\"%s\"}}",
-                static_cast<unsigned int>(esp_random()), node, on ? "on" : "off");
-  return payload;
-}
-
 bool apply_chamber_light_report(const cJSON* object, bool* supported, bool* known, bool* on) {
   if (object == nullptr || supported == nullptr || known == nullptr || on == nullptr) {
     return false;
@@ -2468,7 +2455,7 @@ bool BambuCloudClient::publish_chamber_light_command(bool on) {
     }
 
     const int msg_id =
-        esp_mqtt_client_publish(mqtt_client_, mqtt_request_topic_.c_str(), payload.c_str(), 0, 0, 0);
+        esp_mqtt_client_publish(mqtt_client_, mqtt_request_topic_.c_str(), payload.c_str(), 0, 1, 0);
     if (msg_id < 0) {
       ESP_LOGW(kTag, "Failed to publish cloud chamber light command for %s", node);
       return false;
