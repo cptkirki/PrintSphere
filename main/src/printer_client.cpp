@@ -1,3 +1,4 @@
+#include "printsphere/utf8.hpp"
 #include "printsphere/printer_client.hpp"
 
 #include <algorithm>
@@ -12,6 +13,9 @@
 
 #include "cJSON.h"
 #include "printsphere/bambu_status.hpp"
+#include "printsphere/bambu_protocol.hpp"
+#include "printsphere/bambu_tls.hpp"
+#include "printsphere/time_sync.hpp"
 #include "printsphere/error_lookup.hpp"
 #include "printsphere/status_resolver.hpp"
 #include "esp_heap_caps.h"
@@ -143,15 +147,6 @@ constexpr uint32_t kDisconnectedStallMs = 20000;
 constexpr uint32_t kRebuildDelayMs = 1500;
 constexpr size_t kMaxMqttPayloadBytes = 64U * 1024U;
 
-extern const uint8_t bambu_root_cert_start[] asm("_binary_bambu_cert_start");
-extern const uint8_t bambu_root_cert_end[] asm("_binary_bambu_cert_end");
-extern const uint8_t bambu_p2s_cert_start[] asm("_binary_bambu_p2s_250626_cert_start");
-extern const uint8_t bambu_p2s_cert_end[] asm("_binary_bambu_p2s_250626_cert_end");
-extern const uint8_t bambu_h2c_cert_start[] asm("_binary_bambu_h2c_251122_cert_start");
-extern const uint8_t bambu_h2c_cert_end[] asm("_binary_bambu_h2c_251122_cert_end");
-extern const uint8_t bambu_x2c_cert_start[] asm("_binary_bambu_x2c_260425_cert_start");
-extern const uint8_t bambu_x2c_cert_end[] asm("_binary_bambu_x2c_260425_cert_end");
-
 uint64_t now_ms() {
   return static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
 }
@@ -161,7 +156,7 @@ void copy_text(std::array<char, N>* target, const std::string& value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value.c_str(), target->size());
+  utf8_copy_c_str(target->data(), target->size(), value);
 }
 
 template <size_t N>
@@ -169,7 +164,7 @@ void copy_text(std::array<char, N>* target, const char* value) {
   if (target == nullptr) {
     return;
   }
-  strlcpy(target->data(), value != nullptr ? value : "", target->size());
+  utf8_copy_c_str(target->data(), target->size(), value != nullptr ? value : "");
 }
 
 template <size_t N>
@@ -441,38 +436,6 @@ bool tick_elapsed(uint32_t start_tick, uint32_t now_tick, TickType_t duration) {
     return false;
   }
   return static_cast<int32_t>(now_tick - start_tick) >= static_cast<int32_t>(duration);
-}
-
-void append_embedded_cert(std::string* target, const uint8_t* begin, const uint8_t* end) {
-  if (target == nullptr || begin == nullptr || end == nullptr || end <= begin) {
-    return;
-  }
-
-  size_t length = static_cast<size_t>(end - begin);
-  if (length > 0U && begin[length - 1] == '\0') {
-    --length;
-  }
-  if (length == 0U) {
-    return;
-  }
-
-  target->append(reinterpret_cast<const char*>(begin), length);
-  if (target->empty() || target->back() != '\n') {
-    target->push_back('\n');
-  }
-}
-
-const std::string& local_bambu_ca_bundle() {
-  static const std::string bundle = []() {
-    std::string certs;
-    certs.reserve(14000);
-    append_embedded_cert(&certs, bambu_root_cert_start, bambu_root_cert_end);
-    append_embedded_cert(&certs, bambu_p2s_cert_start, bambu_p2s_cert_end);
-    append_embedded_cert(&certs, bambu_h2c_cert_start, bambu_h2c_cert_end);
-    append_embedded_cert(&certs, bambu_x2c_cert_start, bambu_x2c_cert_end);
-    return certs;
-  }();
-  return bundle;
 }
 
 void log_heap_status(const char* context) {
@@ -799,16 +762,11 @@ float packed_temp_current_value(int packed, float fallback) {
   return static_cast<float>(packed & 0xFFFF);
 }
 
-float normalize_temperature_candidate(float value) {
-  if (value > static_cast<float>(0xFFFF)) {
-    return packed_temp_current_value(static_cast<int>(value), value);
-  }
-  return value;
-}
-
 struct NozzleTemperatureBundle {
   float active = 0.0f;
   float secondary = 0.0f;
+  bool active_present = false;
+  bool secondary_present = false;
   int active_nozzle_index = -1;  // -1 = single nozzle, 0 = right, 1 = left (H2D)
 };
 
@@ -820,57 +778,7 @@ int extract_active_nozzle_index(const cJSON* device) {
   return (state >> 4) & 0xF;
 }
 
-void merge_nozzle_temp_candidates(const cJSON* info_array, int active_nozzle_index,
-                                  float* active_temp, float* secondary_temp) {
-  if (!cJSON_IsArray(info_array) || active_temp == nullptr || secondary_temp == nullptr) {
-    return;
-  }
 
-  const int count = cJSON_GetArraySize(info_array);
-  float first_temp = -1000.0f;
-  float fallback_secondary = -1000.0f;
-  bool matched_active = false;
-  bool matched_secondary = false;
-  for (int i = 0; i < count; ++i) {
-    const cJSON* item = cJSON_GetArrayItem(info_array, i);
-    if (!cJSON_IsObject(item)) {
-      continue;
-    }
-
-    const float temp = normalize_temperature_candidate(json_number_local(item, "temp", -1000.0f));
-    const int id = json_int_local(item, "id", -1);
-    ESP_LOGI(kTag, "[DBG] nozzle info[%d]: id=%d temp=%.1f (raw int=%d)",
-             i, id, temp, (int)temp);
-    if (temp <= -999.0f) {
-      continue;
-    }
-
-    if (first_temp < -999.0f) {
-      first_temp = temp;
-    }
-
-    if (active_nozzle_index >= 0 && id == active_nozzle_index) {
-      *active_temp = temp;
-      matched_active = true;
-    } else if (active_nozzle_index >= 0 && id >= 0) {
-      *secondary_temp = temp;
-      matched_secondary = true;
-    } else if (active_nozzle_index >= 0 && fallback_secondary < -999.0f) {
-      fallback_secondary = temp;
-    }
-  }
-
-  // Do not use the previous runtime temperature to decide whether this payload
-  // is allowed to update it. Some V2 payloads omit an id (or use an id other
-  // than zero for a single nozzle), so the first fresh sample is the active
-  // hotend when no explicit active-id match was found.
-  if (!matched_active && first_temp > -999.0f) {
-    *active_temp = first_temp;
-  }
-  if (!matched_secondary && fallback_secondary > -999.0f) {
-    *secondary_temp = fallback_secondary;
-  }
-}
 
 float extract_bed_temperature_c(const cJSON* print, float fallback) {
   const cJSON* device = child_object_local(print, "device");
@@ -912,23 +820,26 @@ float extract_chamber_temperature_c(const cJSON* print, float fallback) {
 }
 
 NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, float active_fallback,
-                                                          float secondary_fallback) {
+                                                          float secondary_fallback, int previous_nozzle) {
   NozzleTemperatureBundle bundle{active_fallback, secondary_fallback};
   const float direct = json_number_local(print, "nozzle_temper", -1000.0f);
   ESP_LOGD(kTag, "[DBG] nozzle_temper=%.1f (raw int=%d) fallback=%.1f",
            direct, (int)direct, active_fallback);
   if (direct > -999.0f) {
     bundle.active = direct;
+    bundle.active_present = true;
   }
 
   const cJSON* device = child_object_local(print, "device");
   const cJSON* extruder = child_object_local(device, "extruder");
-  const int active_nozzle_index = extract_active_nozzle_index(device);
+  const cJSON* extruder_state = cJSON_GetObjectItemCaseSensitive(child_object_local(device, "extruder"), "state");
+    const int active_nozzle_index = extruder_state ? extract_active_nozzle_index(device) : previous_nozzle;
   bundle.active_nozzle_index = active_nozzle_index;
-  merge_nozzle_temp_candidates(child_array_local(child_object_local(device, "nozzle"), "info"),
-                               active_nozzle_index, &bundle.active, &bundle.secondary);
-  merge_nozzle_temp_candidates(child_array_local(extruder, "info"), active_nozzle_index,
-                               &bundle.active, &bundle.secondary);
+  const int merge_index = active_nozzle_index;
+  merge_nozzle_temperature_patch(child_array_local(child_object_local(device, "nozzle"), "info"),
+                               merge_index, &bundle.active, &bundle.active_present, &bundle.secondary, &bundle.secondary_present);
+  merge_nozzle_temperature_patch(child_array_local(extruder, "info"), merge_index,
+                               &bundle.active, &bundle.active_present, &bundle.secondary, &bundle.secondary_present);
   ESP_LOGD(kTag, "[DBG] nozzle bundle final: active=%.1f secondary=%.1f active_nozzle_idx=%d",
            bundle.active, bundle.secondary, active_nozzle_index);
   return bundle;
@@ -940,31 +851,9 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
 // snow encoding: bits[0:7] = slot_id, bits[8:15] = ams_id.
 // ams_id == 255 means external spool (VIRTUAL_TRAY_MAIN_ID).
 // Returns the mapped tray_now value, or -1 if no snow field is present.
-int extract_extruder_snow_tray_now(const cJSON* print) {
-  const cJSON* device = child_object_local(print, "device");
-  if (device == nullptr) return -1;
-  const cJSON* extruder = child_object_local(device, "extruder");
-  if (extruder == nullptr) return -1;
-  const cJSON* info_array = cJSON_GetObjectItemCaseSensitive(extruder, "info");
-  if (!cJSON_IsArray(info_array)) return -1;
-
-  const cJSON* item = nullptr;
-  cJSON_ArrayForEach(item, info_array) {
-    const int id = json_int_local(item, "id", -1);
-    if (id != 0) continue;  // Primary extruder only.
-    const cJSON* snow_item = cJSON_GetObjectItemCaseSensitive(item, "snow");
-    if (snow_item == nullptr || !cJSON_IsNumber(snow_item)) return -1;
-
-    const int snow = snow_item->valueint;
-    const int ams_id = (snow >> 8) & 0xFF;
-    const int slot_id = snow & 0xFF;
-    ESP_LOGI(kTag, "[DIAG] extruder snow: raw=%d ams_id=%d slot_id=%d", snow, ams_id, slot_id);
-
-    if (ams_id == 255) return 254;        // External spool.
-    if (ams_id >= 128) return ams_id;     // AMS HT (single-tray).
-    return ams_id * 4 + slot_id;          // Standard AMS.
-  }
-  return -1;
+int extract_extruder_snow_tray_now(const cJSON* print, int active_nozzle) {
+  const cJSON* device = cJSON_GetObjectItemCaseSensitive(print, "device");
+  return protocol_snow_tray(print, active_nozzle >= 0 ? active_nozzle : extract_active_nozzle_index(device));
 }
 
 struct LocalProgressPercent {
@@ -984,7 +873,7 @@ bool read_progress_percent_candidate_local(const cJSON* print, const char* const
     if (candidate < 0.0f) {
       continue;
     }
-    *value = candidate <= 1.0f ? (candidate * 100.0f) : candidate;
+    *value = policy::progress_percent(keys[index], candidate);
     return true;
   }
   return false;
@@ -1250,7 +1139,10 @@ bool PrinterClient::is_configured() const {
   return desired_connection().is_ready();
 }
 
-bool PrinterClient::set_chamber_light(bool on) {
+bool PrinterClient::set_chamber_light(bool on, const std::string& expected_serial) {
+  if (reconfigure_requested_.load() || (!expected_serial.empty() &&
+      !policy::same_printer(expected_serial, snapshot().resolved_serial))) return false;
+
   if (!mqtt_connected_.load()) {
     return false;
   }
@@ -1259,27 +1151,22 @@ bool PrinterClient::set_chamber_light(bool on) {
   chamber_light_command_pending_ = true;
   wake_task();
 
-  LocalPrinterRuntimeState runtime = runtime_state_copy();
-  // No pushall here — the printer sends a status update automatically when the light changes.
-  // The network task publishes the MQTT command so UI/App code never races the client handle.
-
-  runtime.chamber_light_supported = true;
-  runtime.chamber_light_state_known = true;
-  runtime.chamber_light_on = on;
-  update_local_runtime_metadata(&runtime, true, mqtt_connected_.load());
-  store_runtime_state(std::move(runtime), false);
-  publish_runtime_snapshot();
   ESP_LOGI(kTag, "Local chamber light command queued: %s", on ? "on" : "off");
   return true;
 }
 
-bool PrinterClient::set_print_command(PrintCommand command) {
+bool PrinterClient::set_print_command(PrintCommand command, const std::string& expected_serial) {
+  if (reconfigure_requested_.load() || (!expected_serial.empty() &&
+      !policy::same_printer(expected_serial, snapshot().resolved_serial))) return false;
+
+  if (runtime_state_copy().local_mqtt_signature_required) return false;
   if (command == PrintCommand::kNone) {
     return false;
   }
   if (!mqtt_connected_.load()) {
     return false;
   }
+  if (!command_tracker_.queue(now_ms())) return false;
   print_command_pending_.store(static_cast<uint8_t>(command));
   wake_task();
   ESP_LOGI(kTag, "Local print command queued: %s", to_string(command));
@@ -1315,9 +1202,19 @@ void PrinterClient::task_entry(void* context) {
   static_cast<PrinterClient*>(context)->task_loop();
 }
 
+PrinterSnapshot PrinterClient::snapshot() const {
+  auto state = state_.snapshot();
+  const auto command = command_tracker_.snapshot(now_ms());
+  state.command_pending = command.busy;
+  state.command_detail = command.detail;
+  return state;
+}
+
 PrinterClient::LocalPrinterRuntimeState PrinterClient::runtime_state_copy() const {
   std::lock_guard<std::mutex> lock(runtime_mutex_);
-  return runtime_state_;
+  LocalPrinterRuntimeState copy = runtime_state_;
+  copy.ams = detached_ams(copy.ams);
+  return copy;
 }
 
 void PrinterClient::store_runtime_state(LocalPrinterRuntimeState runtime, bool notify_task) {
@@ -1353,13 +1250,17 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.progress_percent = runtime.progress_percent;
   snapshot.progress_is_download_related = runtime.progress_is_download_related;
   snapshot.nozzle_temp_c = runtime.nozzle_temp_c;
-  snapshot.nozzle_temp_known = runtime.nozzle_temp_c > 0.0f;
+  snapshot.nozzle_temp_known = runtime.nozzle_temp_updated_ms != 0 &&
+      now_ms() - runtime.nozzle_temp_updated_ms <= 300000;
   snapshot.bed_temp_c = runtime.bed_temp_c;
-  snapshot.bed_temp_known = runtime.bed_temp_c > 0.0f;
+  snapshot.bed_temp_known = runtime.bed_temp_updated_ms != 0 &&
+      now_ms() - runtime.bed_temp_updated_ms <= 300000;
   snapshot.chamber_temp_c = runtime.chamber_temp_c;
-  snapshot.chamber_temp_known = runtime.chamber_temp_c > 0.0f;
+  snapshot.chamber_temp_known = runtime.chamber_temp_updated_ms != 0 &&
+      now_ms() - runtime.chamber_temp_updated_ms <= 300000;
   snapshot.secondary_nozzle_temp_c = runtime.secondary_nozzle_temp_c;
-  snapshot.secondary_nozzle_temp_known = runtime.secondary_nozzle_temp_c > 0.0f;
+  snapshot.secondary_nozzle_temp_known = runtime.secondary_nozzle_temp_updated_ms != 0 &&
+      now_ms() - runtime.secondary_nozzle_temp_updated_ms <= 300000;
   snapshot.active_nozzle_index = runtime.active_nozzle_index;
   snapshot.chamber_light_supported = runtime.chamber_light_supported;
   snapshot.chamber_light_state_known = runtime.chamber_light_state_known;
@@ -1372,7 +1273,7 @@ PrinterSnapshot PrinterClient::build_snapshot_from_runtime(
   snapshot.hms_alert_count = runtime.hms_alert_count;
   snapshot.local_configured = runtime.local_configured;
   snapshot.local_connected = runtime.local_connected;
-  snapshot.local_last_update_ms = runtime.local_last_update_ms;
+  snapshot.local_last_update_ms = runtime.core_status_updated_ms;
   snapshot.local_model = runtime.local_model;
   snapshot.local_capabilities = runtime.local_capabilities;
   snapshot.local_mqtt_signature_required = runtime.local_mqtt_signature_required;
@@ -1722,6 +1623,15 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 
   const cJSON* print = cJSON_GetObjectItemCaseSensitive(root, "print");
   if (cJSON_IsObject(print)) {
+    const std::string command_result = json_string(print, "result", {});
+    if (!command_result.empty()) {
+      const std::string sequence_text = json_string(print, "sequence_id", {});
+      const uint32_t sequence = sequence_text.empty() ?
+          static_cast<uint32_t>(json_int(print, "sequence_id", 0)) :
+          static_cast<uint32_t>(std::strtoul(sequence_text.c_str(), nullptr, 10));
+      command_tracker_.result(sequence, command_result == "success" || command_result == "ok");
+    }
+
     LocalPrinterRuntimeState runtime = runtime_state_copy();
     std::string active_serial;
     {
@@ -1753,6 +1663,12 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     const std::string stage_name =
         cJSON_IsObject(stage) ? json_string(stage, "name", json_string(stage, "stage", {})) : "";
     const cJSON* ams_obj = cJSON_GetObjectItemCaseSensitive(print, "ams");
+    if (is_full_report(root, print) && cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(ams_obj, "ams"))) {
+      const auto external = runtime.ams ? runtime.ams->external_spool : AmsTrayInfo{};
+      runtime.ams = std::make_shared<AmsSnapshot>();
+      runtime.ams->external_spool = external;
+    }
+
     const bool has_hw_switch_state_update =
         cJSON_GetObjectItemCaseSensitive(print, "hw_switch_state") != nullptr;
     const int new_hw_switch_state = json_int(print, "hw_switch_state", previous_hw_switch_state);
@@ -1850,12 +1766,26 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     }
     const NozzleTemperatureBundle nozzle_temps =
         extract_nozzle_temperature_bundle(print, runtime.nozzle_temp_c,
-                                          runtime.secondary_nozzle_temp_c);
+                                          runtime.secondary_nozzle_temp_c, runtime.active_nozzle_index);
     runtime.nozzle_temp_c = nozzle_temps.active;
     runtime.secondary_nozzle_temp_c = nozzle_temps.secondary;
     if (nozzle_temps.active_nozzle_index >= 0) {
+      if (runtime.active_nozzle_index >= 0 && runtime.active_nozzle_index != nozzle_temps.active_nozzle_index) {
+        runtime.nozzle_temp_updated_ms = 0;
+        runtime.secondary_nozzle_temp_updated_ms = 0;
+      }
       runtime.active_nozzle_index = nozzle_temps.active_nozzle_index;
     }
+    const cJSON* device = cJSON_GetObjectItemCaseSensitive(print, "device");
+    const uint64_t sample_ms = now_ms();
+    if (has_core_status(print)) runtime.core_status_updated_ms = sample_ms;
+    if (nozzle_temps.active_present) runtime.nozzle_temp_updated_ms = sample_ms;
+    if (nozzle_temps.secondary_present) runtime.secondary_nozzle_temp_updated_ms = sample_ms;
+    if (cJSON_GetObjectItemCaseSensitive(print, "bed_temper") ||
+        has_temperature_patch(cJSON_GetObjectItemCaseSensitive(device, "bed"))) runtime.bed_temp_updated_ms = sample_ms;
+    if (cJSON_GetObjectItemCaseSensitive(print, "chamber_temper") ||
+        has_temperature_patch(cJSON_GetObjectItemCaseSensitive(device, "chamber")) ||
+        has_temperature_patch(cJSON_GetObjectItemCaseSensitive(device, "ctc"))) runtime.chamber_temp_updated_ms = sample_ms;
     runtime.bed_temp_c = extract_bed_temperature_c(print, runtime.bed_temp_c);
     runtime.chamber_temp_c = extract_chamber_temperature_c(print, runtime.chamber_temp_c);
     runtime.current_layer = extract_current_layer_local(print, runtime.current_layer);
@@ -1888,7 +1818,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       // V2 protocol override: P2S/H2 series send device.extruder.info[].snow which is
       // the authoritative source for the active tray on newer printers.  Map it back to
       // legacy tray_now encoding so all downstream ext-spool / AMS-tray logic works.
-      const int snow_tray = extract_extruder_snow_tray_now(print);
+      const int snow_tray = extract_extruder_snow_tray_now(print, runtime.active_nozzle_index);
       if (snow_tray >= 0 && snow_tray != effective_tray_now) {
         ESP_LOGI(kTag, "tray_now override from snow: ams.tray_now=%d -> snow=%d",
                  effective_tray_now, snow_tray);
@@ -1909,9 +1839,11 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
         uint8_t unit_count = 0;
         const cJSON* ams_unit = nullptr;
         cJSON_ArrayForEach(ams_unit, ams_array) {
-          const int unit_id = json_int(ams_unit, "id", -1);
+          const int protocol_id = json_int(ams_unit, "id", -1);
+          const int unit_id = policy::ams_index(protocol_id);
           if (unit_id < 0 || unit_id >= kMaxAmsUnits) continue;
           AmsUnitInfo& unit = runtime.ams->units[unit_id];
+          unit.protocol_id = policy::ams_protocol_id(unit_id);
           unit.present = true;
           if (unit_id >= unit_count) unit_count = unit_id + 1;
 
@@ -1937,13 +1869,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
               const int tray_id = json_int(tray_obj, "id", -1);
               if (tray_id < 0 || tray_id >= kMaxAmsTrays) continue;
               AmsTrayInfo& tray = unit.trays[tray_id];
-
-              // Detect empty tray: payload with only "id" (and optionally "state").
-              const int field_count = cJSON_GetArraySize(tray_obj);
-              const bool has_only_metadata =
-                  field_count <= 2 &&
-                  cJSON_GetObjectItemCaseSensitive(tray_obj, "id") != nullptr &&
-                  cJSON_GetObjectItemCaseSensitive(tray_obj, "tray_type") == nullptr;
+              const bool has_only_metadata = tray_is_explicitly_empty(tray_obj);
               if (has_only_metadata) {
                 tray.present = false;
                 tray.material_type.clear();
@@ -1954,7 +1880,8 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
                 continue;
               }
 
-              tray.present = true;
+              if (cJSON_GetObjectItemCaseSensitive(tray_obj, "tray_type") ||
+                  cJSON_GetObjectItemCaseSensitive(tray_obj, "tray_color")) tray.present = true;
               const std::string tray_type = json_string(tray_obj, "tray_type", tray.material_type);
               if (!tray_type.empty()) tray.material_type = tray_type;
               const std::string sub_brands = json_string(tray_obj, "tray_sub_brands", tray.material_name);
@@ -1978,7 +1905,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
               if (remain >= 0 && remain <= 100) tray.remain_pct = remain;
 
               // Mark active based on global tray_now (which may include snow override).
-              const int global_tray_idx = unit_id * kMaxAmsTrays + tray_id;
+              const int global_tray_idx = policy::tray_id(unit.protocol_id, tray_id);
               tray.active = (runtime.tray_now == global_tray_idx);
             }
           }
@@ -2022,6 +1949,19 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
         }
       }
 
+    }
+
+    if (runtime.ams) apply_ams_presence(ams_obj, *runtime.ams);
+    // V2 patches need not include the legacy "ams" object.
+    const int v2_tray = extract_extruder_snow_tray_now(print, runtime.active_nozzle_index);
+    if (v2_tray >= 0) runtime.tray_now = v2_tray;
+    if (runtime.ams) {
+      for (auto& unit : runtime.ams->units) {
+        for (int slot = 0; slot < kMaxAmsTrays; ++slot) {
+          unit.trays[slot].active = unit.present && unit.trays[slot].present &&
+              runtime.tray_now == policy::tray_id(unit.protocol_id, slot);
+        }
+      }
     }
 
     // Parse vt_tray (external / virtual tray) for external spool info.
@@ -2325,7 +2265,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
     }
     update_local_runtime_metadata(&runtime, true, true);
 
-    received_payload_ = true;
+    if (has_core_status(print)) received_payload_ = true;
     // [DIAG] Log resolved state after all synthesis — on every change.
     {
       const std::string new_raw_status = text_string(runtime.raw_status);
@@ -2386,6 +2326,8 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 }
 
 void PrinterClient::stop_client() {
+  command_tracker_.reset();
+  print_command_pending_ = static_cast<uint8_t>(PrintCommand::kNone);
   mqtt_connected_ = false;
   session_ever_established_ = false;
   received_payload_ = false;
@@ -2477,13 +2419,16 @@ bool PrinterClient::publish_print_command(PrintCommand command) {
   // OpenBambuAPI: print.pause / print.resume / print.stop are published with
   // QoS 1 for higher priority (printer state-machine relies on delivery
   // guarantee). All three carry an empty `param` field per the same spec.
+  const uint32_t sequence = esp_random() | 1U;
+  command_tracker_.sent(sequence, now_ms());
   char payload[160];
   std::snprintf(payload, sizeof(payload),
                 "{\"print\":{\"sequence_id\":\"%u\",\"command\":\"%s\",\"param\":\"\"}}",
-                static_cast<unsigned int>(esp_random()), token);
+                static_cast<unsigned int>(sequence), token);
   const int msg_id =
       esp_mqtt_client_publish(client_, request_topic_.c_str(), payload, 0, 1, 0);
   if (msg_id < 0) {
+    command_tracker_.failed();
     ESP_LOGW(kTag, "Failed to publish local print.%s", token);
     return false;
   }
@@ -2491,6 +2436,10 @@ bool PrinterClient::publish_print_command(PrintCommand command) {
 }
 
 void PrinterClient::process_pending_print_command() {
+  if (!command_tracker_.snapshot(now_ms()).busy) {
+    print_command_pending_ = static_cast<uint8_t>(PrintCommand::kNone);
+    return;
+  }
   const uint8_t pending = print_command_pending_.load();
   if (pending == static_cast<uint8_t>(PrintCommand::kNone) || !mqtt_connected_.load() ||
       client_ == nullptr) {
@@ -2693,6 +2642,14 @@ void PrinterClient::task_loop() {
       continue;
     }
 
+    if (client_ == nullptr && !time_sync::clock_ready()) {
+      auto waiting = runtime_state_copy();
+      copy_text(&waiting.detail, "Waiting for network time (NTP)");
+      store_runtime_state(std::move(waiting), false);
+      publish_runtime_snapshot();
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+      continue;
+    }
     if (client_ == nullptr) {
       {
         std::lock_guard<std::mutex> lock(config_mutex_);
@@ -2730,19 +2687,10 @@ void PrinterClient::task_loop() {
 
       esp_mqtt_client_config_t mqtt_cfg = {};
       mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
-      const std::string& local_ca_bundle = local_bambu_ca_bundle();
-      if (!local_ca_bundle.empty()) {
-        mqtt_cfg.broker.verification.certificate = local_ca_bundle.c_str();
-        mqtt_cfg.broker.verification.certificate_len = local_ca_bundle.size() + 1U;
-        mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
-        ESP_LOGI(kTag,
-                 "Using embedded local Bambu CA bundle for MQTT TLS verification "
-                 "(hostname check disabled)");
-      } else {
-        mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
-        ESP_LOGW(kTag,
-                 "Embedded local Bambu CA bundle is empty; falling back to insecure local MQTT TLS");
-      }
+      const std::string& local_ca_bundle = bambu_ca_bundle();
+      mqtt_cfg.broker.verification.certificate = local_ca_bundle.c_str();
+      mqtt_cfg.broker.verification.certificate_len = local_ca_bundle.size() + 1U;
+      mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
       mqtt_cfg.credentials.client_id = client_id_.c_str();
       // Shorter keepalive helps detect stalled LAN sessions faster. Bambu
       // tooling commonly uses a very short keepalive; 20s is a pragmatic
@@ -2898,7 +2846,8 @@ void PrinterClient::task_loop() {
         const bool job_live = runtime.lifecycle == PrintLifecycleState::kPreparing ||
                               runtime.lifecycle == PrintLifecycleState::kPrinting ||
                               runtime.lifecycle == PrintLifecycleState::kPaused;
-        if (job_live) {
+        if (job_live || runtime.core_status_updated_ms == 0 ||
+            now_ms() - runtime.core_status_updated_ms > 90000) {
           ESP_LOGD(kTag, "Periodic pushall (job live) to re-sync latched fields");
           publish_request(kPushAll);
         }

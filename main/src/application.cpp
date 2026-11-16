@@ -1,4 +1,5 @@
 #include "printsphere/application.hpp"
+#include "esp_ota_ops.h"
 
 #include <cstring>
 #include <vector>
@@ -34,10 +35,6 @@ constexpr TickType_t kLocalMqttHandoffCooldown = pdMS_TO_TICKS(30000);
 constexpr TickType_t kScreenOffTouchWakePollSlice = pdMS_TO_TICKS(25);
 constexpr TickType_t kUiCommandWakePollSlice = pdMS_TO_TICKS(50);
 constexpr uint64_t kChamberLightOverrideMs = 6000;
-// Pause/resume/stop optimistic-state window. Most printers reflect the new
-// lifecycle in their next status report (sub-second). 5 s is a safety net so
-// the button doesn't lock forever if the command is silently dropped.
-constexpr uint64_t kPrintCommandOverrideMs = 5000;
 
 esp_err_t configure_power_management() {
 #if CONFIG_PM_ENABLE
@@ -191,27 +188,12 @@ PrintCommandPlan print_command_plan(SourceMode source_mode, bool hybrid_prefers_
   return plan;
 }
 
-// Resolve the printer lifecycle state implied by a freshly issued print
-// command. Pause -> Paused, Resume -> Printing, Stop -> Idle. Used to drive
-// the optimistic UI override until the next status report arrives.
-PrintLifecycleState lifecycle_after_print_command(PrintCommand cmd) {
-  switch (cmd) {
-    case PrintCommand::kPause:
-      return PrintLifecycleState::kPaused;
-    case PrintCommand::kResume:
-      return PrintLifecycleState::kPrinting;
-    case PrintCommand::kStop:
-      return PrintLifecycleState::kIdle;
-    case PrintCommand::kNone:
-    default:
-      return PrintLifecycleState::kUnknown;
-  }
-}
-
 void wait_for_next_iteration(Ui& ui, TickType_t delay) {
   TickType_t remaining = delay;
   while (remaining > 0) {
-    if (ui.has_chamber_light_toggle_request() || ui.has_print_command_request()) {
+    if (ui.has_chamber_light_toggle_request() || ui.has_print_command_request() ||
+        ui.has_wake_display_request() || ui.has_snapshot_refresh_request() ||
+        ui.has_printer_switch_request()) {
       break;
     }
     const bool touch_wake_poll_active = ui.screen_power_mode() == ScreenPowerMode::kOff;
@@ -224,7 +206,9 @@ void wait_for_next_iteration(Ui& ui, TickType_t delay) {
     vTaskDelay(slice);
     remaining -= slice;
 
-    if (ui.has_chamber_light_toggle_request() || ui.has_print_command_request()) {
+    if (ui.has_chamber_light_toggle_request() || ui.has_print_command_request() ||
+        ui.has_wake_display_request() || ui.has_snapshot_refresh_request() ||
+        ui.has_printer_switch_request()) {
       break;
     }
     if (touch_wake_poll_active && gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
@@ -345,7 +329,18 @@ void Application::run() {
 
   ESP_LOGI(kTag, "Bootstrap complete");
 
+  const int64_t healthy_boot_started = esp_timer_get_time();
+  bool boot_confirmed = false;
+  uint64_t last_cards_refresh_ms = 0;
   while (true) {
+    if (!boot_confirmed && esp_timer_get_time() - healthy_boot_started >= 10000000) {
+      esp_ota_img_states_t state;
+      if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+          state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_ERROR_CHECK(esp_ota_mark_app_valid_cancel_rollback());
+      }
+      boot_confirmed = true;
+    }
     const TickType_t now_tick = xTaskGetTickCount();
     const uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
     if (ui_.consume_portal_unlock_request()) {
@@ -361,33 +356,34 @@ void Application::run() {
       cloud_client_.configure(config_store_.load_cloud_credentials(), new_conn.serial);
       ESP_LOGI(kTag, "Switched active printer to profile %d", switch_idx);
     }
-    const bool config_page_active = ui_.is_config_page_active();
-    if (config_page_active) {
-      const bool local_connected = printer_client_.snapshot().local_connected;
-      if (!last_config_page_active_ || local_connected != last_config_local_connected_ ||
-          switch_idx >= 0) {
-        const auto profiles = config_store_.load_printer_profiles();
-        const uint8_t active_idx = config_store_.load_active_printer_index();
-        std::vector<Ui::PrinterCardInfo> cards;
-        cards.reserve(profiles.size());
-        for (const auto& p : profiles) {
-          Ui::PrinterCardInfo ci;
-          ci.index = p.index;
-          ci.name = p.display_name;
-          ci.model = p.model;
-          ci.host = p.host;
-          ci.active = (p.index == active_idx);
-          ci.connected = ci.active && local_connected;
-          cards.push_back(std::move(ci));
-        }
-        ui_.update_printer_cards(cards);
+    if (last_cards_refresh_ms == 0 || ui_.is_config_page_active() ||
+        now_ms - last_cards_refresh_ms >= 2000) {
+      last_cards_refresh_ms = now_ms;
+      const auto profiles = config_store_.load_printer_profiles();
+      const uint8_t active_idx = config_store_.load_active_printer_index();
+      const auto local_state = printer_client_.snapshot();
+      const auto cloud_state = cloud_client_.snapshot();
+      std::vector<Ui::PrinterCardInfo> cards;
+      cards.reserve(profiles.size());
+      for (const auto& p : profiles) {
+        Ui::PrinterCardInfo ci;
+        ci.index = p.index;
+        ci.serial = p.serial;
+        ci.name = p.display_name.empty() ? p.serial : p.display_name;
+        ci.model = p.model;
+        ci.host = p.host;
+        ci.active = (p.index == active_idx);
+        ci.connected = ci.active &&
+            ((local_state.local_connected && local_state.resolved_serial == p.serial) ||
+             (cloud_state.connected && cloud_state.resolved_serial == p.serial));
+        cards.push_back(std::move(ci));
       }
-      last_config_local_connected_ = local_connected;
+      ui_.update_printer_cards(cards);
     }
-    last_config_page_active_ = config_page_active;
     const PortalAccessSnapshot portal_access = setup_portal_.access_snapshot();
-    const bool wifi_connected = wifi_manager_.is_station_connected();
-    const std::string wifi_ip = wifi_manager_.station_ip();
+    const auto wifi_state = wifi_manager_.snapshot();
+    const bool wifi_connected = wifi_state.connected;
+    const std::string wifi_ip = wifi_state.ip;
     const bool page_transition_active = ui_.is_page_transition_active();
     const bool preview_page_active = ui_.is_page2_active();
     const bool camera_page_active = ui_.is_camera_page_active();
@@ -547,7 +543,8 @@ void Application::run() {
                                      const BambuCloudSnapshot& current_cloud_snapshot) {
       PrinterSnapshot merged =
           merge_status_sources(current_local_snapshot, local_printer_enabled_, current_cloud_snapshot,
-                               source_mode_, now_ms, wifi_connected, wifi_ip);
+                               source_mode_, now_ms, wifi_connected, wifi_ip,
+                               config_store_.load_active_printer_profile().serial);
       merged.setup_ap_active = current_local_snapshot.setup_ap_active;
       merged.setup_ap_ssid = current_local_snapshot.setup_ap_ssid;
       merged.setup_ap_password = current_local_snapshot.setup_ap_password;
@@ -576,26 +573,8 @@ void Application::run() {
       target_snapshot->chamber_light_state_known = true;
       target_snapshot->chamber_light_on = chamber_light_override_on_;
     };
-    auto apply_print_command_override = [&](PrinterSnapshot* target_snapshot) {
-      if (target_snapshot == nullptr ||
-          print_command_override_kind_ == PrintCommand::kNone) {
-        return;
-      }
-      const PrintLifecycleState desired =
-          lifecycle_after_print_command(print_command_override_kind_);
-      // Clear early once the printer's actual lifecycle confirms the command.
-      if (target_snapshot->lifecycle == desired || now_ms >= print_command_override_until_ms_) {
-        print_command_override_kind_ = PrintCommand::kNone;
-        print_command_override_until_ms_ = 0;
-        target_snapshot->print_command_pending_kind = PrintCommand::kNone;
-        return;
-      }
-      target_snapshot->lifecycle = desired;
-      target_snapshot->print_command_pending_kind = print_command_override_kind_;
-    };
     PrinterSnapshot snapshot = build_merged_snapshot(local_snapshot, cloud_snapshot);
     apply_chamber_light_override(&snapshot);
-    apply_print_command_override(&snapshot);
 
     if (ui_.consume_chamber_light_toggle_request()) {
       const bool requested_on =
@@ -608,13 +587,13 @@ void Application::run() {
                                      local_snapshot, cloud_snapshot);
 
       if (light_plan.try_local) {
-        command_sent = printer_client_.set_chamber_light(requested_on);
+        command_sent = printer_client_.set_chamber_light(requested_on, config_store_.load_active_printer_profile().serial);
         if (command_sent) {
           mark_chamber_light_state(local_snapshot, requested_on);
         }
       }
       if (!command_sent && light_plan.try_cloud) {
-        command_sent = cloud_client_.set_chamber_light(requested_on);
+        command_sent = cloud_client_.set_chamber_light(requested_on, config_store_.load_active_printer_profile().serial);
         if (command_sent) {
           mark_chamber_light_state(cloud_snapshot, requested_on);
         }
@@ -639,10 +618,10 @@ void Application::run() {
           local_network_ready, local_printer_enabled_, cloud_network_ready, local_snapshot,
           cloud_snapshot);
       if (plan.try_local) {
-        command_sent = printer_client_.set_print_command(requested_print_cmd);
+        command_sent = printer_client_.set_print_command(requested_print_cmd, config_store_.load_active_printer_profile().serial);
       }
       if (!command_sent && plan.try_cloud) {
-        command_sent = cloud_client_.set_print_command(requested_print_cmd);
+        command_sent = cloud_client_.set_print_command(requested_print_cmd, config_store_.load_active_printer_profile().serial);
       }
 
       if (!command_sent) {
@@ -651,11 +630,8 @@ void Application::run() {
       } else {
         ESP_LOGI(kTag, "Print command %s issued (%s)", to_string(requested_print_cmd),
                  to_string(source_mode_));
-        print_command_override_kind_ = requested_print_cmd;
-        print_command_override_until_ms_ = now_ms + kPrintCommandOverrideMs;
+        // Only a matching printer report may change the displayed lifecycle.
         snapshot = build_merged_snapshot(local_snapshot, cloud_snapshot);
-        apply_chamber_light_override(&snapshot);
-        apply_print_command_override(&snapshot);
       }
     }
 
@@ -708,8 +684,8 @@ void Application::run() {
     }
 
     resolve_ui_state(snapshot);
-    // Store portal state first (lock-free), then apply_snapshot uses it
-    // inside the same LVGL lock section — eliminates a separate lock acquisition.
+    // Publish immutable inputs. The LVGL task consumes their latest values
+    // between gestures; this task never mutates the widget tree.
     ui_.set_portal_access_state(portal_access.lock_enabled,
                                 portal_access.request_authorized, portal_access.session_active,
                                 portal_access.pin_active, portal_access.pin_code,

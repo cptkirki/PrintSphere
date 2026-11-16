@@ -1,4 +1,5 @@
 #pragma once
+#include "printsphere/command_tracker.hpp"
 
 #include <array>
 #include <atomic>
@@ -39,19 +40,12 @@ class PrinterClient {
   // Called immediately before the local MQTT client allocates/starts its TLS stack.
   // Return a short delay in ms when other network clients need time to unwind.
   void set_pre_local_mqtt_callback(std::function<uint32_t()> cb);
-  bool set_chamber_light(bool on);
-  // Pause / resume / stop the running print job. Returns true if the command
-  // was queued for the worker task to publish; false if MQTT is not currently
-  // connected. The publish itself happens on the next worker iteration so this
-  // call never blocks. The caller is expected to apply an optimistic snapshot
-  // override (see Application) which expires after a few seconds if the printer
-  // does not actually transition lifecycle. Pauses / resumes / stops a print
-  // via MQTT topic device/<DEVICE_ID>/request — works in LAN-only mode when
-  // the printer's LAN access code is in use (LAN-only printers behave the same
-  // way as cloud-connected ones for print-control commands).
-  bool set_print_command(PrintCommand command);
+  bool set_chamber_light(bool on, const std::string& expected_serial = {});
+  // Queue one print control action. The matching printer acknowledgement is
+  // tracked independently from MQTT delivery and never fabricates lifecycle.
+  bool set_print_command(PrintCommand command, const std::string& expected_serial = {});
   esp_err_t start();
-  PrinterSnapshot snapshot() const { return state_.snapshot(); }
+  PrinterSnapshot snapshot() const;
   // Reconnect-storm telemetry snapshot (safe from any task).
   MqttTelemetry mqtt_telemetry() const;
   struct LocalPrinterRuntimeState {
@@ -62,6 +56,11 @@ class PrinterClient {
     float progress_percent = 0.0f;
     bool progress_is_download_related = false;
     float nozzle_temp_c = 0.0f;
+    uint64_t nozzle_temp_updated_ms = 0;
+    uint64_t bed_temp_updated_ms = 0;
+    uint64_t chamber_temp_updated_ms = 0;
+    uint64_t secondary_nozzle_temp_updated_ms = 0;
+    uint64_t core_status_updated_ms = 0;
     float bed_temp_c = 0.0f;
     float chamber_temp_c = 0.0f;
     float secondary_nozzle_temp_c = 0.0f;
@@ -101,6 +100,7 @@ class PrinterClient {
   };
 
  private:
+  CommandTracker command_tracker_{};
   static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id,
                                  void* event_data);
   static void task_entry(void* context);

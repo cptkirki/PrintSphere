@@ -17,7 +17,6 @@ set(PRINTSPHERE_MAIN_REQUIRES
     esp_wifi
     libpng
     lvgl
-    mbedtls
     nvs_flash
     joltwallet__littlefs
 )
@@ -48,6 +47,7 @@ idf_component_register(
         "include/font/dosis_20.c"
         "include/font/dosis_32.c"
         "include/font/dosis_40.c"
+      "include/font/montserrat_12.c" "include/font/montserrat_14.c" "include/font/montserrat_20.c"
         "include/img/bambuicon.c"
         "include/font/mdi_30.c"
         "include/font/mdi_40.c"

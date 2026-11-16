@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -136,8 +135,12 @@ class ConfigStore {
 
   esp_err_t save_wifi_credentials(const WifiCredentials& credentials) const;
   esp_err_t save_cloud_credentials(const BambuCloudCredentials& credentials) const;
-  esp_err_t save_cloud_access_token(const std::string& token) const;
-  esp_err_t clear_cloud_access_token() const;
+  esp_err_t save_cloud_access_token(const std::string& token, int64_t expires_at = 0,
+                                   const BambuCloudCredentials* owner = nullptr) const;
+  int64_t load_cloud_token_expiry() const;
+  bool load_portal_provisioned() const;
+  esp_err_t mark_portal_provisioned() const;
+  esp_err_t clear_cloud_access_token(const BambuCloudCredentials* owner = nullptr) const;
   esp_err_t save_source_mode(SourceMode mode) const;
   esp_err_t save_display_rotation(DisplayRotation rotation) const;
   esp_err_t save_portal_lock_enabled(bool enabled) const;
@@ -148,6 +151,8 @@ class ConfigStore {
   esp_err_t save_timezone_iana(const std::string& iana_name) const;
   std::vector<PrinterProfile> load_printer_profiles() const;
   esp_err_t save_printer_profile(const PrinterProfile& profile) const;
+  esp_err_t sync_cloud_printer_profiles(const std::vector<PrinterProfile>& discovered,
+                                        const BambuCloudCredentials& owner) const;
   esp_err_t delete_printer_profile(uint8_t index) const;
   uint8_t load_active_printer_index() const;
   esp_err_t save_active_printer_index(uint8_t index) const;
@@ -172,17 +177,14 @@ class ConfigStore {
   esp_err_t save_audio_event_filename(uint8_t event_index, const std::string& name) const;
 
  private:
+  mutable std::recursive_mutex configuration_mutex_{};
+  mutable int cached_source_mode_=-1;
   esp_err_t save_string(const char* key, const std::string& value) const;
   std::string load_string(const char* key) const;
   void migrate_legacy_printer_profile();
+  esp_err_t save_profiles_record(const std::vector<PrinterProfile>& profiles, uint8_t active) const;
 
-  // Serializes printer-profile read-modify-write operations so concurrent
-  // callers (HTTP handlers on httpd task + main loop) cannot race and clobber
-  // `prn_count` / profile slot assignments (see /api/printers/save upsert).
-  mutable std::mutex printer_profile_mutex_{};
-  // -1 until first load; subsequent main-loop reads are served without opening
-  // NVS, while portal saves update the cached value immediately.
-  mutable std::atomic<int> cached_source_mode_{-1};
+
 };
 
 }  // namespace printsphere

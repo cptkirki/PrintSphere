@@ -20,6 +20,25 @@
 #include "png.h"
 #include "printsphere/board_config.hpp"
 
+namespace {
+std::atomic<unsigned> display_output_phase{0};
+std::atomic<int64_t> display_output_since{0};
+}
+extern "C" void printsphere_display_trace(unsigned phase) {
+  display_output_since.store(esp_timer_get_time(), std::memory_order_relaxed);
+  display_output_phase.store(phase, std::memory_order_relaxed);
+}
+
+const char* printsphere::Ui::display_output_phase() const {
+  constexpr const char* names[] = {"idle", "prepare", "te_wait", "panel_submit",
+                                  "tx_completion", "dma_drain", "dma_submit"};
+  const auto phase = ::display_output_phase.load(std::memory_order_relaxed);
+  return phase < sizeof(names)/sizeof(names[0]) ? names[phase] : "unknown";
+}
+int64_t printsphere::Ui::display_output_since_us() const {
+  return display_output_since.load(std::memory_order_relaxed);
+}
+
 #if defined(PRINTSPHERE_HW_VARIANT_AMOLED_1_75)
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #elif defined(PRINTSPHERE_HW_VARIANT_LCD_2_8C)
@@ -33,7 +52,9 @@ extern const lv_image_dsc_t bambuicon_small;
 extern const lv_font_t dosis_20;
 extern const lv_font_t dosis_32;
 extern const lv_font_t dosis_40;
-extern const lv_font_t lv_font_montserrat_20;
+extern const lv_font_t montserrat_12;
+extern const lv_font_t montserrat_14;
+extern const lv_font_t montserrat_20;
 extern const lv_font_t mdi_30;
 extern const lv_font_t mdi_40;
 }
@@ -87,9 +108,6 @@ constexpr uint32_t kBatteryOffTimeoutIdleMs = 60000U;
 constexpr uint32_t kBatteryDimTimeoutActiveMs = 30000U;
 constexpr uint32_t kBatteryOffTimeoutActiveMs = 120000U;
 constexpr uint64_t kPortalHintIntroMs = 5ULL * 60ULL * 1000ULL;
-constexpr uint32_t kCardRevealDurationMs = 300U;
-constexpr int32_t kCardRevealYStart = 28;
-constexpr uint32_t kCardRevealStaggerMs = 55U;
 constexpr uint32_t kRingBaseDark = 0x101010;
 constexpr uint32_t kRingIdleSolid = 0x404040;
 constexpr char kDegreeC[] = "\xC2\xB0""C";
@@ -932,6 +950,7 @@ std::string station_portal_text(const PrinterSnapshot& snapshot) {
 }
 
 std::string detail_text(const PrinterSnapshot& snapshot) {
+  if (!snapshot.command_detail.empty() && !snapshot.has_error) return snapshot.command_detail;
   if (snapshot.connection == PrinterConnectionState::kWaitingForCredentials) {
     if (snapshot.setup_ap_active) {
       return setup_access_text(snapshot);
@@ -1215,21 +1234,6 @@ bool should_show_logo(const PrinterSnapshot& snapshot) {
   }
 }
 
-// Micro-interaction: uniform scale on card tap (256 = 100% in LVGL 9)
-void card_scale_exec_cb(void* obj, int32_t val) {
-  lv_obj_set_style_transform_scale(static_cast<lv_obj_t*>(obj), val, 0);
-}
-
-// Cascading reveal: vertical slide-in per card
-void card_reveal_y_exec_cb(void* obj, int32_t val) {
-  lv_obj_set_style_translate_y(static_cast<lv_obj_t*>(obj), val, 0);
-}
-
-// Cascading reveal: fade-in per card
-void card_reveal_opa_exec_cb(void* obj, int32_t val) {
-  lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), static_cast<lv_opa_t>(val), 0);
-}
-
 }  // namespace
 
 void Ui::set_display_rotation(DisplayRotation rotation) {
@@ -1299,11 +1303,12 @@ esp_err_t Ui::initialize() {
   ESP_RETURN_ON_ERROR(bsp_display_rotation_set(bsp_rotation_for(display_rotation_)), kTag,
                       "apply display rotation failed");
 
-  user_brightness_percent_.store(-1, std::memory_order_relaxed);
-  applied_brightness_percent_.store(-1, std::memory_order_relaxed);
-  screen_power_mode_.store(ScreenPowerMode::kAwake, std::memory_order_relaxed);
+  user_brightness_percent_ = -1;
+  applied_brightness_percent_ = -1;
+  screen_power_mode_ = ScreenPowerMode::kAwake;
   last_activity_tick_ms_.store(lv_tick_get());
   set_brightness_percent(kDefaultBrightnessPercent);
+  if (!apply_brightness_policy(ScreenPowerMode::kAwake)) return ESP_FAIL;
   ESP_RETURN_ON_ERROR(build_dashboard(), kTag, "build_dashboard failed");
 
   // With LV_SCROLL_SNAP_NONE the pager decelerates freely after finger release.
@@ -1312,6 +1317,8 @@ esp_err_t Ui::initialize() {
   // launches a single ease-out snap animation to the nearest page — no
   // competing LVGL snap animations.
   {
+    LvglLockGuard lock(250, "configure_input");
+    if (!lock.locked()) return ESP_ERR_TIMEOUT;
     lv_indev_t* indev = lv_indev_get_next(nullptr);
     while (indev != nullptr) {
       if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
@@ -1331,22 +1338,7 @@ esp_err_t Ui::initialize() {
 }
 
 void Ui::set_arc_color_scheme(const ArcColorScheme& colors) {
-  if (!initialized_) {
-    arc_colors_ = colors;
-    return;
-  }
-
-  LvglLockGuard lock(200, "set_arc_color");
-  if (!lock.locked()) {
-    return;
-  }
-
-  arc_colors_ = colors;
-  if (last_snapshot_.ui_status.empty() && last_snapshot_.stage.empty() &&
-      last_snapshot_.detail.empty()) {
-    return;
-  }
-  apply_ring_visual_locked(last_snapshot_);
+  colors_mailbox_.publish(std::make_shared<const ArcColorScheme>(colors));
 }
 
 bool Ui::consume_camera_refresh_request() {
@@ -1378,16 +1370,9 @@ void Ui::set_portal_access_state(bool lock_enabled, bool request_authorized,
     return;
   }
 
-  // Store portal data without LVGL lock.  The actual text computation and
-  // visual update happen inside apply_snapshot_locked() which already holds
-  // the lock.  This eliminates a separate lock acquisition per tick.
-  portal_lock_enabled_ = lock_enabled;
-  portal_request_authorized_ = request_authorized;
-  portal_session_active_ = session_active;
-  portal_pin_active_ = pin_active;
-  portal_pin_code_ = pin_code;
-  portal_pin_remaining_s_ = pin_remaining_s;
-  portal_session_remaining_s_ = session_remaining_s;
+  portal_mailbox_.publish(std::make_shared<const PortalInput>(PortalInput{
+      lock_enabled, request_authorized, session_active, pin_active,
+      pin_code, pin_remaining_s, session_remaining_s}));
 }
 
 void Ui::compute_portal_texts_locked() {
@@ -1439,29 +1424,19 @@ void Ui::printer_card_click_cb(lv_event_t* event) {
   lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(event));
   for (const auto& cw : self->page0_cards_) {
     if (cw.card == target) {
-      self->pending_printer_switch_.store(cw.profile_index, std::memory_order_release);
+      self->pending_printer_switch_ = cw.profile_index;
       self->note_activity(true);
 
-      // Micro-interaction: quick scale bounce (100% → 91% → 100%)
-      lv_anim_t sa;
-      lv_anim_init(&sa);
-      lv_anim_set_var(&sa, target);
-      lv_anim_set_exec_cb(&sa, card_scale_exec_cb);
-      lv_anim_set_values(&sa, 256, 233);
-      lv_anim_set_duration(&sa, 75);
-      lv_anim_set_reverse_duration(&sa, 110);
-      lv_anim_set_path_cb(&sa, lv_anim_path_ease_out);
-      lv_anim_start(&sa);
       break;
     }
   }
 }
 
 int Ui::consume_printer_switch_request() {
-  return pending_printer_switch_.exchange(-1, std::memory_order_acq_rel);
+  return pending_printer_switch_.exchange(-1);
 }
 
-void Ui::apply_page0_parallax(bool force) {
+void Ui::apply_page0_parallax() {
   if (page0_title_ == nullptr || page0_card_list_ == nullptr || pager_ == nullptr) {
     return;
   }
@@ -1471,7 +1446,7 @@ void Ui::apply_page0_parallax(bool force) {
 
   const int page_w = board::kDisplayWidth;
   const int clamped = (scroll_x > page_w) ? page_w : scroll_x;
-  if (!force && clamped == last_parallax_clamped_) {
+  if (clamped == last_parallax_clamped_) {
     return;
   }
   last_parallax_clamped_ = clamped;
@@ -1517,18 +1492,19 @@ void Ui::apply_page0_parallax(bool force) {
 }
 
 void Ui::update_printer_cards(const std::vector<PrinterCardInfo>& cards) {
-  if (!initialized_) {
-    return;
-  }
+  cards_mailbox_.publish(std::make_shared<const std::vector<PrinterCardInfo>>(cards));
+}
 
-  // Only rebuild (and trigger the reveal animation) when the card data has
-  // actually changed — the caller runs every main-loop tick, so without this
-  // guard the animation restarts hundreds of times per second.
+void Ui::apply_printer_cards_locked(const std::vector<PrinterCardInfo>& cards) {
+
+  // Stable cards keep their widgets and animation/layout state. Only a change
+  // in membership/order rebuilds the list; status/name changes patch a row.
   const auto cards_equal = [](const std::vector<PrinterCardInfo>& a,
                                const std::vector<PrinterCardInfo>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
       if (a[i].index != b[i].index ||
+          a[i].serial != b[i].serial ||
           a[i].active != b[i].active ||
           a[i].connected != b[i].connected ||
           a[i].name != b[i].name ||
@@ -1542,14 +1518,32 @@ void Ui::update_printer_cards(const std::vector<PrinterCardInfo>& cards) {
   if (cards_equal(cards, last_printer_cards_)) {
     return;
   }
-  last_printer_cards_ = cards;
-
-  LvglLockGuard lock(200, "update_cards");
-  if (!lock.locked()) {
-    return;
+  bool topology_matches = cards.size() == page0_cards_.size() && cards.size() == last_printer_cards_.size();
+  for (size_t i = 0; topology_matches && i < cards.size(); ++i) {
+    topology_matches = cards[i].serial == page0_cards_[i].serial;
   }
-
-  rebuild_printer_cards_locked(cards);
+  if (!topology_matches) {
+    rebuild_printer_cards_locked(cards);
+  } else {
+    for (size_t i = 0; i < cards.size(); ++i) {
+      const auto& info = cards[i];
+      auto& row = page0_cards_[i];
+      const auto& previous = last_printer_cards_[i];
+      row.profile_index = info.index;
+      set_label_text_if_changed(row.name_label, info.name.empty() ? info.model : info.name);
+      set_label_text_if_changed(row.model_label, info.model.empty() ? "Unknown" : info.model);
+      set_label_text_if_changed(row.host_label, info.host.empty() ? "No local IP" : info.host);
+      if (info.active != previous.active) {
+        lv_obj_set_style_border_color(row.card, lv_color_hex(info.active ? 0x00CC66 : 0x303030), 0);
+        lv_obj_set_style_border_width(row.card, info.active ? 2 : 1, 0);
+        lv_obj_set_style_border_opa(row.card, info.active ? LV_OPA_COVER : LV_OPA_60, 0);
+      }
+      if (info.connected != previous.connected) {
+        lv_obj_set_style_bg_color(row.status_dot, lv_color_hex(info.connected ? 0x00CC66 : 0x666666), 0);
+      }
+    }
+  }
+  last_printer_cards_ = cards;
 }
 
 void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards) {
@@ -1569,9 +1563,8 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
   }
 
   const lv_font_t* font_name = &dosis_20;
-  const lv_font_t* font_detail = &lv_font_montserrat_14;
+  const lv_font_t* font_detail = &montserrat_14;
 
-  int card_idx = 0;
   for (const auto& info : cards) {
     // Card container — glasmorphism-lite: semi-transparent bg + shadow elevation
     lv_obj_t* card = lv_obj_create(page0_card_list_);
@@ -1583,6 +1576,7 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
     lv_obj_set_style_pad_all(card, 12, 0);
     lv_obj_set_style_pad_row(card, 2, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x29353B), LV_STATE_PRESSED);
     // Shadow for 3D depth on OLED
     lv_obj_set_style_shadow_width(card, 20, 0);
     lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
@@ -1647,67 +1641,9 @@ void Ui::rebuild_printer_cards_locked(const std::vector<PrinterCardInfo>& cards)
     cw.host_label = host_lbl;
     cw.status_dot = dot;
     cw.profile_index = info.index;
+    cw.serial = info.serial;
     page0_cards_.push_back(cw);
 
-    // Cascading reveal: start hidden below, fade + slide in with staggered delay
-    lv_obj_set_style_opa(card, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_translate_y(card, kCardRevealYStart, 0);
-    const uint32_t reveal_delay = static_cast<uint32_t>(card_idx) * kCardRevealStaggerMs;
-
-    lv_anim_t ry;
-    lv_anim_init(&ry);
-    lv_anim_set_var(&ry, card);
-    lv_anim_set_exec_cb(&ry, card_reveal_y_exec_cb);
-    lv_anim_set_values(&ry, kCardRevealYStart, 0);
-    lv_anim_set_duration(&ry, kCardRevealDurationMs);
-    lv_anim_set_delay(&ry, reveal_delay);
-    LV_ANIM_SET_EASE_OUT_BACK(&ry);
-    lv_anim_set_path_cb(&ry, lv_anim_path_custom_bezier3);
-    lv_anim_start(&ry);
-
-    lv_anim_t ro;
-    lv_anim_init(&ro);
-    lv_anim_set_var(&ro, card);
-    lv_anim_set_exec_cb(&ro, card_reveal_opa_exec_cb);
-    lv_anim_set_values(&ro, LV_OPA_TRANSP, LV_OPA_COVER);
-    lv_anim_set_duration(&ro, kCardRevealDurationMs);
-    lv_anim_set_delay(&ro, reveal_delay);
-    lv_anim_set_path_cb(&ro, lv_anim_path_ease_out);
-    lv_anim_start(&ro);
-
-    ++card_idx;
-  }
-}
-
-void Ui::replay_card_animations_locked() {
-  int card_idx = 0;
-  for (const PrinterCardWidgets& cw : page0_cards_) {
-    lv_obj_set_style_opa(cw.card, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_translate_y(cw.card, kCardRevealYStart, 0);
-    const uint32_t reveal_delay = static_cast<uint32_t>(card_idx) * kCardRevealStaggerMs;
-
-    lv_anim_t ry;
-    lv_anim_init(&ry);
-    lv_anim_set_var(&ry, cw.card);
-    lv_anim_set_exec_cb(&ry, card_reveal_y_exec_cb);
-    lv_anim_set_values(&ry, kCardRevealYStart, 0);
-    lv_anim_set_duration(&ry, kCardRevealDurationMs);
-    lv_anim_set_delay(&ry, reveal_delay);
-    LV_ANIM_SET_EASE_OUT_BACK(&ry);
-    lv_anim_set_path_cb(&ry, lv_anim_path_custom_bezier3);
-    lv_anim_start(&ry);
-
-    lv_anim_t ro;
-    lv_anim_init(&ro);
-    lv_anim_set_var(&ro, cw.card);
-    lv_anim_set_exec_cb(&ro, card_reveal_opa_exec_cb);
-    lv_anim_set_values(&ro, LV_OPA_TRANSP, LV_OPA_COVER);
-    lv_anim_set_duration(&ro, kCardRevealDurationMs);
-    lv_anim_set_delay(&ro, reveal_delay);
-    lv_anim_set_path_cb(&ro, lv_anim_path_ease_out);
-    lv_anim_start(&ro);
-
-    ++card_idx;
   }
 }
 
@@ -1715,46 +1651,128 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
   if (!initialized_) {
     return;
   }
-  if (scrolling_) {
-    last_snapshot_ = snapshot;
-    deferred_snapshot_ = snapshot;
-    deferred_snapshot_pending_ = true;
-    return;
+  snapshot_refresh_requested_ = false;
+  // Only application-owned data is read here. All LVGL state/caches are owned
+  // by its task; the renderer receives an immutable prepared message.
+  if (prepared_preview_source_.get() != snapshot.preview_blob.get()) {
+    prepared_preview_source_ = snapshot.preview_blob;
+    prepared_preview_raw_.reset();
+    prepared_preview_dsc_ = {};
+    preview_decode_retry_us_ = 0;
   }
-
-  // Pre-decode preview PNG outside LVGL lock, but only when the preview page is
-  // actually active. The decoded cover is ~1 MB, lives in PSRAM, and is kept
-  // cached across page changes so navigating away doesn't create a decode storm.
-  std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw;
-  lv_image_dsc_t pre_decoded_dsc{};
-  const bool preview_page_active = !scrolling_ && active_page_ == kPageIdxPreview;
-  const bool preview_blob_changed =
-      snapshot.preview_blob && !snapshot.preview_blob->empty() &&
-      last_preview_blob_.get() != snapshot.preview_blob.get();
-  // Also pre-decode when the blob exists but hasn't been decoded yet (e.g.
-  // blob arrived while another page was active, then user scrolled to preview).
-  const bool needs_first_decode =
-      !preview_blob_changed && snapshot.preview_blob &&
-      !snapshot.preview_blob->empty() &&
-      (!last_preview_raw_ || last_preview_raw_->empty());
-  if (preview_page_active && (preview_blob_changed || needs_first_decode)) {
-    decode_preview_png(snapshot.preview_blob, &pre_decoded_raw, &pre_decoded_dsc);
+  if (is_page2_active() && snapshot.preview_blob && !snapshot.preview_blob->empty() &&
+      !prepared_preview_raw_ && esp_timer_get_time() >= preview_decode_retry_us_) {
+    if (!decode_preview_png(snapshot.preview_blob, &prepared_preview_raw_, &prepared_preview_dsc_))
+      preview_decode_retry_us_ = esp_timer_get_time() + 5000000;
   }
+  auto prepared = std::make_shared<PreparedSnapshot>();
+  prepared->snapshot = snapshot;
+  prepared->preview_raw = prepared_preview_raw_;
+  prepared->preview_dsc = prepared_preview_dsc_;
+  snapshot_mailbox_.publish(std::move(prepared));
+}
 
-  LvglLockGuard lock(500, "apply_snapshot");
-  if (!lock.locked()) {
-    return;
+void Ui::set_work_phase(UiWorkPhase phase) {
+  work_phase_since_us_ = esp_timer_get_time();
+  work_phase_ = phase;
+}
+
+void Ui::process_updates_locked() {
+  if (scrolling_) return;
+  bool update = render_refresh_pending_;
+  if (auto colors = colors_mailbox_.take()) { arc_colors_ = *colors; update = true; }
+  if (auto portal = portal_mailbox_.take()) {
+    portal_lock_enabled_ = portal->lock_enabled;
+    portal_request_authorized_ = portal->authorized;
+    portal_session_active_ = portal->session_active;
+    portal_pin_active_ = portal->pin_active;
+    portal_pin_code_ = portal->pin;
+    portal_pin_remaining_s_ = portal->pin_remaining_s;
+    portal_session_remaining_s_ = portal->session_remaining_s;
+    update = true;
   }
-
-  last_snapshot_ = snapshot;
-  if (scrolling_) {
-    deferred_snapshot_ = snapshot;
-    deferred_snapshot_pending_ = true;
-    return;
+  auto prepared = snapshot_mailbox_.take();
+  if (prepared) { last_snapshot_ = prepared->snapshot; update = true; }
+  if (update) {
+    render_refresh_pending_ = false;
+    const int64_t began = esp_timer_get_time();
+    set_work_phase(UiWorkPhase::kWidgets);
+    apply_snapshot_locked(last_snapshot_, false,
+        prepared ? prepared->preview_raw : nullptr,
+        prepared ? &prepared->preview_dsc : nullptr);
+    update_timing_.add(esp_timer_get_time() - began);
+    set_work_phase(UiWorkPhase::kIdle);
+    return; // Structural card work gets a separate timer turn.
   }
+  if (auto cards = cards_mailbox_.take()) {
+    const int64_t began = esp_timer_get_time();
+    set_work_phase(UiWorkPhase::kWidgets);
+    apply_printer_cards_locked(*cards);
+    update_timing_.add(esp_timer_get_time() - began);
+    set_work_phase(UiWorkPhase::kIdle);
+  }
+}
 
-  apply_snapshot_locked(snapshot, false,
-                        std::move(pre_decoded_raw), &pre_decoded_dsc);
+void Ui::publish_performance_locked(int64_t now_us) {
+  if (now_us - performance_window_us_ < 5000000) return;
+  UiPerformanceSnapshot report;
+  report.window_ms = static_cast<uint32_t>((now_us - performance_window_us_) / 1000);
+  report.render_cycle = render_timing_.summary();
+  report.flush_callback = flush_timing_.summary();
+  report.flush_wait = flush_wait_timing_.summary();
+  report.widget_update = update_timing_.summary();
+  report.scroll_render_cycle = scroll_timing_.summary();
+  performance_mailbox_.publish(std::make_shared<const UiPerformanceSnapshot>(report));
+  render_timing_ = {}; flush_timing_ = {}; flush_wait_timing_ = {};
+  update_timing_ = {}; scroll_timing_ = {};
+  performance_window_us_ = now_us;
+}
+
+void Ui::update_timer_cb(lv_timer_t* timer) {
+  auto* ui = static_cast<Ui*>(lv_timer_get_user_data(timer));
+  ui->publish_performance_locked(esp_timer_get_time());
+  ui->process_updates_locked();
+}
+
+void Ui::performance_event_cb(lv_event_t* event) {
+  auto* ui = static_cast<Ui*>(lv_event_get_user_data(event));
+  const int64_t now = esp_timer_get_time();
+  switch (lv_event_get_code(event)) {
+    case LV_EVENT_RENDER_START:
+      ui->render_started_us_ = now;
+      ui->render_was_scrolling_ = ui->scrolling_;
+      ui->set_work_phase(UiWorkPhase::kRender);
+      break;
+    case LV_EVENT_RENDER_READY:
+      if (ui->render_started_us_) {
+        const auto duration = now - ui->render_started_us_;
+        ui->render_timing_.add(duration);
+        if (ui->render_was_scrolling_) ui->scroll_timing_.add(duration);
+        ui->render_started_us_ = 0;
+        ui->last_frame_us_ = now;
+      }
+      ui->set_work_phase(UiWorkPhase::kIdle);
+      break;
+    case LV_EVENT_FLUSH_START:
+      ui->flush_started_us_ = now;
+      ui->set_work_phase(UiWorkPhase::kFlush);
+      break;
+    case LV_EVENT_FLUSH_FINISH:
+      if (ui->flush_started_us_) ui->flush_timing_.add(now - ui->flush_started_us_);
+      ui->flush_started_us_ = 0;
+      ui->set_work_phase(UiWorkPhase::kRender);
+      break;
+    case LV_EVENT_FLUSH_WAIT_START:
+      ui->flush_wait_started_us_ = now;
+      ui->set_work_phase(UiWorkPhase::kFlushWait);
+      break;
+    case LV_EVENT_FLUSH_WAIT_FINISH:
+      if (ui->flush_wait_started_us_) ui->flush_wait_timing_.add(now - ui->flush_wait_started_us_);
+      ui->flush_wait_started_us_ = 0;
+      ui->set_work_phase(ui->render_started_us_ ? UiWorkPhase::kRender : UiWorkPhase::kIdle);
+      break;
+    default: break;
+  }
 }
 
 void Ui::apply_ring_visual_locked(const PrinterSnapshot& snapshot) {
@@ -1892,7 +1910,6 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
                                std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw,
                                const lv_image_dsc_t* pre_decoded_dsc) {
   LvglLockGuard::note_phase("enter");
-  deferred_snapshot_pending_ = false;
   update_page_availability_locked(snapshot);
 
   bool wake_due_to_state_change = false;
@@ -2045,7 +2062,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     compute_ams_tray_errors(snapshot);
     const bool show_unit_labels = ams_count > 1;
     for (int u = 0; u < kMaxAmsUnits; ++u) {
-      if (u < ams_count) {
+      if (u < ams_count && snapshot.ams->units[u].present) {
         render_ams_unit(u, snapshot, show_unit_labels);
       }
     }
@@ -2203,8 +2220,9 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
     // "Layer: X / Y", fall back to the regular small font otherwise.
     const bool subnote_is_layer =
         has_camera_image && (snapshot.total_layers > 0 || snapshot.current_layer > 0);
-    lv_obj_set_style_text_font(page3_subnote_,
-                               subnote_is_layer ? &dosis_32 : &lv_font_montserrat_20, 0);
+    const lv_font_t* desired_font = subnote_is_layer ? &dosis_32 : &montserrat_20;
+    if (lv_obj_get_style_text_font(page3_subnote_, LV_PART_MAIN) != desired_font)
+      lv_obj_set_style_text_font(page3_subnote_, desired_font, 0);
     set_label_text_if_changed(page3_subnote_, camera_subnote);
   }
 
@@ -2383,7 +2401,7 @@ void Ui::build_ams_page(int unit_idx) {
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     ams_tray_pct_[unit_idx][i] = lv_label_create(page);
     set_label_text_if_changed(ams_tray_pct_[unit_idx][i], "");
-    lv_obj_set_style_text_font(ams_tray_pct_[unit_idx][i], &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(ams_tray_pct_[unit_idx][i], &montserrat_20, 0);
     lv_obj_set_style_text_color(ams_tray_pct_[unit_idx][i], lv_color_hex(0xFFFFFF), 0);
     lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -2459,7 +2477,7 @@ void Ui::build_ams_page(int unit_idx) {
     lv_obj_set_width(ams_ext_type_, 48);
     lv_label_set_long_mode(ams_ext_type_, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(ams_ext_type_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(ams_ext_type_, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(ams_ext_type_, &montserrat_20, 0);
     lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(ams_ext_type_, LV_ALIGN_CENTER, 0, 8);
 
@@ -2468,7 +2486,7 @@ void Ui::build_ams_page(int unit_idx) {
     lv_obj_set_width(ams_ext_mat_, 48);
     lv_label_set_long_mode(ams_ext_mat_, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(ams_ext_mat_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(ams_ext_mat_, &montserrat_14, 0);
     lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
 
@@ -2523,6 +2541,8 @@ void Ui::compute_ams_tray_errors(const PrinterSnapshot& snapshot) {
 void Ui::ams_error_pulse_timer_cb(lv_timer_t* timer) {
   auto* ui = static_cast<Ui*>(lv_timer_get_user_data(timer));
   if (ui == nullptr) return;
+  if (ui->scrolling_ || ui->active_page_ < kPageIdxAmsFirst ||
+      ui->active_page_ > kPageIdxAmsLast) return;
   ui->ams_error_pulse_phase_ = (ui->ams_error_pulse_phase_ + 1U) & 0x3FU;
   // Triangle wave 0..32 → blend factor between dark and red. The arrow stays
   // fully opaque (LV_OPA_COVER); only the color changes, so it never bleeds
@@ -2540,6 +2560,7 @@ void Ui::ams_error_pulse_timer_cb(lv_timer_t* timer) {
       (static_cast<uint32_t>(g) << 8) |
       static_cast<uint32_t>(b));
   for (int u = 0; u < kMaxAmsUnits; ++u) {
+    if (ui->active_page_ != kPageIdxAmsFirst + u) continue;
     for (int s = 0; s < kMaxAmsTrays; ++s) {
       if (!ui->ams_tray_error_[u][s]) continue;
       lv_obj_t* arrow = ui->ams_tray_arrow_[u][s];
@@ -2584,8 +2605,11 @@ void Ui::render_ams_unit(int unit_idx, const PrinterSnapshot& snapshot, bool sho
   if (snapshot.ams == nullptr) return;
   const AmsUnitInfo& unit = snapshot.ams->units[unit_idx];
 
-  // Unit header label
+  // The UI index is separate from sparse device IDs (e.g. HT 128).
   if (ams_unit_label_[unit_idx] != nullptr) {
+    const std::string label = unit.protocol_id >= 128 ?
+        "AMS HT " + std::to_string(unit.protocol_id - 127) : "AMS " + std::to_string(unit_idx + 1);
+    set_label_text_if_changed(ams_unit_label_[unit_idx], label.c_str());
     set_hidden(ams_unit_label_[unit_idx], !show_unit_label);
   }
 
@@ -2659,6 +2683,7 @@ void Ui::render_ams_unit(int unit_idx, const PrinterSnapshot& snapshot, bool sho
 
   for (int i = 0; i < kMaxAmsTrays; ++i) {
     const AmsTrayInfo& tray = unit.trays[i];
+    set_hidden(ams_tray_col_[unit_idx][i], unit.protocol_id >= 128 && i > 0);
     lv_obj_t* rect = ams_tray_rect_[unit_idx][i];
     lv_obj_t* arrow = ams_tray_arrow_[unit_idx][i];
     const bool has_error = ams_tray_error_[unit_idx][i];
@@ -2746,6 +2771,7 @@ esp_err_t Ui::build_dashboard() {
   if (!lock.locked()) {
     return ESP_ERR_TIMEOUT;
   }
+  if (auto colors = colors_mailbox_.take()) arc_colors_ = *colors;
 
   screen_ = lv_screen_active();
   lv_obj_set_style_bg_color(screen_, lv_color_hex(0x000000), 0);
@@ -2754,7 +2780,7 @@ esp_err_t Ui::build_dashboard() {
   const lv_font_t* dosis20 = &dosis_20;
   const lv_font_t* dosis32 = &dosis_32;
   const lv_font_t* dosis40 = &dosis_40;
-  const lv_font_t* info20 = &lv_font_montserrat_20;
+  const lv_font_t* info20 = &montserrat_20;
   const lv_font_t* mdi30 = &mdi_30;
   const lv_font_t* mdi40 = &mdi_40;
 
@@ -3217,7 +3243,6 @@ esp_err_t Ui::build_dashboard() {
   active_page_ = kPageIdxMain;
   scrolling_ = false;
   publish_page_state_snapshot();
-  deferred_snapshot_pending_ = false;
   detail_visible_ = true;
   show_logo_ = false;
   preview_text_image_mode_ = false;
@@ -3225,6 +3250,10 @@ esp_err_t Ui::build_dashboard() {
   apply_page_visibility();
   update_portal_access_visuals_locked();
 
+  performance_window_us_ = esp_timer_get_time();
+  lv_display_add_event_cb(display_, &Ui::performance_event_cb, LV_EVENT_ALL, this);
+  update_timer_ = lv_timer_create(&Ui::update_timer_cb, 20, this);
+  if (!update_timer_) return ESP_ERR_NO_MEM;
   return ESP_OK;
 }
 
@@ -3279,7 +3308,7 @@ void Ui::apply_page_visibility() {
   // Overlay + page0 opacity are driven by apply_page0_parallax.
   // When not scrolling, snap to final state.
   if (!scrolling_) {
-    apply_page0_parallax(true);
+    apply_page0_parallax();
   }
 
   apply_logo_visibility();
@@ -3303,7 +3332,7 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   const uint8_t ams_count = snapshot.ams ? snapshot.ams->count : 0;
   bool ams_changed = false;
   for (int u = 0; u < kMaxAmsUnits; ++u) {
-    const bool present = u < ams_count;
+    const bool present = u < ams_count && snapshot.ams->units[u].present;
     if (ams_unit_present_[u] != present) {
       ams_unit_present_[u] = present;
       ams_changed = true;
@@ -3357,7 +3386,7 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   }
   scrolling_ = false;
   publish_page_state_snapshot();
-  apply_page0_parallax(true);
+  apply_page0_parallax();
   // Ring timer resume is handled by apply_ring_visual_locked via apply_snapshot.
 }
 
@@ -3470,9 +3499,6 @@ void Ui::set_active_page(int page) {
     lv_obj_scroll_to_x(pager_, target_x, LV_ANIM_OFF);
   }
   active_page_ = clamped_page;
-  if (clamped_page == 0 && previous_page != 0) {
-    replay_card_animations_locked();
-  }
   if (active_page_ == kPageIdxPreview) {
     preview_image_visible_ = ensure_preview_image_loaded_locked(false);
   }
@@ -3483,14 +3509,11 @@ void Ui::set_active_page(int page) {
   }
   scrolling_ = false;
   publish_page_state_snapshot();
-  apply_page0_parallax(true);
+  apply_page0_parallax();
   // Ring timer resume is handled by apply_ring_visual_locked below.
   apply_page_visibility();
-  if (deferred_snapshot_pending_) {
-    apply_snapshot_locked(deferred_snapshot_, true);
-  } else if (previous_page != clamped_page) {
-    apply_snapshot_locked(last_snapshot_, true);
-  }
+  render_refresh_pending_ = true;
+  snapshot_refresh_requested_ = true;
 }
 
 void Ui::set_pager_scroll_locked(bool locked) {
@@ -3515,7 +3538,7 @@ void Ui::set_pager_scroll_locked(bool locked) {
   }
   scrolling_ = false;
   publish_page_state_snapshot();
-  apply_page0_parallax(true);
+  apply_page0_parallax();
   apply_page_visibility();
 }
 
@@ -3525,6 +3548,9 @@ void Ui::publish_page_state_snapshot() {
 }
 
 void Ui::handle_pager_event(lv_event_t* event) {
+  // Vertical card lists and labels bubble their events through the pager.
+  // Only the pager's own scroll may begin/end a horizontal page transition.
+  if (lv_event_get_target(event) != pager_) return;
   const lv_event_code_t code = lv_event_get_code(event);
 
   if (pager_scroll_locked_) {
@@ -3542,6 +3568,9 @@ void Ui::handle_pager_event(lv_event_t* event) {
 
   if (code == LV_EVENT_SCROLL_BEGIN) {
     scrolling_ = true;
+    stop_ring_animations_locked();
+    if (lv_label_get_long_mode(detail_label_) == LV_LABEL_LONG_SCROLL_CIRCULAR)
+      lv_label_set_long_mode(detail_label_, LV_LABEL_LONG_WRAP);
     // Capture the gesture's origin page for the release-threshold decision
     // below. Only finger-initiated scrolls count; the snap animation's own
     // SCROLL_BEGIN (no pressed indev) must not overwrite it.
@@ -3616,7 +3645,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 
   if (code == LV_EVENT_PRESSED) {
     set_pager_scroll_locked(false);
-    if (screen_power_mode_.load(std::memory_order_acquire) == ScreenPowerMode::kOff) {
+    if (screen_power_mode_ == ScreenPowerMode::kOff) {
       // First touch wakes the screen; a second touch performs UI actions.
       note_activity(true);
       gesture_active_ = false;
@@ -3631,7 +3660,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
     overlay_visible_ = false;
     gesture_start_x_ = point.x;
     gesture_start_y_ = point.y;
-    gesture_start_brightness_ = user_brightness_percent_.load(std::memory_order_acquire);
+    gesture_start_brightness_ = user_brightness_percent_;
     return;
   }
 
@@ -3676,8 +3705,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
     set_brightness_percent(new_brightness);
 
     char buffer[8] = {};
-    std::snprintf(buffer, sizeof(buffer), "%d%%",
-                  user_brightness_percent_.load(std::memory_order_acquire));
+    std::snprintf(buffer, sizeof(buffer), "%d%%", user_brightness_percent_.load());
     set_label_text_if_changed(brightness_overlay_, buffer);
     lv_obj_clear_flag(brightness_overlay_, LV_OBJ_FLAG_HIDDEN);
     overlay_visible_ = true;
@@ -3826,36 +3854,29 @@ void Ui::update_print_buttons_locked(const PrinterSnapshot& snapshot) {
 
   // Visually disable both buttons while a command is in flight (avoid double-fire
   // until the printer reflects the new lifecycle in its next status report).
-  const bool pending = snapshot.print_command_pending_kind != PrintCommand::kNone;
-  const lv_opa_t pause_opa = pending ? LV_OPA_40 : LV_OPA_90;
-  lv_obj_set_style_bg_opa(page2_pause_button_, pause_opa, 0);
-  lv_obj_set_style_bg_opa(page2_stop_button_, pause_opa, 0);
+  const bool pending = snapshot.command_pending;
+  if (last_buttons_pending_ != static_cast<int>(pending)) {
+    const lv_opa_t pause_opa = pending ? LV_OPA_40 : LV_OPA_90;
+    lv_obj_set_style_bg_opa(page2_pause_button_, pause_opa, 0);
+    lv_obj_set_style_bg_opa(page2_stop_button_, pause_opa, 0);
+    last_buttons_pending_ = static_cast<int>(pending);
+  }
 }
 
 void Ui::set_brightness_percent(int brightness_percent) {
   const int clamped = std::clamp(brightness_percent, 0, 100);
-  if (user_brightness_percent_.exchange(clamped, std::memory_order_acq_rel) == clamped) {
+  if (user_brightness_percent_ == clamped) {
     return;
   }
-  apply_brightness_policy();
+
+  user_brightness_percent_ = clamped;
+  wake_display_requested_ = true;
 }
 
 void Ui::note_activity(bool wake_display_now) {
   last_activity_tick_ms_.store(lv_tick_get());
   if (wake_display_now) {
-    wake_display_requested_.store(true, std::memory_order_release);
-  }
-}
-
-void Ui::wake_display() {
-  const ScreenPowerMode previous =
-      screen_power_mode_.exchange(ScreenPowerMode::kAwake, std::memory_order_acq_rel);
-  if (previous == ScreenPowerMode::kAwake) {
-    return;
-  }
-  apply_brightness_policy();
-  if (previous == ScreenPowerMode::kOff) {
-    esp_lv_adapter_resume();
+    wake_display_requested_ = true;
   }
 }
 
@@ -3864,120 +3885,90 @@ void Ui::request_wake_display() {
 }
 
 void Ui::set_battery_display_policy(const BatteryDisplayPolicy& policy) {
-  std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
   battery_display_policy_ = policy;
 }
 
-void Ui::apply_brightness_policy() {
-  const int user_brightness = user_brightness_percent_.load(std::memory_order_acquire);
-  const ScreenPowerMode power_mode = screen_power_mode_.load(std::memory_order_acquire);
-  int dim_brightness_percent = 0;
-  {
-    std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
-    dim_brightness_percent = battery_display_policy_.dim_brightness_percent;
-  }
+bool Ui::apply_brightness_policy(ScreenPowerMode mode) {
+  const int user_brightness = user_brightness_percent_.load();
   int target_brightness = user_brightness;
-  if (power_mode == ScreenPowerMode::kDimmed) {
-    if (dim_brightness_percent > 0) {
-      target_brightness = std::clamp(dim_brightness_percent, 1, 100);
+  if (mode == ScreenPowerMode::kDimmed) {
+    if (battery_display_policy_.dim_brightness_percent > 0) {
+      target_brightness = std::clamp(battery_display_policy_.dim_brightness_percent, 1, 100);
     } else {
       target_brightness = std::max(8, std::min(18, std::max(1, user_brightness / 3)));
     }
-  } else if (power_mode == ScreenPowerMode::kOff) {
+  } else if (mode == ScreenPowerMode::kOff) {
     target_brightness = 0;
   }
 
-  if (applied_brightness_percent_.exchange(target_brightness, std::memory_order_acq_rel) ==
-      target_brightness) {
-    return;
+  if (applied_brightness_percent_ == target_brightness) {
+    return true;
   }
-  bsp_display_brightness_set(target_brightness);
+
+  power_io_since_us_ = esp_timer_get_time();
+  const esp_err_t result = bsp_display_brightness_set(target_brightness);
+  power_io_since_us_ = 0;
+  if (result != ESP_OK) {
+    applied_brightness_percent_ = -1;
+    return false;
+  }
+  applied_brightness_percent_ = target_brightness;
+  return true;
 }
 
 void Ui::update_power_save(bool on_battery, bool keep_awake, bool print_active) {
   const uint32_t now = lv_tick_get();
   const uint32_t idle_ms = now - last_activity_tick_ms_.load();
 
-  if (wake_display_requested_.exchange(false, std::memory_order_acq_rel)) {
-    wake_display();
-    return;
-  }
-
-  BatteryDisplayPolicy policy;
-  {
-    std::lock_guard<std::mutex> lock(battery_display_policy_mutex_);
-    policy = battery_display_policy_;
-  }
-
   // While the LVGL worker is paused (screen off), LVGL touch events are not
   // processed.  Poll the raw touch-interrupt GPIO so a finger press can still
   // wake the display.  CST9217 pulls INT (GPIO 11) low on contact.
-  if (screen_power_mode_.load(std::memory_order_acquire) == ScreenPowerMode::kOff &&
+  if (screen_power_mode_ == ScreenPowerMode::kOff &&
       gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
-    note_activity(false);
-    wake_display();
-    return;
+    note_activity(true);
   }
 
   // print_active only selects the "during print" timeouts — it must NOT
   // suppress dimming/screen-off (v1.6 regression: print_active was folded
   // into keep_awake, which made the *_active_s policy timeouts dead code).
   const uint32_t dim_timeout = (print_active
-      ? policy.dim_timeout_active_s
-      : policy.dim_timeout_idle_s) * 1000U;
+      ? battery_display_policy_.dim_timeout_active_s
+      : battery_display_policy_.dim_timeout_idle_s) * 1000U;
   const uint32_t off_timeout = (print_active
-      ? policy.off_timeout_active_s
-      : policy.off_timeout_idle_s) * 1000U;
+      ? battery_display_policy_.off_timeout_active_s
+      : battery_display_policy_.off_timeout_idle_s) * 1000U;
 
   ScreenPowerMode target_mode = ScreenPowerMode::kAwake;
-  if (!keep_awake && (on_battery || policy.usb_power_save_enabled)) {
-    if (policy.screen_off_enabled && idle_ms >= off_timeout) {
+  const bool wake_requested = wake_display_requested_.exchange(false);
+  if (!wake_requested && !keep_awake && (on_battery || battery_display_policy_.usb_power_save_enabled)) {
+    if (battery_display_policy_.screen_off_enabled && idle_ms >= off_timeout) {
       target_mode = ScreenPowerMode::kOff;
-    } else if (policy.dim_enabled && idle_ms >= dim_timeout) {
+    } else if (battery_display_policy_.dim_enabled && idle_ms >= dim_timeout) {
       target_mode = ScreenPowerMode::kDimmed;
     }
   }
 
-  const ScreenPowerMode current_mode = screen_power_mode_.load(std::memory_order_acquire);
-  if (current_mode != target_mode) {
-    const bool was_off = current_mode == ScreenPowerMode::kOff;
-    const bool going_off = target_mode == ScreenPowerMode::kOff;
-    screen_power_mode_.store(target_mode, std::memory_order_release);
-
-    // IMPORTANT: When turning the screen off, pause the LVGL worker BEFORE
-    // setting brightness to 0.  The AMOLED panel stops generating the TE
-    // signal on GPIO13 at brightness 0.  If lv_timer_handler() is in the
-    // flush path it will block forever on xSemaphoreTake(te_vsync_sem,
-    // portMAX_DELAY).  Pausing first ensures the worker finishes its current
-    // render cycle (while TE is still active) and then idles.
-    //
-    // If pause times out (worker stuck in flush), we must NOT kill the TE
-    // signal — that would permanently deadlock the worker.  Instead, abort
-    // the screen-off transition and stay in the current power mode.
-    if (going_off && !was_off) {
-      esp_err_t pause_ret = esp_lv_adapter_pause(1000);
-      if (pause_ret != ESP_OK) {
-        ESP_LOGW(kTag, "LVGL worker pause timeout — aborting screen-off to avoid TE deadlock (%s)",
-                 esp_err_to_name(pause_ret));
-        // Treat a failed screen-off attempt like fresh activity so we don't
-        // immediately hammer pause() again on the next main-loop iteration.
-        last_activity_tick_ms_.store(now);
-        screen_power_mode_.store(was_off ? ScreenPowerMode::kOff : ScreenPowerMode::kAwake,
-                                 std::memory_order_release);
-        return;
-      }
-    }
-
-    apply_brightness_policy();
-
-    if (was_off && !going_off) {
-      esp_lv_adapter_resume();
-    }
+  // Only the application task applies power changes. Touch/render callbacks
+  // publish atomic requests and never send SPI commands or wait for pause().
+  const ScreenPowerMode previous = screen_power_mode_.load();
+  const bool applied = transition_screen_power(display_worker_paused_, target_mode,
+      []() { return esp_lv_adapter_pause(1000) == ESP_OK; },
+      [this](ScreenPowerMode mode) { return apply_brightness_policy(mode); },
+      []() { return esp_lv_adapter_resume() == ESP_OK; });
+  if (!applied) {
+    if (target_mode == ScreenPowerMode::kOff) last_activity_tick_ms_.store(now);
+    if (wake_requested) wake_display_requested_ = true;
+    return; // Keep confirmed mode/brightness; retry a failed write later.
+  }
+  screen_power_mode_ = target_mode;
+  if (previous != target_mode) {
+    ESP_LOGI(kTag, "Display power %d -> %d (brightness=%d)",
+             static_cast<int>(previous), static_cast<int>(target_mode), applied_brightness_percent_);
   }
 }
 
 bool Ui::is_low_power_mode_active() const {
-  return screen_power_mode_.load(std::memory_order_relaxed) != ScreenPowerMode::kAwake;
+  return screen_power_mode_ != ScreenPowerMode::kAwake;
 }
 
 void Ui::pager_event_cb(lv_event_t* event) {
@@ -4029,8 +4020,7 @@ void Ui::handle_remaining_row_click() {
   // We are inside an LVGL event \u2014 the lvgl_port task already holds the
   // display lock, so no extra locking is needed before mutating widgets.
   show_eta_ = !show_eta_;
-  // Re-apply the cached snapshot so the row updates immediately.
-  apply_snapshot_locked(last_snapshot_, false);
+  render_refresh_pending_ = true;
 }
 
 }  // namespace printsphere

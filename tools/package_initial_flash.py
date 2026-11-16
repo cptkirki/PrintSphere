@@ -4,8 +4,38 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import struct
+import subprocess
 from pathlib import Path
 from typing import Iterable
+
+
+def app_identity(data: bytes) -> dict:
+    if len(data) < 288 or data[0] != 0xE9 or struct.unpack_from("<I", data, 32)[0] != 0xABCD5432:
+        raise ValueError("Missing ESP32 application descriptor")
+    def field(offset: int) -> str:
+        return data[offset:offset + 32].split(b"\0", 1)[0].decode("ascii")
+    result = {"version": field(48), "project": field(80), "idf": field(144)}
+    boards = {"printsphere_2_8c_p2": "lcd_2_8c", "printsphere_1_75_p2": "amoled_1_75"}
+    if result["project"] not in boards:
+        raise ValueError("Image is not a board-identified PrintSphere application")
+    result["board"] = boards[result["project"]]
+    return result
+
+
+def source_tree_hash(source_root: Path) -> str:
+    files = {p for directory in ("main", "components", "tools/patches")
+             for p in (source_root / directory).rglob("*")
+             if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
+    files.update(source_root / name for name in (
+        "VERSION", "CMakeLists.txt", "dependencies.lock", "sdkconfig.defaults", "partitions.csv",
+        "tools/package_initial_flash.py"))
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda p: p.relative_to(source_root).as_posix()):
+        digest.update(path.relative_to(source_root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +181,13 @@ def main() -> int:
         else:
             ota_output_path = ota_output_arg.resolve()
 
+    # Validate the actual image before writing or replacing any release artifact.
+    app_path, app_bytes = load_app_binary(build_dir)
+    identity = app_identity(app_bytes)
+    expected_version = identity["version"] + ("-2.8c" if identity["board"] == "lcd_2_8c" else "")
+    if release_version and release_version != expected_version:
+        raise ValueError(f"Package version {release_version!r} differs from image {expected_version!r}")
+    release_version = expected_version
     entries = load_flash_entries(build_dir)
     merged = merge_flash_entries(entries)
 
@@ -191,6 +228,19 @@ def main() -> int:
         print(f"Wrote OTA binary {ota_versioned_path}")
     print(f"OTA size:   {len(app_bytes)} bytes  (source: {app_path.name})")
     print(f"OTA SHA256: {ota_digest}")
+
+    source_root = Path(__file__).resolve().parents[1]
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_root,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    manifest = {
+        **identity, "idf_required": "5.5.4", "package_version": release_version, "git_commit": revision,
+        "source_tree_sha256": source_tree_hash(source_root),
+        "dependencies_lock_sha256": hashlib.sha256((source_root / "dependencies.lock").read_bytes()).hexdigest(),
+        "sdkconfig_sha256": hashlib.sha256((build_dir / "config/sdkconfig.h").read_bytes()).hexdigest(),
+        "ota": {"bytes": len(app_bytes), "sha256": ota_digest},
+        "initial": {"bytes": len(merged), "sha256": digest},
+    }
+    (output_path.parent.parent / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     return 0
 

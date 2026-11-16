@@ -1,4 +1,5 @@
 #pragma once
+#include "printsphere/command_tracker.hpp"
 
 #include <array>
 #include <atomic>
@@ -36,6 +37,11 @@ enum class CloudSetupStage : uint8_t {
 const char* to_string(CloudSetupStage stage);
 
 struct BambuCloudSnapshot {
+  bool command_pending = false;
+  std::string command_detail;
+  int http_status = 0;
+  std::string http_failure;
+  uint32_t operation_id = 0;
   bool configured = false;
   bool connected = false;
   bool session_connected = false;
@@ -80,7 +86,7 @@ struct BambuCloudSnapshot {
   int tray_now = -1;
   int tray_tar = -1;
   int ams_status_main = -1;
-  std::shared_ptr<AmsSnapshot> ams;
+  std::shared_ptr<const AmsSnapshot> ams;
   std::vector<uint64_t> hms_codes;
   uint16_t hms_alert_count = 0;
   uint64_t live_data_last_update_ms = 0;
@@ -148,6 +154,8 @@ class BambuCloudClient {
   };
 
   struct CloudRestRuntimeState {
+    int http_status = 0;
+    std::string http_failure;
     bool configured = false;
     bool session_ready = false;
     bool verification_required = false;
@@ -192,15 +200,17 @@ class BambuCloudClient {
     }
   }
   void set_preview_fetch_enabled(bool enabled);
+  uint32_t operation_id() const { return operation_id_.load(); }
   void request_reload_from_store() {
+    operation_id_.fetch_add(1);
     reload_requested_.store(true);
     if (task_handle_ != nullptr) {
       xTaskNotifyGive(task_handle_);
     }
   }
   void submit_verification_code(std::string code);
-  bool set_chamber_light(bool on);
-  bool set_print_command(PrintCommand command);
+  bool set_chamber_light(bool on, const std::string& expected_serial = {});
+  bool set_print_command(PrintCommand command, const std::string& expected_serial = {});
   esp_err_t start();
   BambuCloudSnapshot snapshot() const;
   BambuCloudSnapshot refreshed_snapshot();
@@ -209,6 +219,7 @@ class BambuCloudClient {
   MqttTelemetry mqtt_telemetry() const;
 
  private:
+  CommandTracker command_tracker_{};
   enum class AuthMode : uint8_t {
     kPassword,
     kEmailCode,
@@ -245,7 +256,12 @@ class BambuCloudClient {
   bool request_verification_code();
   bool perform_json_request(const std::string& url, const char* method,
                             const std::string& request_body, const std::string& bearer_token,
-                            int* status_code, std::string* response_body);
+                            int* status_code, std::string* response_body,
+                            const std::string& csrf = {}, std::string* response_token = nullptr,
+                            std::string* response_csrf = nullptr);
+  std::string http_failure_detail(const char* context) const;
+  void accept_token(const std::string& token, int expires_in);
+  bool token_has_expired() const;
   void set_snapshot(BambuCloudSnapshot snapshot);
   AuthMode auth_mode() const;
   bool waiting_for_user_code() const;
@@ -310,10 +326,23 @@ class BambuCloudClient {
   std::string access_token_{};
   std::string mqtt_username_{};
   int64_t token_expiry_us_ = 0;
+  int64_t token_expiry_utc_ = 0;
+  policy::RetryBudget http_budget_{};
+  policy::RetryBudget auth_budget_{};
+  policy::RetryBudget binding_budget_{};
+  policy::RetryBudget preview_budget_{};
+  policy::RetryBudget core_sync_budget_{};
+  bool password_attempt_allowed_ = true;
+  policy::HttpFailure last_http_failure_ = policy::HttpFailure::kNone;
+  int last_http_status_ = 0;
+  esp_err_t last_transport_error_ = ESP_OK;
+  std::atomic<uint32_t> operation_id_{0};
+  std::atomic<uint32_t> active_operation_id_{0};
   TaskHandle_t task_handle_ = nullptr;
   esp_mqtt_client_handle_t mqtt_client_ = nullptr;
   std::string mqtt_client_id_{};
   std::string mqtt_report_topic_{};
+  std::string mqtt_bound_serial_{};
   std::string mqtt_request_topic_{};
   std::string incoming_topic_{};
   std::string incoming_payload_{};

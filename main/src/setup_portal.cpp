@@ -1,5 +1,10 @@
+#include "printsphere/wav_parser.hpp"
+#include "printsphere/web_escape.hpp"
+#include "printsphere/task_start.hpp"
+#include "printsphere/utf8.hpp"
 #include "printsphere/setup_portal.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -12,8 +17,10 @@
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_https_ota.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "printsphere/firmware_identity.hpp"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -32,8 +39,22 @@ namespace {
 #define PRINTSPHERE_RELEASE_VERSION "dev"
 #endif
 
+class OtaLease {
+ public:
+  explicit OtaLease(std::atomic<bool>& flag, bool adopt = false) : flag_(flag) {
+    bool expected = false;
+    acquired_ = adopt || flag_.compare_exchange_strong(expected, true);
+  }
+  ~OtaLease() { if (acquired_) flag_ = false; }
+  explicit operator bool() const { return acquired_; }
+  void keep_until_reboot() { acquired_ = false; }
+ private:
+  std::atomic<bool>& flag_;
+  bool acquired_ = false;
+};
+
 constexpr char kTag[] = "printsphere.portal";
-constexpr size_t kMaxRequestBody = 4096;
+constexpr size_t kMaxRequestBody = 12 * 1024;
 constexpr char kPortalSessionCookieName[] = "printsphere_portal_session";
 constexpr uint64_t kPortalPinLifetimeMs = 2ULL * 60ULL * 1000ULL;
 constexpr uint64_t kPortalSessionLifetimeMs = 10ULL * 60ULL * 1000ULL;
@@ -46,73 +67,6 @@ constexpr char kFaviconSvg[] =
     "<circle cx=\"32\" cy=\"32\" r=\"18\" fill=\"none\" stroke=\"#f0a64b\" stroke-width=\"8\"/>"
     "</svg>";
 
-std::string json_escape(const std::string& input) {
-  std::string output;
-  output.reserve(input.size());
-
-  for (const char ch : input) {
-    switch (ch) {
-      case '\\':
-        output += "\\\\";
-        break;
-      case '"':
-        output += "\\\"";
-        break;
-      case '\n':
-        output += "\\n";
-        break;
-      case '\r':
-        output += "\\r";
-        break;
-      case '\t':
-        output += "\\t";
-        break;
-      default:
-        output.push_back(ch);
-        break;
-    }
-  }
-
-  return output;
-}
-
-std::string html_escape(const std::string& input) {
-  std::string output;
-  output.reserve(input.size());
-  for (const char ch : input) {
-    switch (ch) {
-      case '&': output += "&amp;"; break;
-      case '<': output += "&lt;"; break;
-      case '>': output += "&gt;"; break;
-      case '"': output += "&quot;"; break;
-      case '\'': output += "&#39;"; break;
-      default: output.push_back(ch); break;
-    }
-  }
-  return output;
-}
-
-// Escapes a value placed inside a quoted JavaScript string in an inline
-// <script>. Escaping '<' prevents a value containing "</script>" from ending
-// the element before the JavaScript parser sees the string literal.
-std::string script_string_escape(const std::string& input) {
-  std::string output;
-  output.reserve(input.size());
-  for (const unsigned char ch : input) {
-    switch (ch) {
-      case '\\': output += "\\\\"; break;
-      case '"': output += "\\\""; break;
-      case '\n': output += "\\n"; break;
-      case '\r': output += "\\r"; break;
-      case '\t': output += "\\t"; break;
-      case '<': output += "\\u003C"; break;
-      case '>': output += "\\u003E"; break;
-      case '&': output += "\\u0026"; break;
-      default: output.push_back(static_cast<char>(ch)); break;
-    }
-  }
-  return output;
-}
 
 std::string read_string_field(const cJSON* object, const char* key) {
   const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, key);
@@ -401,10 +355,10 @@ void append_portal_access_fields(std::string* body, const PortalAccessSnapshot& 
   }
 }
 
-void send_json(httpd_req_t* request, const std::string& body) {
+esp_err_t send_json(httpd_req_t* request, const std::string& body) {
   httpd_resp_set_type(request, "application/json");
   httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-  httpd_resp_send(request, body.c_str(), body.size());
+  return httpd_resp_send(request, body.c_str(), body.size());
 }
 
 esp_err_t receive_json_body(httpd_req_t* request, cJSON** root_out) {
@@ -523,22 +477,7 @@ bool cloud_detail_is_transitional(const std::string& detail) {
          normalized == "RESTORED BAMBU CLOUD SESSION";
 }
 
-bool cloud_stage_is_user_visible_progress(CloudSetupStage stage) {
-  switch (stage) {
-    case CloudSetupStage::kEmailCodeRequired:
-    case CloudSetupStage::kTfaRequired:
-    case CloudSetupStage::kBindingPrinter:
-    case CloudSetupStage::kConnectingMqtt:
-    case CloudSetupStage::kConnected:
-    case CloudSetupStage::kFailed:
-      return true;
-    case CloudSetupStage::kIdle:
-    case CloudSetupStage::kLoggingIn:
-    case CloudSetupStage::kCodeSubmitted:
-    default:
-      return false;
-  }
-}
+
 
 bool cloud_portal_ready(const BambuCloudSnapshot& snapshot);
 
@@ -551,58 +490,9 @@ struct CloudPortalPresentation {
   std::string status_detail = "No cloud response yet";
 };
 
-bool cloud_connect_result_ready(const BambuCloudSnapshot& before,
-                                const BambuCloudSnapshot& current) {
-  if (!cloud_portal_ready(before) && cloud_portal_ready(current)) {
-    return true;
-  }
-  if ((!before.verification_required && current.verification_required) ||
-      (!before.tfa_required && current.tfa_required)) {
-    return true;
-  }
-  if (cloud_stage_is_user_visible_progress(current.setup_stage) &&
-      current.setup_stage != before.setup_stage) {
-    return true;
-  }
 
-  if (current.configured != before.configured ||
-      current.resolved_serial != before.resolved_serial) {
-    return true;
-  }
 
-  if (current.detail == before.detail) {
-    return false;
-  }
 
-  return !cloud_detail_is_transitional(current.detail);
-}
-
-bool cloud_verify_result_ready(const BambuCloudSnapshot& before,
-                               const BambuCloudSnapshot& current) {
-  if (!cloud_portal_ready(before) && cloud_portal_ready(current)) {
-    return true;
-  }
-  if ((!before.verification_required && current.verification_required) ||
-      (!before.tfa_required && current.tfa_required)) {
-    return true;
-  }
-  if (cloud_stage_is_user_visible_progress(current.setup_stage) &&
-      current.setup_stage != before.setup_stage) {
-    return true;
-  }
-  if (current.resolved_serial != before.resolved_serial) {
-    return true;
-  }
-  if (current.detail == before.detail) {
-    return false;
-  }
-  if (current.setup_stage == CloudSetupStage::kFailed) {
-    return true;
-  }
-  return !cloud_detail_is_transitional(current.detail) &&
-         current.setup_stage != CloudSetupStage::kCodeSubmitted &&
-         current.setup_stage != CloudSetupStage::kLoggingIn;
-}
 
 bool cloud_portal_ready(const BambuCloudSnapshot& snapshot) {
   if (!snapshot.configured || snapshot.verification_required || snapshot.tfa_required) {
@@ -708,16 +598,13 @@ CloudPortalPresentation cloud_portal_presentation(const BambuCloudSnapshot& clou
   return presentation;
 }
 
-bool cloud_login_still_pending(const BambuCloudSnapshot& snapshot) {
-  if (!snapshot.configured || cloud_portal_ready(snapshot) || snapshot.verification_required ||
-      snapshot.tfa_required) {
-    return false;
-  }
 
-  return snapshot.setup_stage != CloudSetupStage::kFailed;
-}
 
 void append_cloud_status_fields(std::string* body, const BambuCloudSnapshot& cloud) {
+  *body += ",\"cloud_operation_id\":" + std::to_string(cloud.operation_id);
+  *body += ",\"cloud_http_status\":" + std::to_string(cloud.http_status);
+  *body += ",\"cloud_http_failure\":\"" + json_escape(cloud.http_failure) + "\"";
+
   if (body == nullptr) {
     return;
   }
@@ -812,7 +699,7 @@ void append_mqtt_telemetry_fields(std::string* body, const MqttTelemetry& local,
 
 void SetupPortal::request_unlock_pin() {
   const uint64_t current_ms = now_ms();
-  std::lock_guard<std::mutex> lock(access_mutex_);
+  std::lock_guard<std::recursive_mutex> lock(access_mutex_);
   prune_access_state_locked(current_ms);
   if (!is_lock_required()) {
     unlock_pin_.clear();
@@ -829,7 +716,7 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
   const bool lock_enabled = is_lock_enabled();
   const bool lock_required = is_lock_required();
   const uint64_t current_ms = now_ms();
-  std::lock_guard<std::mutex> lock(access_mutex_);
+  std::lock_guard<std::recursive_mutex> lock(access_mutex_);
   prune_access_state_locked(current_ms);
 
   PortalAccessSnapshot snapshot;
@@ -867,19 +754,7 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
                         duration_text(std::max<uint32_t>(grace_remaining_s, 1U)) +
                         " after initial setup. Finish your configuration now.";
     } else {
-      switch (config_store_.load_source_mode()) {
-        case SourceMode::kCloudOnly:
-          snapshot.detail = "Web Config is open until Bambu Cloud is connected.";
-          break;
-        case SourceMode::kLocalOnly:
-          snapshot.detail = "Web Config is open until the local printer path is connected.";
-          break;
-        case SourceMode::kHybrid:
-        default:
-          snapshot.detail =
-              "Web Config is open until either Bambu Cloud or the local printer path is connected.";
-          break;
-      }
+      snapshot.detail = "Web Config is open for the first printer setup.";
     }
   } else if (snapshot.pin_active) {
     snapshot.detail =
@@ -900,80 +775,42 @@ PortalAccessSnapshot SetupPortal::access_snapshot(bool request_authorized) {
 }
 
 bool SetupPortal::is_provisioning_complete() const {
-  if (wifi_manager_.is_setup_access_point_active() || !wifi_manager_.is_station_connected()) {
-    return false;
-  }
-
-  const SourceMode source_mode = config_store_.load_source_mode();
-  const PrinterSnapshot local = printer_client_.snapshot();
-  const BambuCloudSnapshot cloud = cloud_client_.snapshot();
-  const bool local_connected = local.connection == PrinterConnectionState::kOnline;
-  const bool cloud_connected = cloud_portal_ready(cloud);
-
-  switch (source_mode) {
-    case SourceMode::kCloudOnly:
-      return cloud_connected;
-    case SourceMode::kLocalOnly:
-      return local_connected;
-    case SourceMode::kHybrid:
-    default:
-      return cloud_connected || local_connected;
-  }
+  return config_store_.load_portal_provisioned();
 }
 
 void SetupPortal::prune_access_state_locked(uint64_t current_ms) {
   if (unlock_pin_expiry_ms_ != 0 && current_ms >= unlock_pin_expiry_ms_) {
-    unlock_pin_.clear();
-    unlock_pin_expiry_ms_ = 0;
+    unlock_pin_.clear(); unlock_pin_expiry_ms_ = 0;
   }
   if (session_expiry_ms_ != 0 && current_ms >= session_expiry_ms_) {
-    session_token_.clear();
-    session_expiry_ms_ = 0;
+    session_token_.clear(); session_expiry_ms_ = 0;
   }
 }
-
 std::string SetupPortal::generate_unlock_pin() {
   char buffer[7] = {};
-  std::snprintf(buffer, sizeof(buffer), "%06u",
-                static_cast<unsigned int>(esp_random() % 1000000U));
+  std::snprintf(buffer, sizeof(buffer), "%06u", static_cast<unsigned>(esp_random() % 1000000U));
   return buffer;
 }
-
 std::string SetupPortal::generate_session_token() {
   char buffer[33] = {};
-  std::snprintf(buffer, sizeof(buffer), "%08x%08x%08x%08x",
-                static_cast<unsigned int>(esp_random()),
-                static_cast<unsigned int>(esp_random()),
-                static_cast<unsigned int>(esp_random()),
-                static_cast<unsigned int>(esp_random()));
+  std::snprintf(buffer, sizeof(buffer), "%08x%08x%08x%08x", static_cast<unsigned>(esp_random()),
+                static_cast<unsigned>(esp_random()), static_cast<unsigned>(esp_random()),
+                static_cast<unsigned>(esp_random()));
   return buffer;
 }
-
 bool SetupPortal::is_lock_required() const {
-  if (wifi_manager_.is_setup_access_point_active()) {
-    return false;
-  }
-
-  if (!is_lock_enabled()) {
-    return false;
-  }
-
+  if (!is_lock_enabled()) return false;
+  std::lock_guard<std::recursive_mutex> lock(access_mutex_);
   if (!is_provisioning_complete()) {
-    return false;
+    const bool configured = config_store_.load_cloud_credentials().has_identity() ||
+                            config_store_.load_printer_profile_count() > 0;
+    if (!configured) return false;
+    // The initial wizard gets a single boot-local grace window. Subsequent
+    // boots, AP fallback and transport failures never grant access.
+    if (config_store_.mark_portal_provisioned() != ESP_OK) return true;
+    provisioning_grace_expiry_ms_ = now_ms() + kPortalProvisioningGraceMs;
   }
-
-  // Grace period: keep portal open for a few minutes after first provisioning
-  const uint64_t current_ms = now_ms();
-  if (provisioning_grace_expiry_ms_ == 0) {
-    provisioning_grace_expiry_ms_ = current_ms + kPortalProvisioningGraceMs;
-    ESP_LOGI(kTag, "Provisioning complete — portal grace period active for %u s",
-             static_cast<unsigned>(kPortalProvisioningGraceMs / 1000ULL));
-  }
-  if (current_ms < provisioning_grace_expiry_ms_) {
-    return false;
-  }
-
-  return true;
+  return policy::portal_requires_lock(true, true, provisioning_grace_expiry_ms_, now_ms());
 }
 
 bool SetupPortal::is_lock_enabled() const { return config_store_.load_portal_lock_enabled(); }
@@ -989,7 +826,7 @@ bool SetupPortal::is_request_authorized(httpd_req_t* request) {
   }
 
   const uint64_t current_ms = now_ms();
-  std::lock_guard<std::mutex> lock(access_mutex_);
+  std::lock_guard<std::recursive_mutex> lock(access_mutex_);
   prune_access_state_locked(current_ms);
   return !session_token_.empty() && presented == session_token_;
 }
@@ -1012,6 +849,7 @@ esp_err_t SetupPortal::send_unlock_page(httpd_req_t* request) {
   const std::string clear_cookie = session_cookie_header("", 0);
 
   std::string html;
+  html.reserve(56 * 1024);
   html.reserve(5000);
   html += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
   html += "<title>PrintSphere Unlock</title><style>";
@@ -1050,7 +888,7 @@ esp_err_t SetupPortal::start() {
   config.server_port = 80;
   config.stack_size = 12288;  // 8192 was too small — handle_root builds ~40KB HTML on the stack
   // Leave some headroom for portal endpoints so feature additions do not silently exhaust slots.
-  config.max_uri_handlers = 32;
+  config.max_uri_handlers = 40;
   config.recv_wait_timeout = 30;
 
   ESP_RETURN_ON_ERROR(httpd_start(&server_, &config), kTag, "httpd_start failed");
@@ -1213,6 +1051,13 @@ esp_err_t SetupPortal::start() {
   cloud_connect_uri.user_ctx = this;
   ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &cloud_connect_uri), kTag,
                       "cloud connect handler failed");
+
+  httpd_uri_t cloud_token_uri = {};
+  cloud_token_uri.uri = "/api/cloud/token";
+  cloud_token_uri.method = HTTP_POST;
+  cloud_token_uri.handler = &SetupPortal::handle_cloud_token;
+  cloud_token_uri.user_ctx = this;
+  ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server_, &cloud_token_uri), kTag, "cloud token handler failed");
 
   httpd_uri_t cloud_verify_uri = {};
   cloud_verify_uri.uri = "/api/cloud/verify";
@@ -1489,7 +1334,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
       bat_policy.dim_enabled || bat_policy.screen_off_enabled ? "info" : "idle";
   const PowerSnapshot power = portal->pmu_manager_.sample();
   std::string html;
-  html.reserve(48U * 1024U);
+  html.reserve(56 * 1024);
 
   const auto add_badge = [](std::string* html, const char* id, const std::string& label,
                             const std::string& value, const char* state_class) {
@@ -1750,6 +1595,11 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
     html += html_escape(cloud_code_placeholder);
     html += "\"></div>";
     html += "<div class=\"field\"><label>&nbsp;</label><button type=\"button\" class=\"secondary\" id=\"verify-button\">Submit Code</button></div>";
+    html += "<details><summary>Use an existing cloud session (advanced)</summary>"
+            "<p class=\"micro\">If account sign-in is blocked, you can import an access token from your own existing session. The token is never shown again.</p>"
+            "<input id=\"cloud_access_token\" type=\"password\" autocomplete=\"off\" maxlength=\"7000\" aria-label=\"Cloud access token\">"
+            "<button type=\"button\" class=\"secondary\" id=\"cloud-token-button\">Import session</button></details>";
+
     html += "</div>";
     html += "<p class=\"micro";
     if (!cloud_snapshot.verification_required) {
@@ -2493,7 +2343,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "portalTimerInterval=setInterval(updatePortalTimer,1000);updatePortalTimer();}"
           "else if(portalTimerSeconds<=0&&portalTimerInterval){"
           "clearInterval(portalTimerInterval);portalTimerInterval=null;updatePortalTimer();}}";
-  html += "let cloudFollowupTimer=null;";
+  html += "let cloudFollowupTimer=null;let cloudOperation=0;";
   html += "let cloudFollowupUntil=0;";
   html += "let cloudFollowupDetail='';";
   html += "let localFollowupTimer=null;";
@@ -2586,11 +2436,12 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else if(wifiScanDetail){wifiScanDetail.textContent=body.error||'Wi-Fi scan failed right now.';}}"
           "catch(error){if(wifiScanDetail){wifiScanDetail.textContent='Wi-Fi scan request failed.';}}"
           "finally{wifiScanInFlight=false;if(wifiScanButton){wifiScanButton.disabled=false;}}}";
+  html += "function htmlText(v){return String(v==null?'':v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}";
   html += "function setBadge(id,label,value,stateClass){const badge=document.getElementById(id);if(!badge)return;"
-          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+label+'</span><span class=\"badge-value\">'+value+'</span>';}"
+          "badge.className='badge '+stateClass;badge.innerHTML='<span class=\"badge-label\">'+htmlText(label)+'</span><span class=\"badge-value\">'+htmlText(value)+'</span>';}"
           "function setPill(id,value,stateClass){const p=document.getElementById(id);if(!p)return;"
           "p.className='summary-pill '+stateClass;p.textContent=value;}"; 
-  html += "function renderCloudStatus(body){"
+  html += "function renderCloudStatus(body){if(body&&body.cloud_operation_id&&body.cloud_operation_id<cloudOperation)return;"
           "var cv='Not configured',cs='idle';"
           "if(body&&body.cloud_badge_value){cv=body.cloud_badge_value;cs=body.cloud_badge_state||'ok';}"
           "else{var st=cloudSetupStage(body);"
@@ -2615,7 +2466,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(body){updateCloudVerification(body);applyResolvedSerial(body);}"
           "var sr=cloudSessionLooksReady(body),xr=!!cloudResolvedSerial(body)||localSerialInputReady(),st2=cloudSetupStage(body);"
           "if(body&&(cloudStageIsCodeRequired(st2)||st2==='failed'||(sr&&xr))){stopCloudFollowup();}}";
-  html += "function applyHealthBody(body){if(!body)return null;"
+  html += "function applyHealthBody(body){if(!body)return null;if(body.cloud_operation_id&&body.cloud_operation_id<cloudOperation)return null;"
           "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
           "const wifiValue=body.wifi_connected?('Connected - '+(body.wifi_ip||'')):'Not connected';"
           "setBadge('wifi-badge','Wi-Fi',wifiValue,body.wifi_connected?'ok':'warn');"
@@ -2807,7 +2658,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "try{const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(buildPayload())});"
           "const body=await response.json().catch(()=>({}));"
           "if(response.ok){setStatus('Saved. Restarting ESP...','The connection will drop briefly during reboot.',30000);}"
-          "else{setStatus(body.error||'Saving failed','Please review the fields and try again.',8000);saveButton.disabled=false;}}"
+          "else{setStatus(body.error||'Saving failed',body.detail||'Please review the fields and try again.',8000);saveButton.disabled=false;}}"
           "catch(error){setStatus('Saving failed','The request to the ESP could not be completed.',8000);saveButton.disabled=false;}});";
   html += "document.addEventListener('keydown',function(e){if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.type!=='submit'){e.preventDefault();e.target.blur();}});";
   html += "{const pt=document.getElementById('portal-timer');if(pt){pt.addEventListener('click',extendSession);}}";
@@ -2968,7 +2819,7 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(!cloud_email){setStatus('Cloud credentials missing','Enter the Bambu email first.',5000);return;}"
           "stopCloudFollowup();cloudConnectButton.disabled=true;setStatus('Connecting cloud...','Saving credentials and starting the login now.',8000);"
           "try{const response=await fetch('/api/cloud/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_email,cloud_password,cloud_region,source_mode})});"
-          "const body=await response.json().catch(()=>({}));renderCloudStatus(body);"
+          "const body=await response.json().catch(()=>({}));cloudOperation=body.cloud_operation_id||cloudOperation;renderCloudStatus(body);"
           "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
           "if(response.ok){savedConfig.cloud_email=cloud_email;savedConfig.cloud_region=cloud_region;"
           "savedConfig.cloud_password_saved=!!cloud_password||savedConfig.cloud_password_saved;"
@@ -2992,20 +2843,29 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "else{const detail=body.detail||'Waiting for local printer response...';setStatus('Local path started',detail,4000);startLocalFollowup(detail,12000);schedulePortalReload(2000);}}"
           "else{setStatus(body.error||'Local connect failed',body.detail||'Please review the local printer fields and try again.',8000);}}"
           "catch(error){setStatus('Local request failed','The request to the ESP did not complete successfully.',7000);}finally{localConnectButton.disabled=false;updateHealth();}});}";
+  html += "const tokenButton=document.getElementById('cloud-token-button');if(tokenButton){tokenButton.addEventListener('click',async()=>{"
+          "const field=document.getElementById('cloud_access_token');const access_token=field.value.trim();"
+          "const cloud_email=trimmedValue('cloud_email'),cloud_region=valueOf('cloud_region')||'eu';"
+          "if(!access_token||!cloud_email){setStatus('Session details missing','Enter your account and access token.',6000);return;}"
+          "tokenButton.disabled=true;try{const r=await fetch('/api/cloud/token',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({access_token,cloud_email,cloud_region})});field.value='';const body=await r.json().catch(()=>({}));"
+          "if(r.ok){cloudOperation=body.cloud_operation_id||cloudOperation;startCloudFollowup('Checking imported session...',20000);}"
+          "else{setStatus('Session import failed',body.error||'Review the session details.',8000);}}"
+          "catch(e){setStatus('Session import failed','Could not reach PrintSphere.',8000);}finally{field.value='';tokenButton.disabled=false;}});}";
   html += "if(verifyButton){verifyButton.addEventListener('click',async()=>{const code=trimmedValue('cloud_verification_code');"
           "if(!code){setStatus('Cloud code missing','Please enter the requested code first.',5000);return;}"
           "stopCloudFollowup();verifyButton.disabled=true;setStatus('Connecting cloud...','Completing the cloud login now.',8000);"
           "try{const response=await fetch('/api/cloud/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});"
-          "const body=await response.json().catch(()=>({}));renderCloudStatus(body);"
+          "const body=await response.json().catch(()=>({}));cloudOperation=body.cloud_operation_id||cloudOperation;renderCloudStatus(body);"
           "if(body.cloud_badge_value){setBadge('cloud-badge','Cloud',body.cloud_badge_value,body.cloud_badge_state||'ok');}"
           "if(response.ok){"
           "const stage=cloudSetupStage(body);"
           "if(body.cloud_connected||cloudSessionLooksReady(body)){setStatus('Cloud connected',body.detail||body.cloud_detail||'Connected to Bambu Cloud.',7000);if(!cloudSuccessReloadScheduled){cloudSuccessReloadScheduled=true;schedulePortalReload(350);}}"
           "else if(cloudStageIsCodeRequired(stage)){setStatus(stage==='tfa_required'?'2FA required':'Verification code required',body.detail||body.cloud_detail||'Please check the code and try again.',8000);}"
-          "else if(stage==='failed'){setStatus('Cloud code was rejected',body.detail||body.cloud_detail||'Please check the code and try again.',7000);}"
+          "else if(stage==='failed'){setStatus('Cloud verification failed',body.detail||body.cloud_detail||'Please check the code and try again.',7000);}"
           "else{const detail=body.detail||body.cloud_detail||'The cloud accepted the code and is finishing login now.';setStatus(cloudStageStatusLabel(stage),detail,4000);startCloudFollowup(detail,15000);}"
           "const codeInput=document.getElementById('cloud_verification_code');if(codeInput){codeInput.value='';}}"
-          "else{setStatus(body.error||'Cloud code was rejected',body.detail||'Please check the code and try again.',7000);}}"
+          "else{setStatus(body.error||'Cloud verification failed',body.detail||'Please check the code and try again.',7000);}}"
           "catch(error){setStatus('Cloud request failed','The request to the ESP did not complete successfully.',7000);}finally{verifyButton.disabled=false;if(!cloudSuccessReloadScheduled){await forceHealthRefresh();}}});}"; 
   html += "if(wifiSsidSelect){wifiSsidSelect.addEventListener('change',()=>{if(wifiSsidSelect.value==='__manual__'){if(wifiSsidScanField){wifiSsidScanField.style.display='none';}if(wifiSsidManualField){wifiSsidManualField.style.display='';}var inp=document.getElementById('wifi_ssid');if(inp){inp.focus();}return;}if(wifiSsidSelect.value){const wifiInput=document.getElementById('wifi_ssid');if(wifiInput){wifiInput.value=wifiSsidSelect.value;}}});}";  
   html += "if(wifiScanButton){wifiScanButton.addEventListener('click',refreshWifiScan);}";
@@ -3051,11 +2911,11 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "cloud.forEach(cd=>{"
           "const card=document.createElement('div');card.className='printer-card cloud-only';card.dataset.serial=cd.serial;"
           "const name=cd.display_name||cd.model||cd.serial;"
-          "card.innerHTML=\'<div class=\"printer-card-header\"><strong>\'+name+\'</strong><span class=\"summary-pill info\">Cloud only</span></div>\'"
-          "+\'<div class=\"printer-card-body\"><span class=\"printer-tag\">\'+(cd.model||\'\')+\'</span>\'"
+          "card.innerHTML=\'<div class=\"printer-card-header\"><strong>\'+htmlText(name)+\'</strong><span class=\"summary-pill info\">Cloud only</span></div>\'"
+          "+\'<div class=\"printer-card-body\"><span class=\"printer-tag\">\'+htmlText(cd.model||\'\')+\'</span>\'"
           "+\'<span class=\"printer-tag\">\'+( cd.online?\"Online\":\"Offline\")+\'</span>\'"
-          "+\'<span class=\"printer-tag\">\'+(cd.serial||\'\').substring(0,6)+\'...</span></div>\'"
-          "+\'<div class=\"printer-card-actions\"><button type=\"button\" class=\"secondary printer-add-cloud-btn\" data-serial=\"\'+cd.serial+\'\" data-name=\"\'+( cd.display_name||\'\')+\'\" data-model=\"\'+( cd.model||\'\')+\'\">Add to Profiles</button></div>\';"
+          "+\'<span class=\"printer-tag\">\'+htmlText((cd.serial||\'\').substring(0,6))+\'...</span></div>\'"
+          "+\'<div class=\"printer-card-actions\"><button type=\"button\" class=\"secondary printer-add-cloud-btn\" data-serial=\"\'+htmlText(cd.serial)+\'\" data-name=\"\'+htmlText(cd.display_name||\'\')+\'\" data-model=\"\'+htmlText(cd.model||\'\')+\'\">Add to Profiles</button></div>\';"
           "list.appendChild(card);});"
           "list.querySelectorAll('.printer-add-cloud-btn').forEach(b=>{"
           "b.addEventListener('click',async()=>{"
@@ -3167,6 +3027,10 @@ esp_err_t SetupPortal::handle_root(httpd_req_t* request) {
           "if(otaUrlBar)otaUrlBar.style.width='100%';"
           "if(otaUrlStatus)otaUrlStatus.textContent='Flash successful \u2014 device is restarting...';"
           "setStatus('Firmware flashed','PrintSphere is rebooting to the new firmware now.',60000);"
+          "}else if(b.state==='restart_required'){"
+          "if(otaUrlBar)otaUrlBar.style.width='100%';"
+          "if(otaUrlStatus)otaUrlStatus.textContent=b.error;"
+          "setStatus('Firmware installed','Restart PrintSphere manually to activate the update.',0);"
           "}else if(b.state==='failed'){"
           "if(otaUrlStatus)otaUrlStatus.textContent='Flash failed: '+(b.error||'unknown error');"
           "if(otaUrlBtn)otaUrlBtn.disabled=false;"
@@ -3277,6 +3141,43 @@ esp_err_t SetupPortal::handle_health(httpd_req_t* request) {
     append_mqtt_telemetry_fields(&body, portal->printer_client_.mqtt_telemetry(),
                                  portal->cloud_client_.mqtt_telemetry());
   }
+  // These counters contain no account or portal secrets. They remain readable
+  // while locked, so a stalled display cannot prevent obtaining diagnostics.
+  // No LVGL mutex is acquired. Durations are microseconds, not FPS.
+  const auto& ui = portal->ui_;
+  const int64_t current_us = esp_timer_get_time();
+  const int64_t phase_since = ui.work_phase_since_us();
+  const int64_t frame_at = ui.last_frame_us();
+  body += ",\"ui_performance\":{\"phase\":\"";
+  body += ui_work_phase_name(ui.work_phase());
+  body += "\",\"phase_age_ms\":" + std::to_string(phase_since > 0 ? std::max<int64_t>(0, current_us - phase_since) / 1000 : 0);
+  body += ",\"last_frame_age_ms\":" + std::to_string(frame_at > 0 ? std::max<int64_t>(0, current_us - frame_at) / 1000 : -1);
+  body += ",\"display_output_phase\":\"";
+  body += ui.display_output_phase();
+  const auto output_since = ui.display_output_since_us();
+  body += "\",\"display_output_age_ms\":" + std::to_string(output_since > 0 ? std::max<int64_t>(0, current_us - output_since) / 1000 : 0);
+  body += ",\"power_mode\":" + std::to_string(static_cast<int>(ui.screen_power_mode()));
+  body += ",\"scrolling\":";
+  body += ui.is_page_transition_active() ? "true" : "false";
+  body += ",\"pending_snapshot\":";
+  body += ui.has_pending_snapshot() ? "true" : "false";
+  body += ",\"dma_free_bytes\":" + std::to_string(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  body += ",\"dma_largest_bytes\":" + std::to_string(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  if (auto report = ui.performance_snapshot()) {
+    body += ",\"window_ms\":" + std::to_string(report->window_ms);
+    auto append_timing = [&](const char* name, const UiTimingSummary& timing) {
+      body += ",\""; body += name; body += "\":{\"samples\":" + std::to_string(timing.samples);
+      body += ",\"mean_us\":" + std::to_string(timing.mean_us);
+      body += ",\"p95_upper_us\":" + std::to_string(timing.p95_upper_us);
+      body += ",\"max_us\":" + std::to_string(timing.max_us) + "}";
+    };
+    append_timing("render_cycle_including_flush", report->render_cycle);
+    append_timing("flush_callback", report->flush_callback);
+    append_timing("flush_wait", report->flush_wait);
+    append_timing("widget_update", report->widget_update);
+    append_timing("scroll_render_cycle", report->scroll_render_cycle);
+  }
+  body += "}";
   body += "}";
 
   send_json(request, body);
@@ -3315,7 +3216,7 @@ esp_err_t SetupPortal::handle_unlock(httpd_req_t* request) {
   const uint64_t current_ms = now_ms();
   bool unlocked = false;
   {
-    std::lock_guard<std::mutex> lock(portal->access_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(portal->access_mutex_);
     portal->prune_access_state_locked(current_ms);
     if (!portal->unlock_pin_.empty() && pin == portal->unlock_pin_) {
       portal->session_token_ = generate_session_token();
@@ -3357,7 +3258,7 @@ esp_err_t SetupPortal::handle_session_extend(httpd_req_t* request) {
   uint32_t remaining_s = 0;
   {
     const uint64_t current_ms = now_ms();
-    std::lock_guard<std::mutex> lock(portal->access_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(portal->access_mutex_);
     portal->prune_access_state_locked(current_ms);
     if (!portal->session_token_.empty()) {
       // Locked session: extend the session token expiry
@@ -3647,9 +3548,7 @@ esp_err_t SetupPortal::handle_config_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Settings were saved, but the restart task could not be started. Restart the device manually.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3730,9 +3629,7 @@ esp_err_t SetupPortal::handle_source_mode_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Connection mode was saved, but the restart task could not be started.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3763,9 +3660,7 @@ esp_err_t SetupPortal::handle_display_rotation_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Display rotation was saved, but the restart task could not be started.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3826,9 +3721,7 @@ esp_err_t SetupPortal::handle_battery_display_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Power settings were saved, but the restart task could not be started.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3861,9 +3754,7 @@ esp_err_t SetupPortal::handle_portal_access_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"Portal access was saved, but the restart task could not be started.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -3900,9 +3791,7 @@ esp_err_t SetupPortal::handle_ams_display_post(httpd_req_t* request) {
 
   if (!portal->schedule_reboot()) {
     httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"status\":\"saved\",\"rebooting\":false,\"detail\":\"AMS display settings were saved, but the restart task could not be started.\"}");
-    return ESP_OK;
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Settings saved. Restart the device manually.\"}");
   }
 
   send_json(request, "{\"status\":\"saved\",\"rebooting\":true}");
@@ -4096,84 +3985,6 @@ esp_err_t receive_binary_body(httpd_req_t* request, std::vector<uint8_t>& out,
   return ESP_OK;
 }
 
-bool pcm_upload_is_playable(const std::vector<int16_t>& samples) {
-  if (samples.size() < kMinUploadPcmSamples) {
-    return false;
-  }
-  int peak = 0;
-  for (const int16_t sample : samples) {
-    const int value = sample < 0 ? -static_cast<int>(sample) : static_cast<int>(sample);
-    if (value > peak) {
-      peak = value;
-    }
-  }
-  return peak >= kMinUploadPcmPeak;
-}
-
-// Minimal RIFF/WAV parser. Accepts only mono 16-bit 16 kHz PCM WAV.
-// Extracts the raw int16_t samples into `samples_out`.
-bool parse_wav_pcm(const uint8_t* data, size_t len, std::vector<int16_t>& samples_out,
-                   std::string& error_out) {
-  if (len < 44) { error_out = "file too small"; return false; }
-  if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
-    error_out = "not a WAV file";
-    return false;
-  }
-
-  uint16_t audio_format = 0, channels = 0, bits_per_sample = 0;
-  uint32_t sample_rate = 0;
-  const uint8_t* pcm_data = nullptr;
-  size_t pcm_bytes = 0;
-
-  size_t pos = 12;
-  while (pos <= len && len - pos >= 8) {
-    uint32_t chunk_size = 0;
-    std::memcpy(&chunk_size, data + pos + 4, 4);
-    const size_t available = len - pos - 8;
-    if (static_cast<size_t>(chunk_size) > available) {
-      error_out = "truncated WAV chunk";
-      return false;
-    }
-    if (std::memcmp(data + pos, "fmt ", 4) == 0 && chunk_size >= 16) {
-      std::memcpy(&audio_format, data + pos + 8, 2);
-      std::memcpy(&channels, data + pos + 10, 2);
-      std::memcpy(&sample_rate, data + pos + 12, 4);
-      std::memcpy(&bits_per_sample, data + pos + 22, 2);
-    } else if (std::memcmp(data + pos, "data", 4) == 0) {
-      pcm_data = data + pos + 8;
-      pcm_bytes = static_cast<size_t>(chunk_size);
-    }
-    const size_t padded_size = static_cast<size_t>(chunk_size) + (chunk_size & 1U);
-    if (padded_size > available) {
-      // A final odd-sized chunk may omit its optional RIFF padding byte.
-      if ((chunk_size & 1U) == 0U || static_cast<size_t>(chunk_size) != available) {
-        error_out = "truncated WAV padding";
-        return false;
-      }
-      pos = len;
-    } else {
-      pos += 8 + padded_size;
-    }
-  }
-
-  if (pcm_data == nullptr) { error_out = "data chunk not found"; return false; }
-  if (audio_format != 1)   { error_out = "only PCM WAV supported (format=1)"; return false; }
-  if (channels != 1)       { error_out = "only mono WAV supported (channels=1)"; return false; }
-  if (sample_rate != 16000) { error_out = "only 16000 Hz WAV supported"; return false; }
-  if (bits_per_sample != 16) { error_out = "only 16-bit WAV supported"; return false; }
-
-  const size_t sample_count = pcm_bytes / sizeof(int16_t);
-  if (sample_count == 0) { error_out = "empty audio data"; return false; }
-
-  samples_out.resize(sample_count);
-  std::memcpy(samples_out.data(), pcm_data, sample_count * sizeof(int16_t));
-  if (!pcm_upload_is_playable(samples_out)) {
-    samples_out.clear();
-    error_out = "audio too short or silent";
-    return false;
-  }
-  return true;
-}
 
 }  // namespace
 
@@ -4189,7 +4000,7 @@ esp_err_t SetupPortal::handle_audio_upload(httpd_req_t* request) {
 
   // Optional display name from the "name" query param (already trimmed to 7 chars by the client).
   std::string display_name = uri_query_str(request, "name");
-  if (display_name.size() > 8) display_name.resize(8);  // hard cap server-side
+  if (display_name.size() > 8) display_name = utf8_truncate_chars(display_name, 8);  // hard cap server-side
 
   std::vector<uint8_t> body;
   esp_err_t recv_err = receive_binary_body(request, body, kMaxWavBody);
@@ -4197,7 +4008,7 @@ esp_err_t SetupPortal::handle_audio_upload(httpd_req_t* request) {
 
   std::vector<int16_t> samples;
   std::string parse_error;
-  if (!parse_wav_pcm(body.data(), body.size(), samples, parse_error)) {
+  if (!parse_wav_pcm(body.data(), body.size(), samples, parse_error, kMinUploadPcmSamples, kMinUploadPcmPeak)) {
     ESP_LOGW(kTag, "WAV parse failed for event %d: %s", event_idx, parse_error.c_str());
     std::string err_json = "{\"error\":\"Invalid WAV: ";
     err_json += parse_error;
@@ -4321,40 +4132,40 @@ esp_err_t SetupPortal::handle_cloud_connect(httpd_req_t* request) {
   }
   portal->cloud_client_.request_reload_from_store();
 
-  const BambuCloudSnapshot before = portal->cloud_client_.snapshot();
-  BambuCloudSnapshot current = before;
-  for (int attempt = 0; attempt < 60; ++attempt) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-    current = portal->cloud_client_.refreshed_snapshot();
-    if (cloud_connect_result_ready(before, current)) {
-      break;
-    }
-  }
-
-  const bool login_still_pending = cloud_login_still_pending(current);
-  if (current.setup_stage == CloudSetupStage::kFailed) {
-    httpd_resp_set_status(request, "502 Bad Gateway");
-  }
-
-  std::string body = "{\"status\":\"";
-  if (cloud_portal_ready(current)) {
-    body += "connected";
-  } else if (current.verification_required) {
-    body += "verification_required";
-  } else if (current.setup_stage == CloudSetupStage::kFailed) {
-    body += "failed";
-  } else if (login_still_pending) {
-    body += "queued";
-  } else {
-    body += "saved";
-  }
-  body += "\",\"detail\":\"";
-  body += json_escape(current.detail);
-  body += "\"";
+  httpd_resp_set_status(request, "202 Accepted");
+  BambuCloudSnapshot current;
+  current.configured = true;
+  current.setup_stage = CloudSetupStage::kLoggingIn;
+  current.operation_id = portal->cloud_client_.operation_id();
+  current.detail = "Cloud login queued";
+  std::string body = "{\"status\":\"queued\"";
   append_cloud_status_fields(&body, current);
   body += "}";
   send_json(request, body);
   return ESP_OK;
+}
+
+esp_err_t SetupPortal::handle_cloud_token(httpd_req_t* request) {
+  auto* portal = static_cast<SetupPortal*>(request->user_ctx);
+  if (!portal) return ESP_FAIL;
+  if (!portal->is_request_authorized(request)) return portal->send_locked_response(request);
+  cJSON* root = nullptr;
+  const esp_err_t error = receive_json_body(request, &root);
+  if (error != ESP_OK) return error;
+  const std::string token = read_string_field(root, "access_token");
+  BambuCloudCredentials owner{trim_copy(read_string_field(root, "cloud_email")), {},
+      parse_cloud_region(read_string_field(root, "cloud_region"))};
+  cJSON_Delete(root);
+  if (owner.email.empty() || token.size() < 16 || token.size() > 7000 ||
+      token.find_first_of(" \t\r\n") != std::string::npos) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid account or session token");
+  }
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_cloud_credentials(owner), kTag, "save session account failed");
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_cloud_access_token(token, 0, &owner), kTag, "save session token failed");
+  portal->cloud_client_.request_reload_from_store();
+  httpd_resp_set_status(request, "202 Accepted");
+  return send_json(request, "{\"status\":\"queued\",\"cloud_operation_id\":" +
+      std::to_string(portal->cloud_client_.operation_id()) + "}");
 }
 
 esp_err_t SetupPortal::handle_cloud_verify(httpd_req_t* request) {
@@ -4378,53 +4189,18 @@ esp_err_t SetupPortal::handle_cloud_verify(httpd_req_t* request) {
     return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "verification code missing");
   }
 
-  BambuCloudSnapshot snapshot = portal->cloud_client_.snapshot();
-  const std::string previous_detail = snapshot.detail;
-  const std::string previous_resolved_serial = snapshot.resolved_serial;
-  const bool previous_connected = snapshot.connected;
-  const bool previous_session_connected = snapshot.session_connected;
-  const bool previous_verification_required = snapshot.verification_required;
-  const bool previous_configured = snapshot.configured;
-  const CloudSetupStage previous_setup_stage = snapshot.setup_stage;
-  BambuCloudSnapshot previous_snapshot;
-  previous_snapshot.configured = previous_configured;
-  previous_snapshot.connected = previous_connected;
-  previous_snapshot.session_connected = previous_session_connected;
-  previous_snapshot.setup_stage = previous_setup_stage;
-  previous_snapshot.detail = previous_detail;
-  previous_snapshot.resolved_serial = previous_resolved_serial;
-  previous_snapshot.verification_required = previous_verification_required;
-
+  const BambuCloudSnapshot before = portal->cloud_client_.snapshot();
+  if (!before.verification_required || before.setup_stage == CloudSetupStage::kCodeSubmitted) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "No challenge is waiting for a code");
+  }
+  if (code.size() != 6 || code.find_first_not_of("0123456789") != std::string::npos) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected a six-digit code");
+  }
   portal->cloud_client_.submit_verification_code(code);
-  for (int attempt = 0; attempt < 80; ++attempt) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-    snapshot = portal->cloud_client_.refreshed_snapshot();
-    if (cloud_verify_result_ready(previous_snapshot, snapshot)) {
-      break;
-    }
-  }
-
-  const bool login_still_pending = cloud_login_still_pending(snapshot);
-  if (snapshot.verification_required) {
-    httpd_resp_set_status(request, "409 Conflict");
-  } else if (snapshot.setup_stage == CloudSetupStage::kFailed ||
-             (!cloud_portal_ready(snapshot) && !login_still_pending)) {
-    httpd_resp_set_status(request, "502 Bad Gateway");
-  }
-
-  std::string body = "{\"status\":\"";
-  if (cloud_portal_ready(snapshot)) {
-    body += "connected";
-  } else if (snapshot.verification_required) {
-    body += "verification_required";
-  } else if (login_still_pending) {
-    body += "queued";
-  } else {
-    body += "failed";
-  }
-  body += "\",\"detail\":\"";
-  body += json_escape(snapshot.detail);
-  body += "\"";
+  httpd_resp_set_status(request, "202 Accepted");
+  auto snapshot = portal->cloud_client_.snapshot();
+  snapshot.operation_id = portal->cloud_client_.operation_id();
+  std::string body = "{\"status\":\"queued\"";
   append_cloud_status_fields(&body, snapshot);
   body += "}";
   send_json(request, body);
@@ -4644,14 +4420,13 @@ esp_err_t SetupPortal::handle_printers_select(httpd_req_t* request) {
     return ESP_OK;
   }
 
-  portal->config_store_.save_active_printer_index(new_index);
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_active_printer_index(new_index), kTag,
+                      "save active printer failed");
 
   // Live-reconnect all clients
   const PrinterConnection conn = selected->to_connection();
-  if (conn.is_ready()) {
-    portal->printer_client_.configure(conn);
-    portal->camera_client_.configure(conn);
-  }
+  portal->printer_client_.configure(conn);
+  portal->camera_client_.configure(conn);
   const BambuCloudCredentials cloud_creds = portal->config_store_.load_cloud_credentials();
   portal->cloud_client_.configure(cloud_creds, selected->serial);
 
@@ -4719,7 +4494,8 @@ esp_err_t SetupPortal::handle_printers_save(httpd_req_t* request) {
       if (cd.serial == serial) { profile.cloud_bound = true; break; }
     }
   }
-  portal->config_store_.save_printer_profile(profile);
+  ESP_RETURN_ON_ERROR(portal->config_store_.save_printer_profile(profile), kTag,
+                      "save printer profile failed");
 
   std::string body = "{\"status\":\"saved\",\"index\":";
   body += std::to_string(profile.index);
@@ -4831,6 +4607,11 @@ esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
     return portal->send_locked_response(request);
   }
 
+  OtaLease lease(portal->ota_in_progress_);
+  if (!lease) {
+    httpd_resp_set_status(request, "409 Conflict");
+    return send_json(request, "{\"error\":\"Another firmware update is active\"}");
+  }
   const int total = request->content_len;
   if (total <= 0 || total > 8 * 1024 * 1024) {
     httpd_resp_set_status(request, "400 Bad Request");
@@ -4846,6 +4627,9 @@ esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
     return ESP_OK;
   }
 
+  if (static_cast<size_t>(total) > update_partition->size) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Firmware exceeds OTA partition");
+  }
   ESP_LOGI(kTag, "OTA upload: %d bytes -> partition '%s'", total, update_partition->label);
 
   esp_ota_handle_t ota_handle = 0;
@@ -4896,6 +4680,12 @@ esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
     return ESP_OK;
   }
 
+  esp_app_desc_t candidate = {};
+  if (esp_ota_get_partition_description(update_partition, &candidate) != ESP_OK ||
+      !firmware_matches(*esp_app_get_description(), candidate)) {
+    httpd_resp_set_status(request, "422 Unprocessable Entity");
+    return send_json(request, "{\"error\":\"Firmware is for a different board or partition layout\"}");
+  }
   err = esp_ota_set_boot_partition(update_partition);
   if (err != ESP_OK) {
     ESP_LOGE(kTag, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
@@ -4906,30 +4696,27 @@ esp_err_t SetupPortal::handle_ota_upload(httpd_req_t* request) {
     return ESP_OK;
   }
 
+  lease.keep_until_reboot();
   ESP_LOGI(kTag, "OTA upload complete: %d bytes written, scheduling reboot", received);
+  if (!portal->schedule_reboot()) {
+    httpd_resp_set_status(request, "503 Service Unavailable");
+    return send_json(request, "{\"status\":\"saved\",\"rebooting\":false,\"error\":\"Manual restart required\",\"detail\":\"Firmware installed. Restart the device manually.\"}");
+  }
   send_json(request, "{\"status\":\"success\",\"rebooting\":true}");
-  portal->schedule_reboot();
   return ESP_OK;
+}
+
+bool SetupPortal::schedule_reboot() {
+  const bool started = start_task_once(reboot_requested_, reboot_mutex_, [this] {
+    return xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, this, 4, nullptr) == pdPASS;
+  });
+  if (!started) ESP_LOGE(kTag, "Unable to create reboot task");
+  return started;
 }
 
 void SetupPortal::reboot_task(void*) {
   vTaskDelay(pdMS_TO_TICKS(1500));
   esp_restart();
-}
-
-bool SetupPortal::schedule_reboot() {
-  bool expected = false;
-  if (!reboot_requested_.compare_exchange_strong(expected, true)) {
-    return true;
-  }
-  const BaseType_t created =
-      xTaskCreate(&SetupPortal::reboot_task, "portal_reboot", 2048, this, 4, nullptr);
-  if (created != pdPASS) {
-    reboot_requested_.store(false);
-    ESP_LOGE(kTag, "Failed to create reboot task");
-    return false;
-  }
-  return true;
 }
 
 esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
@@ -4979,13 +4766,17 @@ esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
     return ESP_OK;
   }
 
+  if (!time_sync::clock_ready()) {
+    return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Waiting for network time (NTP)");
+  }
+  bool expected = false;
+  if (!portal->ota_in_progress_.compare_exchange_strong(expected, true)) {
+    httpd_resp_set_status(request, "409 Conflict");
+    return send_json(request, "{\"error\":\"Another firmware update is active\"}");
+  }
   {
     std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
-    if (portal->ota_url_status_.state == OtaUrlState::kDownloading) {
-      httpd_resp_set_status(request, "409 Conflict");
-      send_json(request, "{\"error\":\"OTA download already in progress\"}");
-      return ESP_OK;
-    }
+
     portal->ota_url_pending_ = url;
     portal->ota_url_status_.state = OtaUrlState::kDownloading;
     portal->ota_url_status_.progress_percent = 0;
@@ -4993,18 +4784,12 @@ esp_err_t SetupPortal::handle_ota_url(httpd_req_t* request) {
   }
 
   ESP_LOGI(kTag, "Starting OTA URL task: %s", url.c_str());
-  const BaseType_t created =
-      xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr);
-  if (created != pdPASS) {
-    {
-      std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
-      portal->ota_url_status_.state = OtaUrlState::kFailed;
-      portal->ota_url_status_.error = "Not enough memory to start OTA";
-    }
-    httpd_resp_set_status(request, "503 Service Unavailable");
-    send_json(request,
-              "{\"error\":\"OTA task unavailable\",\"detail\":\"Not enough memory to start the firmware download.\"}");
-    return ESP_OK;
+  if (xTaskCreate(&SetupPortal::ota_url_task, "ota_url", 8192, portal, 5, nullptr) != pdPASS) {
+    portal->ota_in_progress_ = false;
+    std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+    portal->ota_url_status_.state = OtaUrlState::kFailed;
+    portal->ota_url_status_.error = "Cannot start update task";
+    return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot start update task");
   }
 
   std::string body = "{\"status\":\"started\",\"url\":\"";
@@ -5053,7 +4838,10 @@ esp_err_t SetupPortal::handle_ota_status(httpd_req_t* request) {
 }
 
 void SetupPortal::ota_url_task(void* context) {
+  [context]() {
   auto* portal = static_cast<SetupPortal*>(context);
+  // Adopt the HTTP handler's update reservation.
+  OtaLease lease(portal->ota_in_progress_, true);
 
   std::string url;
   {
@@ -5081,7 +4869,8 @@ void SetupPortal::ota_url_task(void* context) {
       portal->ota_url_status_.state = OtaUrlState::kFailed;
       portal->ota_url_status_.error = esp_err_to_name(err);
     }
-    vTaskDelete(nullptr);
+    portal->ota_in_progress_ = false;
+    lease.keep_until_reboot();
     return;
   }
 
@@ -5107,10 +4896,22 @@ void SetupPortal::ota_url_task(void* context) {
       portal->ota_url_status_.error = (err != ESP_OK)
           ? std::string(esp_err_to_name(err)) : std::string("Incomplete download");
     }
-    vTaskDelete(nullptr);
+    portal->ota_in_progress_ = false;
+    lease.keep_until_reboot();
     return;
   }
 
+  esp_app_desc_t candidate = {};
+  if (esp_https_ota_get_img_desc(ota_handle, &candidate) != ESP_OK ||
+      !firmware_matches(*esp_app_get_description(), candidate)) {
+    esp_https_ota_abort(ota_handle);
+    { std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
+      portal->ota_url_status_.state = OtaUrlState::kFailed;
+      portal->ota_url_status_.error = "Firmware is for a different board or partition layout"; }
+    portal->ota_in_progress_ = false;
+    lease.keep_until_reboot();
+    return;
+  }
   err = esp_https_ota_finish(ota_handle);
   if (err != ESP_OK) {
     ESP_LOGE(kTag, "OTA URL finish failed: %s", esp_err_to_name(err));
@@ -5120,17 +4921,21 @@ void SetupPortal::ota_url_task(void* context) {
       portal->ota_url_status_.error =
           std::string("Firmware validation failed: ") + esp_err_to_name(err);
     }
-    vTaskDelete(nullptr);
+    portal->ota_in_progress_ = false;
+    lease.keep_until_reboot();
     return;
   }
 
   ESP_LOGI(kTag, "OTA URL complete, scheduling reboot");
+  lease.keep_until_reboot();
+  const bool restarting=portal->schedule_reboot();
   {
     std::lock_guard<std::mutex> lock(portal->ota_url_mutex_);
-    portal->ota_url_status_.state = OtaUrlState::kDone;
+    portal->ota_url_status_.state = restarting ? OtaUrlState::kDone : OtaUrlState::kRestartRequired;
     portal->ota_url_status_.progress_percent = 100;
+    if(!restarting) portal->ota_url_status_.error = "Firmware installed. Restart the device manually.";
   }
-  portal->schedule_reboot();
+  }();
   vTaskDelete(nullptr);
 }
 

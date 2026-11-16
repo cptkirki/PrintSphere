@@ -14,7 +14,7 @@ void set_timezone_iana(const std::string& iana_name);
 
 // Returns the IANA name that was last applied via set_timezone_iana(), or an
 // empty string when no zone has been configured yet.
-const std::string& current_iana();
+std::string current_iana();
 
 // Translate a known IANA zone to its POSIX TZ string. Returns an empty string
 // when the zone is not in the curated table.
@@ -28,5 +28,6 @@ std::vector<std::string_view> supported_iana_zones();
 // Start SNTP (idempotent). Should be invoked once an IP address has been
 // acquired so the system clock can sync against pool.ntp.org.
 void start_sntp_if_needed();
+bool clock_ready();
 
 }  // namespace printsphere::time_sync
