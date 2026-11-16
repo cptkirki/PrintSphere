@@ -6,7 +6,7 @@ It works directly with Bambu Cloud, the printer's local connection, or both. Hom
 
 <img width="400" height="300" alt="PrintSphere AMOLED display" src="https://github.com/user-attachments/assets/820c2e9b-10a7-4430-949c-e8b0adc1357d" /> <img width="400" height="300" alt="PrintSphere interface" src="https://github.com/user-attachments/assets/5923dc59-0123-4df1-b54d-673c6dbad23b" />
 
-Latest stable version: **v1.6.2**
+Latest stable version: **v1.7.5** fixed cloud login
 
 ## Supported hardware
 
