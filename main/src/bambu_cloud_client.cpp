@@ -1,3 +1,4 @@
+#include "printsphere/tls_io.hpp"
 #include "printsphere/utf8.hpp"
 #include "printsphere/bambu_cloud_client.hpp"
 
@@ -61,7 +62,7 @@ constexpr TickType_t kCloudStatusPollActive = pdMS_TO_TICKS(5000);
 constexpr TickType_t kCloudStatusPollLowPower = pdMS_TO_TICKS(180000);
 constexpr TickType_t kCloudInitialPreviewDelay = pdMS_TO_TICKS(8000);
 constexpr TickType_t kCloudPreviewWakePoll = pdMS_TO_TICKS(2000);
-constexpr TickType_t kCloudPreviewRetryBackoff = pdMS_TO_TICKS(30000);
+constexpr int64_t kCloudPreviewRetryBackoffUs = 30000000LL;
 constexpr int kCloudAuthRetryBackoffSeconds = 30;
 constexpr int64_t kCloudAuthRetryBackoffUs =
     static_cast<int64_t>(kCloudAuthRetryBackoffSeconds) * 1000000LL;
@@ -1449,7 +1450,7 @@ NozzleTemperatureBundle extract_cloud_nozzle_temperature_bundle(const cJSON* ite
     const cJSON* extruder_state = cJSON_GetObjectItemCaseSensitive(child_object_local(device, "extruder"), "state");
     const int active_nozzle_index = extruder_state ? extract_active_nozzle_index(device) : previous_nozzle;
     bundle.active_nozzle_index = active_nozzle_index;
-    const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
+    const int merge_index = active_nozzle_index;
     merge_nozzle_temperature_patch(child_array_local(child_object_local(device, "nozzle"), "info"),
                                  merge_index, &bundle.active, &bundle.active_present,
                                  &bundle.secondary, &bundle.secondary_present);
@@ -3342,7 +3343,7 @@ void BambuCloudClient::task_entry(void* context) {
 void BambuCloudClient::task_loop() {
   const TickType_t task_start_tick = xTaskGetTickCount();
   TickType_t last_preview_fetch_tick = 0;
-  TickType_t preview_retry_not_before_tick = 0;
+  int64_t preview_retry_not_before_us = 0;
   bool last_preview_fetch_enabled = false;
   bool last_preview_active_print = false;
   bool preview_refresh_pending = true;
@@ -3371,7 +3372,7 @@ void BambuCloudClient::task_loop() {
       }
       apply_configuration(std::move(credentials), std::move(printer_serial));
       last_preview_fetch_tick = 0;
-      preview_retry_not_before_tick = 0;
+      preview_retry_not_before_us = 0;
       last_preview_fetch_enabled = false;
       last_preview_active_print = false;
       preview_refresh_pending = true;
@@ -3384,7 +3385,7 @@ void BambuCloudClient::task_loop() {
       apply_configuration(config_store_->load_cloud_credentials(),
                           config_store_->load_active_printer_profile().serial);
       last_preview_fetch_tick = 0;
-      preview_retry_not_before_tick = 0;
+      preview_retry_not_before_us = 0;
       last_preview_fetch_enabled = false;
       last_preview_active_print = false;
       preview_refresh_pending = true;
@@ -3611,7 +3612,7 @@ void BambuCloudClient::task_loop() {
     const bool preview_missing =
         preview_snapshot.preview_url.empty() || preview_snapshot.preview_blob == nullptr;
     const bool preview_backoff_active =
-        preview_retry_not_before_tick != 0 && now_tick < preview_retry_not_before_tick;
+        preview_retry_not_before_us != 0 && esp_timer_get_time() < preview_retry_not_before_us;
     const bool preview_due =
         preview_budget_.due(esp_timer_get_time()) &&
         preview_fetch_enabled && initial_preview_window_open &&
@@ -3634,9 +3635,9 @@ void BambuCloudClient::task_loop() {
         if (preview_ok) {
           preview_refresh_pending = false;
           last_preview_fetch_tick = now_tick;
-          preview_retry_not_before_tick = 0;
+          preview_retry_not_before_us = 0;
         } else {
-          preview_retry_not_before_tick = now_tick + kCloudPreviewRetryBackoff;
+          preview_retry_not_before_us = esp_timer_get_time() + kCloudPreviewRetryBackoffUs;
         }
       }
     }
@@ -4555,23 +4556,18 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
       "\r\nUser-Agent: PrintSphere/1.0\r\nAccept: image/png,image/*;q=0.9,*/*;q=0.1\r\n"
       "Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
-  size_t written_total = 0;
-  while (written_total < request.size()) {
-    const ssize_t written =
-        esp_tls_conn_write(tls, request.data() + written_total, request.size() - written_total);
-    if (written <= 0) {
-      ESP_LOGW(kTag, "Preview TLS fallback write failed");
-      esp_tls_conn_destroy(tls);
-      return nullptr;
-    }
-    written_total += static_cast<size_t>(written);
+  if (!tls_write_until(tls,request.data(),request.size(),esp_timer_get_time()+10000000LL)) {
+    ESP_LOGW(kTag, "Preview TLS fallback write failed");
+    esp_tls_conn_destroy(tls);
+    return nullptr;
   }
 
   std::vector<uint8_t> response;
   response.reserve(kPreviewPersistentReserveBytes);
   char read_buffer[1024];
+  const int64_t read_deadline = esp_timer_get_time()+20000000LL;
   while (response.size() < (kMaxPreviewBytes + 8192)) {
-    const ssize_t read = esp_tls_conn_read(tls, read_buffer, sizeof(read_buffer));
+    const ssize_t read = tls_read_until(tls, read_buffer, sizeof(read_buffer), read_deadline);
     if (read > 0) {
       response.insert(response.end(), read_buffer, read_buffer + read);
       continue;
@@ -4580,11 +4576,10 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
       break;
     }
 
-    if (!response.empty()) {
-      break;
-    }
-
-    ESP_LOGW(kTag, "Preview TLS fallback read failed before data");
+    // Preserve servers that close TLS without close_notify after their body.
+    // The existing Content-Length check below still rejects short responses.
+    if (!response.empty()) break;
+    ESP_LOGW(kTag, "Preview TLS fallback read failed or timed out");
     esp_tls_conn_destroy(tls);
     return nullptr;
   }
@@ -4740,7 +4735,8 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
     last_transport_error_ = esp_http_client_open(client, static_cast<int>(request_body.size()));
     if (last_transport_error_ != ESP_OK) break;
     size_t sent = 0;
-    while (sent < request_body.size()) {
+    const int64_t write_deadline = esp_timer_get_time()+10000000LL;
+    while (sent < request_body.size() && esp_timer_get_time()<write_deadline) {
       const int written = esp_http_client_write(client, request_body.data() + sent,
                                                 static_cast<int>(request_body.size() - sent));
       if (written <= 0) break;

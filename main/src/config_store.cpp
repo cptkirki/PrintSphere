@@ -274,11 +274,15 @@ bool ConfigStore::load_portal_provisioned() const { return load_string("portal_d
 esp_err_t ConfigStore::mark_portal_provisioned() const { return save_string("portal_done", "1"); }
 
 SourceMode ConfigStore::load_source_mode() const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
+  if(cached_source_mode_>=0) return static_cast<SourceMode>(cached_source_mode_);
   std::string value = load_string("source_mode");
   if (value.empty()) {
     value = load_string("state_source");
   }
-  return parse_source_mode(value);
+  const auto mode=parse_source_mode(value);
+  cached_source_mode_=static_cast<int>(mode);
+  return mode;
 }
 
 DisplayRotation ConfigStore::load_display_rotation() const {
@@ -422,8 +426,11 @@ esp_err_t ConfigStore::clear_cloud_access_token(const BambuCloudCredentials* own
 }
 
 esp_err_t ConfigStore::save_source_mode(SourceMode mode) const {
+  std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   ESP_RETURN_ON_ERROR(save_string("source_mode", to_string(mode)), kTag, "save source mode failed");
-  return save_string("state_source", "");
+  const auto err=save_string("state_source", "");
+  cached_source_mode_=err==ESP_OK ? static_cast<int>(mode) : -1;
+  return err;
 }
 
 esp_err_t ConfigStore::save_display_rotation(DisplayRotation rotation) const {

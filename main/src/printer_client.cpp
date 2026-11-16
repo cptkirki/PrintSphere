@@ -835,7 +835,7 @@ NozzleTemperatureBundle extract_nozzle_temperature_bundle(const cJSON* print, fl
   const cJSON* extruder_state = cJSON_GetObjectItemCaseSensitive(child_object_local(device, "extruder"), "state");
     const int active_nozzle_index = extruder_state ? extract_active_nozzle_index(device) : previous_nozzle;
   bundle.active_nozzle_index = active_nozzle_index;
-  const int merge_index = active_nozzle_index >= 0 ? active_nozzle_index : 0;
+  const int merge_index = active_nozzle_index;
   merge_nozzle_temperature_patch(child_array_local(child_object_local(device, "nozzle"), "info"),
                                merge_index, &bundle.active, &bundle.active_present, &bundle.secondary, &bundle.secondary_present);
   merge_nozzle_temperature_patch(child_array_local(extruder, "info"), merge_index,

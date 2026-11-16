@@ -1,3 +1,4 @@
+#include "printsphere/tls_io.hpp"
 #include "printsphere/p1s_camera_client.hpp"
 
 #include <algorithm>
@@ -244,7 +245,7 @@ bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
     if (esp_timer_get_time() >= deadline_us) {
       return false;
     }
-    const ssize_t read = esp_tls_conn_read(tls, out + offset, length - offset);
+    const ssize_t read = tls_read_until(tls, out + offset, length - offset, deadline_us);
     if (read <= 0) {
       return false;
     }
@@ -254,20 +255,7 @@ bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
 }
 
 bool P1sCameraClient::write_all(esp_tls_t* tls, const void* buffer, size_t length) {
-  const auto* data = static_cast<const uint8_t*>(buffer);
-  size_t offset = 0;
-  const int64_t deadline_us = esp_timer_get_time() + kTlsWriteDeadlineUs;
-  while (offset < length) {
-    if (esp_timer_get_time() >= deadline_us) {
-      return false;
-    }
-    const ssize_t written = esp_tls_conn_write(tls, data + offset, length - offset);
-    if (written <= 0) {
-      return false;
-    }
-    offset += static_cast<size_t>(written);
-  }
-  return true;
+  return tls_write_until(tls,buffer,length,esp_timer_get_time()+kTlsWriteDeadlineUs);
 }
 
 bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {

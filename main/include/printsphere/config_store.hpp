@@ -178,6 +178,7 @@ class ConfigStore {
 
  private:
   mutable std::recursive_mutex configuration_mutex_{};
+  mutable int cached_source_mode_=-1;
   esp_err_t save_string(const char* key, const std::string& value) const;
   std::string load_string(const char* key) const;
   void migrate_legacy_printer_profile();

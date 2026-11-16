@@ -9,7 +9,7 @@
 namespace {
 std::map<std::string, std::string> committed, pending;
 bool fail_commit = false;
-unsigned commit_count = 0;
+unsigned commit_count = 0, string_reads = 0;
 }
 int nvs_flash_init() { return 0; }
 int nvs_flash_erase() { committed.clear(); return 0; }
@@ -28,6 +28,7 @@ int nvs_get_blob(nvs_handle_t, const char* key, void* value, size_t* length) {
   *length = found->second.size(); return 0;
 }
 int nvs_get_str(nvs_handle_t handle, const char* key, char* value, size_t* length) {
+  ++string_reads;
   return nvs_get_blob(handle, key, value, length);
 }
 int nvs_commit(nvs_handle_t) {
@@ -48,6 +49,16 @@ int main() {
   assert(config.save_wifi_credentials({"new", "new-password"}) != ESP_OK);
   assert(config.load_wifi_credentials().ssid == "old");
   assert(config.load_wifi_credentials().password == "old-password");
+  assert(config.save_source_mode(SourceMode::kCloudOnly)==ESP_OK);
+  const auto before_reads=string_reads;
+  for(int i=0;i<100;++i) assert(config.load_source_mode()==SourceMode::kCloudOnly);
+  assert(string_reads==before_reads);
+  fail_commit=true;
+  assert(config.save_source_mode(SourceMode::kLocalOnly)!=ESP_OK);
+  fail_commit=false;
+  assert(config.load_source_mode()==SourceMode::kCloudOnly);
+  assert(config.save_source_mode(SourceMode::kHybrid)==ESP_OK);
+  assert(config.load_source_mode()==SourceMode::kHybrid);
   BambuCloudCredentials a{"a@example.invalid", "secret", CloudRegion::kEU};
   BambuCloudCredentials b{"b@example.invalid", "different", CloudRegion::kCN};
   assert(config.save_cloud_credentials(a) == ESP_OK);

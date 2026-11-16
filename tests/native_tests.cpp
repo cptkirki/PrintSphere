@@ -68,6 +68,18 @@ int main() {
   merge_nozzle_temperature_patch(temperature_delta.value, 0, &active, &active_present,
                                  &secondary, &secondary_present);
   assert(active == 235 && secondary == 215 && !active_present && secondary_present);
+  Json idless(R"([{"temp":240}])");
+  active_present=secondary_present=false;
+  merge_nozzle_temperature_patch(idless.value,1,&active,&active_present,&secondary,&secondary_present);
+  assert(active==240 && active_present && !secondary_present);
+  Json unknown_active(R"([{"id":7,"temp":241}])");
+  active_present=secondary_present=false;
+  merge_nozzle_temperature_patch(unknown_active.value,-1,&active,&active_present,&secondary,&secondary_present);
+  assert(active==241 && active_present && !secondary_present);
+  Json invalid_id(R"([{"id":"broken","temp":99}])");
+  active_present=secondary_present=false;
+  merge_nozzle_temperature_patch(invalid_id.value,0,&active,&active_present,&secondary,&secondary_present);
+  assert(active==241 && !active_present && !secondary_present);
   AmsSnapshot ams;
   ams.units[0].present = true;
   ams.units[0].trays[0].present = true;

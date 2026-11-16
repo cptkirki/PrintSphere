@@ -36,10 +36,23 @@ inline void merge_nozzle_temperature_patch(const cJSON* array, int active_nozzle
     float* active, bool* active_present, float* secondary, bool* secondary_present) {
   const cJSON* item = nullptr;
   int index = 0;
+  bool inferred_active=false;
+  const int count=cJSON_GetArraySize(array);
   cJSON_ArrayForEach(item, array) {
     const cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-    const int nozzle = cJSON_IsString(id) ? std::atoi(id->valuestring) :
-        (cJSON_IsNumber(id) ? id->valueint : index);
+    int nozzle=count==1 && active_nozzle>=0 ? active_nozzle : index;
+    if(id) {
+      if(cJSON_IsNumber(id)) {
+        if(!std::isfinite(id->valuedouble) || id->valuedouble<0 || id->valuedouble>255 ||
+           std::floor(id->valuedouble)!=id->valuedouble) { ++index; continue; }
+        nozzle=id->valueint;
+      } else if(cJSON_IsString(id)) {
+        char* end=nullptr;
+        const long parsed=std::strtol(id->valuestring,&end,10);
+        if(end==id->valuestring || *end || parsed<0 || parsed>255) { ++index; continue; }
+        nozzle=static_cast<int>(parsed);
+      } else { ++index; continue; }
+    }
     ++index;
     const cJSON* field = cJSON_GetObjectItemCaseSensitive(item, "temp");
     if (!cJSON_IsNumber(field) && !cJSON_IsString(field)) continue;
@@ -48,7 +61,9 @@ inline void merge_nozzle_temperature_patch(const cJSON* array, int active_nozzle
     if ((end && (*end || end == field->valuestring)) || !std::isfinite(value) ||
         value < 0 || value > UINT32_MAX) continue;
     if (value > 65535) value = static_cast<uint32_t>(value) & 0xffff;
-    if (nozzle == active_nozzle) { *active = value; *active_present = true; }
+    if (nozzle == active_nozzle || (active_nozzle<0 && !inferred_active)) {
+      *active = value; *active_present = true; inferred_active=true;
+    }
     else if (nozzle >= 0) { *secondary = value; *secondary_present = true; }
   }
 }

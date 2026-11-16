@@ -23,6 +23,7 @@ def main():
     subprocess.run([str(cc), "-c", str(cjson / "cJSON.c"), "-o", str(obj)], check=True)
     for name, sources, extra in [
         ("utf8-tests", [root / "tests/utf8_tests.cpp"], []),
+        ("pr43-tests", [root / "tests/pr43_tests.cpp"], []),
         ("policy-tests", [root / "tests/native_tests.cpp"], []),
         ("display-power-tests", [root / "tests/display_power_tests.cpp"], []),
         ("ui-runtime-tests", [root / "tests/ui_runtime_tests.cpp"], []),

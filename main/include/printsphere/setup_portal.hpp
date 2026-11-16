@@ -89,6 +89,7 @@ class SetupPortal {
 #endif
   static void ota_url_task(void* context);
   static void reboot_task(void* context);
+  bool schedule_reboot();
   bool is_provisioning_complete() const;
   bool is_lock_required() const;
   bool is_request_authorized(httpd_req_t* request);
@@ -109,10 +110,11 @@ class SetupPortal {
   AudioNotifier& audio_notifier_;
   httpd_handle_t server_ = nullptr;
   std::atomic<bool> reboot_requested_{false};
+  std::mutex reboot_mutex_;
   std::atomic<bool> ota_in_progress_{false};
   mutable std::recursive_mutex access_mutex_{};
   // OTA URL state (protected by ota_url_mutex_)
-  enum class OtaUrlState { kIdle, kDownloading, kDone, kFailed };
+  enum class OtaUrlState { kIdle, kDownloading, kDone, kRestartRequired, kFailed };
   struct OtaUrlStatus {
     OtaUrlState state = OtaUrlState::kIdle;
     int progress_percent = 0;
