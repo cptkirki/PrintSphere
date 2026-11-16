@@ -1,6 +1,7 @@
 #include "printsphere/printer_state.hpp"
 
 #include <cctype>
+#include <cstdio>
 #include <utility>
 
 namespace printsphere {
@@ -81,6 +82,24 @@ const char* mqtt_command_token(PrintCommand command) {
     default:
       return "";
   }
+}
+
+std::string build_ledctrl_payload(const char* node, bool on) {
+  if (node == nullptr || *node == '\0') {
+    return {};
+  }
+
+  char payload[256];
+  const int written = std::snprintf(
+      payload, sizeof(payload),
+      "{\"system\":{\"sequence_id\":\"0\",\"command\":\"ledctrl\","
+      "\"led_node\":\"%s\",\"led_mode\":\"%s\",\"led_on_time\":500,"
+      "\"led_off_time\":500,\"loop_times\":0,\"interval_time\":0}}",
+      node, on ? "on" : "off");
+  if (written <= 0 || static_cast<size_t>(written) >= sizeof(payload)) {
+    return {};
+  }
+  return payload;
 }
 
 const char* to_string(PrinterModel model) {
