@@ -182,10 +182,11 @@ struct ModelCapabilityFlags {
 // PrinterModel in printer_state.hpp.
 constexpr ModelCapabilityFlags kModelCapabilities[] = {
     // jpeg   rtsp   chmbT  sNzlT  chmbL  sChmbL local  devLoc cloud
+    // A1/A1 Mini/P1P/A2L still use MQTT node "chamber_light" for the toolhead LED.
     /* kUnknown */ {false, false, false, false, false, false, true,  false, false},
-    /* kA1      */ {true,  false, false, false, false, false, true,  false, false},
-    /* kA1Mini  */ {true,  false, false, false, false, false, true,  false, false},
-    /* kP1P     */ {true,  false, false, false, false, false, true,  false, false},
+    /* kA1      */ {true,  false, false, false, true,  false, true,  false, false},
+    /* kA1Mini  */ {true,  false, false, false, true,  false, true,  false, false},
+    /* kP1P     */ {true,  false, false, false, true,  false, true,  false, false},
     /* kP1S     */ {true,  false, false, false, true,  false, true,  false, false},
     /* kP2S     */ {false, true,  true,  false, true,  false, true,  false, true },
     /* kH2C     */ {false, true,  true,  false, true,  true,  true,  true,  true },
@@ -196,7 +197,7 @@ constexpr ModelCapabilityFlags kModelCapabilities[] = {
     /* kX1C     */ {false, true,  true,  false, true,  false, true,  false, true },
     /* kX1E     */ {false, true,  true,  false, true,  false, true,  false, true },
     /* kX2D     */ {false, true,  true,  true,  true,  true,  true,  true,  true },
-    /* kA2L     */ {true,  false, false, false, false, false, true,  false, false},
+    /* kA2L     */ {true,  false, false, false, true,  false, true,  false, false},
 };
 
 constexpr size_t kModelCapabilityCount =
