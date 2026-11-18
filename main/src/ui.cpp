@@ -1678,7 +1678,17 @@ void Ui::set_work_phase(UiWorkPhase phase) {
 }
 
 void Ui::process_updates_locked() {
-  if (scrolling_) return;
+  if (scrolling_) {
+    if (lv_obj_is_scrolling(pager_)) return;
+    for (auto* input = lv_indev_get_next(nullptr); input; input = lv_indev_get_next(input)) {
+      if (lv_indev_get_display(input) == display_ &&
+          lv_indev_get_type(input) == LV_INDEV_TYPE_POINTER &&
+          lv_indev_get_state(input) == LV_INDEV_STATE_PRESSED) return;
+    }
+    // LVGL can cancel a snap before its first tick without emitting SCROLL_END.
+    // Settle the pager and reapply the last snapshot to restart its ring.
+    set_active_page(nearest_enabled_page_for_scroll());
+  }
   bool update = render_refresh_pending_;
   if (auto colors = colors_mailbox_.take()) { arc_colors_ = *colors; update = true; }
   if (auto portal = portal_mailbox_.take()) {
@@ -3540,6 +3550,7 @@ void Ui::set_pager_scroll_locked(bool locked) {
   publish_page_state_snapshot();
   apply_page0_parallax();
   apply_page_visibility();
+  render_refresh_pending_ = true;
 }
 
 void Ui::publish_page_state_snapshot() {

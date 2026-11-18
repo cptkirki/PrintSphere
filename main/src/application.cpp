@@ -325,6 +325,7 @@ void Application::run() {
   printer_client_.configure(printer_connection);
   ESP_ERROR_CHECK(printer_client_.start());
   camera_client_.configure(printer_connection);
+  applied_printer_connection_ = printer_connection;
   ESP_ERROR_CHECK(camera_client_.start());
 
   ESP_LOGI(kTag, "Bootstrap complete");
@@ -353,6 +354,7 @@ void Application::run() {
       const PrinterConnection new_conn = config_store_.load_active_printer_profile().to_connection();
       printer_client_.configure(new_conn);
       camera_client_.configure(new_conn);
+      applied_printer_connection_ = new_conn;
       cloud_client_.configure(config_store_.load_cloud_credentials(), new_conn.serial);
       ESP_LOGI(kTag, "Switched active printer to profile %d", switch_idx);
     }
@@ -361,6 +363,20 @@ void Application::run() {
       last_cards_refresh_ms = now_ms;
       const auto profiles = config_store_.load_printer_profiles();
       const uint8_t active_idx = config_store_.load_active_printer_index();
+      // Apply LAN credentials discovered for the active cloud profile.
+      PrinterConnection connection;
+      for (const auto& profile : profiles) {
+        if (profile.index != active_idx) continue;
+        connection = profile.to_connection();
+        break;
+      }
+      if (connection.host != applied_printer_connection_.host ||
+          connection.serial != applied_printer_connection_.serial ||
+          connection.access_code != applied_printer_connection_.access_code) {
+        printer_client_.configure(connection);
+        camera_client_.configure(connection);
+        applied_printer_connection_ = connection;
+      }
       const auto local_state = printer_client_.snapshot();
       const auto cloud_state = cloud_client_.snapshot();
       std::vector<Ui::PrinterCardInfo> cards;

@@ -74,14 +74,63 @@ int main() {
   assert(find_text(lv_layer_top(), "25%")); // producer performs no widget mutation
   pump(30);
   assert(find_text(lv_layer_top(), "55%"));
-  lv_obj_send_event(pager, LV_EVENT_SCROLL_BEGIN, nullptr);
+  const int main_page_x = lv_obj_get_x(lv_obj_get_child(pager, Ui::kPageIdxMain));
+  lv_obj_scroll_to_x(pager, 0, LV_ANIM_ON);
   assert(ui.is_page_transition_active());
   for (int i=56; i<=99; ++i) { state.progress_percent = float(i); ui.apply_snapshot(state); }
   pump(60);
   assert(find_text(lv_layer_top(), "55%") && !find_text(lv_layer_top(), "99%"));
-  lv_obj_send_event(pager, LV_EVENT_SCROLL_END, nullptr);
-  pump(500);
+  pump(1000);
   assert(!ui.is_page_transition_active() && find_text(lv_layer_top(), "99%"));
+  lv_obj_scroll_to_x(pager, main_page_x, LV_ANIM_OFF);
+  pump(30);
+
+  lv_obj_t* arc = nullptr;
+  for (uint32_t i = 0; i < lv_obj_get_child_count(screen) && !arc; ++i) {
+    arc = lv_obj_get_child_by_type(lv_obj_get_child(screen, i), 0, &lv_arc_class);
+  }
+  assert(arc);
+  auto touch_state = LV_INDEV_STATE_RELEASED;
+  auto* touch = lv_indev_create();
+  lv_indev_set_type(touch, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_user_data(touch, &touch_state);
+  lv_indev_set_read_cb(touch, [](lv_indev_t* input, lv_indev_data_t* data) {
+    data->point = {4, 4};
+    data->state = *static_cast<lv_indev_state_t*>(lv_indev_get_user_data(input));
+  });
+  for (const char* stage : {"loading", "unloading"}) {
+    state.ui_status = stage;
+    ui.apply_snapshot(state);
+    pump(400);
+    assert(lv_arc_get_value(arc) > 0 && lv_arc_get_value(arc) < 100);
+
+    // LVGL emits BEGIN immediately. Cancelling before its first animation
+    // tick skips END. The last printer snapshot must suffice to resume.
+    lv_obj_scroll_to_x(pager, 0, LV_ANIM_ON);
+    assert(ui.is_page_transition_active());
+    lv_obj_stop_scroll_anim(pager);
+    assert(!lv_obj_is_scrolling(pager) && ui.is_page_transition_active());
+    if (state.ui_status == "unloading") {
+      touch_state = LV_INDEV_STATE_PRESSED;
+      lv_indev_read(touch);
+      pump(100);
+      assert(ui.is_page_transition_active());
+      touch_state = LV_INDEV_STATE_RELEASED;
+      lv_indev_read(touch);
+    }
+    pump(100);
+    assert(!ui.is_page_transition_active());
+    assert(lv_obj_get_scroll_x(pager) == main_page_x);
+    const int resumed_value = lv_arc_get_value(arc);
+    pump(250);
+    assert(state.ui_status == "loading" ? lv_arc_get_value(arc) > resumed_value
+                                        : lv_arc_get_value(arc) < resumed_value);
+  }
+  lv_indev_delete(touch);
+  state.ui_status = "printing";
+  ui.apply_snapshot(state);
+  pump(60);
+  assert(lv_arc_get_value(arc) == 99);
   // A nested vertical list/label bubbles scroll events. Those must never
   // suspend status delivery or snap the horizontal pager to another page.
   auto* nested_scroll=lv_obj_create(lv_obj_get_child(pager,0));
@@ -151,7 +200,13 @@ int main() {
   concurrent_producer.join();
   pump(60);
   assert(find_text(lv_layer_top(),"77%") && !ui.has_pending_snapshot());
-  pump(5100);
+  // Keep both rendering and widget updates active across a telemetry window.
+  state.ui_status = "loading";
+  for (int progress = 78; progress < 90; ++progress) {
+    state.progress_percent = progress;
+    ui.apply_snapshot(state);
+    pump(500);
+  }
   auto performance = ui.performance_snapshot();
   assert(performance && performance->window_ms >= 5000);
   assert(performance->render_cycle.samples > 0 && performance->widget_update.samples > 0);

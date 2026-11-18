@@ -1,10 +1,22 @@
 #pragma once
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include "cJSON.h"
 #include "printsphere/printer_state.hpp"
 
 namespace printsphere {
+inline bool should_reset_cloud_job_metrics(PrintLifecycleState previous, PrintLifecycleState next,
+                                          std::string_view previous_job, std::string_view current_job) {
+  if (previous == next) return false;
+  if (next == PrintLifecycleState::kPrinting && previous == PrintLifecycleState::kPaused) {
+    // A resume patch can omit every metric. Keep the paused job's values
+    // unless the printer identifies a different job.
+    return !previous_job.empty() && !current_job.empty() && previous_job != current_job;
+  }
+  return next == PrintLifecycleState::kPreparing || next == PrintLifecycleState::kPrinting;
+}
+
 inline std::shared_ptr<AmsSnapshot> detached_ams(const std::shared_ptr<AmsSnapshot>& current) {
   return current ? std::make_shared<AmsSnapshot>(*current) : nullptr;
 }

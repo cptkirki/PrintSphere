@@ -82,7 +82,7 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c -p COM7 monitor
 Build both variants first. Then run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/package_release.ps1 -Version v1.6.2
+powershell -ExecutionPolicy Bypass -File tools/package_release.ps1 -Version v1.7.0
 ```
 
 The script creates the four current release images plus versioned archive copies:
@@ -99,13 +99,13 @@ Versioned copies are stored below the corresponding `archive/` directories.
 AMOLED 1.75:
 
 ```powershell
-python tools/package_initial_flash.py --build-dir build-amoled_1_75 --release-root release --version v1.6.2
+python tools/package_initial_flash.py --build-dir build-amoled_1_75 --release-root release --version v1.7.0
 ```
 
 LCD 2.8C:
 
 ```powershell
-python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.6.2-2.8c
+python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.7.0-2.8c
 ```
 
 ## Initial image versus OTA image
@@ -159,9 +159,41 @@ idf.py -B build-lcd_2_8c -DPRINTSPHERE_HW_VARIANT=lcd_2_8c reconfigure
 
 ## Release checklist
 
-1. Set the release version in the root `CMakeLists.txt`.
+1. Set the release version in the root `VERSION` file.
 2. Build and test both hardware variants.
 3. Package both variants with an explicit version.
 4. Verify the four generated images and their versioned archive copies.
 5. Update the browser installer and release notes.
 6. Commit and publish the source, installer, notes and binaries together.
+
+## v1.7.0 verification and update compatibility
+
+`VERSION` is the single release-version source. Use ESP-IDF v5.5.4 and retain the checked-in `dependencies.lock`. A new build uses its own `build-*/sdkconfig`; existing caches can be migrated with `-DSDKCONFIG=<absolute build directory>/sdkconfig`. The pinned LVGL adapter patch is applied/verified automatically during CMake configuration. Source drift stops the build.
+
+After dependency resolution, run `python tools/test_host.py` with a native GCC/G++ toolchain on PATH. `--cxx <path to g++>` selects a portable compiler. These tests execute production protocol/policy code and the ConfigStore against an NVS testdouble; they do not simulate printer networking or display hardware.
+
+The packager validates the application descriptor and writes `manifest.json` with board, image version, SDK build string, commit, source/dependency/configuration hashes and firmware hashes. Pass the actual compiled version; relabelling an older image is rejected.
+
+Read [v1.7.0 release notes](../../release/RELEASE_NOTES_v1.7.0.md) before upgrading: rollback needs a matching rollback-enabled bootloader, and the new atomic configuration records are not a downgrade-compatible format. Real account/2FA, camera, board and rollback tests remain necessary before public release.
+
+Normal builds disable `CONFIG_MBEDTLS_DEBUG`. Existing cached sdkconfigs must also disable it via menuconfig (Component config > mbedTLS > Enable mbedTLS debugging). A derived `CONFIG_MBEDTLS_DEBUG_LEVEL=1` alone does not select the warning-level choice; fresh configs can select verbose instead. ESP-IDF resets the mbedTLS log tag each time it creates a TLS context, so a one-time runtime log filter is insufficient. Release configuration rejects cached TLS tracing; deliberately enable it only with a `-debug`/`_debug` version. Standard transport and certificate error logs remain available without the internal TLS trace.
+
+If the release check stops configuration before menuconfig can open, edit the active `build-<board>/sdkconfig` directly: replace `CONFIG_MBEDTLS_DEBUG=y` with `# CONFIG_MBEDTLS_DEBUG is not set`, then run `idf.py ... reconfigure`. Changing only `sdkconfig.defaults` does not override an existing cached configuration.
+
+Run `python tools/test_lvgl_host.py` for the actual LVGL UI regressions on both layouts. It builds under `build-host/lvgl-ui` with a native compiler, CMake and Ninja; `--cxx`, `--cmake` and `--ninja` override tool discovery. See [test scope](../../tests/lvgl_host/README.md). The live device's `/api/health` reports UI phase, pending work and five-second timing summaries without acquiring the LVGL lock or logging every frame.
+
+
+### Display synchronization (v1.7.5)
+
+LVGL must use semaphore synchronization (`CONFIG_LV_USE_FREERTOS_TASK_NOTIFY=n`).
+Set `CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES=2`: adapter wakeups use index 0,
+GPIO-TE SPI completion uses index 1. The checked-in defaults select these values;
+CMake rejects an incompatible cached sdkconfig. Update existing board configs
+through menuconfig before rebuilding if this guard fires.
+
+The adapter patcher is applied during CMake configuration, with source-drift checks.
+The PowerShell entry point delegates to the same Python implementation. The actual
+AMOLED DMA staging regression runs as part of `python tools/test_host.py`.
+`/api/health` exposes `display_output_phase` and `display_output_age_ms` for the
+GPIO-TE path without acquiring the LVGL mutex or printing per-frame logs. See the
+[v1.7.5 notes](../../release/RELEASE_NOTES_v1.7.5.md) for diagnostic limits.

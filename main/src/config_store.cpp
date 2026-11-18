@@ -591,7 +591,9 @@ esp_err_t ConfigStore::save_profiles_record(const std::vector<PrinterProfile>& p
         cJSON_AddStringToObject(item, "access", profile.access_code.c_str()) &&
         cJSON_AddStringToObject(item, "name", profile.display_name.c_str()) &&
         cJSON_AddStringToObject(item, "model", profile.model.c_str()) &&
-        cJSON_AddBoolToObject(item, "cloud", profile.cloud_bound);
+        cJSON_AddBoolToObject(item, "cloud", profile.cloud_bound) &&
+        cJSON_AddBoolToObject(item, "auto_host", profile.host_from_cloud) &&
+        cJSON_AddBoolToObject(item, "auto_access", profile.access_code_from_cloud);
   }
   if (!ok) { cJSON_Delete(root); return ESP_ERR_NO_MEM; }
   const std::string json = serialize_record(root);
@@ -623,6 +625,8 @@ std::vector<PrinterProfile> ConfigStore::load_printer_profiles() const {
       profile.display_name = record_string(item, "name");
       profile.model = record_string(item, "model");
       profile.cloud_bound = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "cloud"));
+      profile.host_from_cloud = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "auto_host"));
+      profile.access_code_from_cloud = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "auto_access"));
       profiles.push_back(std::move(profile));
     }
     cJSON_Delete(root);
@@ -647,8 +651,21 @@ esp_err_t ConfigStore::save_printer_profile(const PrinterProfile& profile) const
   std::lock_guard<std::recursive_mutex> lock(configuration_mutex_);
   auto profiles = load_printer_profiles();
   if (profile.index >= kMaxPrinterProfiles || profile.index > profiles.size()) return ESP_ERR_INVALID_ARG;
-  if (profile.index == profiles.size()) profiles.push_back(profile);
-  else profiles[profile.index] = profile;
+  // This entry point saves user edits. Preserve discovery provenance only for
+  // unchanged fields; a different value explicitly overrides discovery.
+  auto saved = profile;
+  saved.host_from_cloud = false;
+  saved.access_code_from_cloud = false;
+  if (profile.index == profiles.size()) profiles.push_back(std::move(saved));
+  else {
+    const auto& previous = profiles[profile.index];
+    if (previous.serial == saved.serial) {
+      saved.host_from_cloud = previous.host_from_cloud && previous.host == saved.host;
+      saved.access_code_from_cloud = previous.access_code_from_cloud &&
+                                     previous.access_code == saved.access_code;
+    }
+    profiles[profile.index] = std::move(saved);
+  }
   return save_profiles_record(profiles, load_active_printer_index());
 }
 
@@ -674,12 +691,28 @@ esp_err_t ConfigStore::sync_cloud_printer_profiles(
       profile.serial = device.serial;
       profile.display_name = device.display_name;
       profile.model = device.model;
+      profile.host = device.host;
+      profile.access_code = device.access_code;
+      profile.host_from_cloud = !device.host.empty();
+      profile.access_code_from_cloud = !device.access_code.empty();
       profile.cloud_bound = true;
       profiles.push_back(std::move(profile));
       changed = true;
       continue;
     }
-    // Account discovery must never overwrite local credentials or user names.
+    // Refresh discovered values, while preserving explicit local overrides.
+    if ((found->host.empty() || found->host_from_cloud) && !device.host.empty() &&
+        found->host != device.host) {
+      found->host = device.host;
+      found->host_from_cloud = true;
+      changed = true;
+    }
+    if ((found->access_code.empty() || found->access_code_from_cloud) &&
+        !device.access_code.empty() && found->access_code != device.access_code) {
+      found->access_code = device.access_code;
+      found->access_code_from_cloud = true;
+      changed = true;
+    }
     if (!found->cloud_bound) { found->cloud_bound = true; changed = true; }
     if (found->display_name.empty() && !device.display_name.empty()) {
       found->display_name = device.display_name;

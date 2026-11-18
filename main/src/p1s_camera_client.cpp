@@ -455,11 +455,15 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
       continue;
     }
 
-    if (!enabled_.load()) {
+    if (!enabled_.load() || reconfigure_requested_.load()) {
       ESP_LOGD(kTag, "Camera disabled after decode, dropping frame");
       return false;
     }
 
+    std::lock_guard<std::mutex> config_lock(config_mutex_);
+    if (reconfigure_requested_.load() || desired_connection_.serial != connection.serial ||
+        desired_connection_.host != connection.host ||
+        desired_connection_.access_code != connection.access_code) return false;
     set_frame_snapshot(true, enabled_.load(), true, "Camera image updated",
                        std::move(rgb565_frame), width, height);
     ESP_LOGI(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
@@ -552,6 +556,7 @@ void P1sCameraClient::task_loop() {
 
     const bool ok = fetch_frame_once(connection);
     last_fetch_us = esp_timer_get_time();
+    if (reconfigure_requested_.load()) continue;
     if (!ok) {
       if (!enabled_.load()) {
         consecutive_connect_failures_ = 0;

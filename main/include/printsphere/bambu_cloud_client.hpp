@@ -1,5 +1,6 @@
 #pragma once
 #include "printsphere/command_tracker.hpp"
+#include "printsphere/latest_mailbox.hpp"
 
 #include <array>
 #include <atomic>
@@ -343,6 +344,13 @@ class BambuCloudClient {
   std::string mqtt_client_id_{};
   std::string mqtt_report_topic_{};
   std::string mqtt_bound_serial_{};
+  BambuCloudCredentials mqtt_bound_owner_{};
+  std::string mqtt_last_lan_host_{};
+  struct LanDiscovery {
+    PrinterProfile profile;
+    BambuCloudCredentials owner;
+  };
+  LatestMailbox<LanDiscovery> lan_discovery_;
   std::string mqtt_request_topic_{};
   std::string incoming_topic_{};
   std::string incoming_payload_{};

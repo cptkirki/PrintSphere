@@ -72,6 +72,10 @@ struct PrinterProfile {
   std::string display_name;
   std::string model;
   bool cloud_bound = false;
+  // Automatically discovered values can follow DHCP/code changes. Explicit
+  // local overrides remain authoritative, including after a reboot.
+  bool host_from_cloud = false;
+  bool access_code_from_cloud = false;
   bool has_local_config() const { return !host.empty() && !access_code.empty(); }
   PrinterConnection to_connection() const {
     PrinterConnection c;

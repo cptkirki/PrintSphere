@@ -27,6 +27,7 @@ class Application {
   BambuCloudClient cloud_client_{};
   PrinterClient printer_client_{};
   P1sCameraClient camera_client_{};
+  PrinterConnection applied_printer_connection_{};
   Ui ui_{};
   SetupPortal setup_portal_;
   SerialProvisioner serial_provisioner_;

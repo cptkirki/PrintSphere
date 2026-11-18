@@ -1,4 +1,5 @@
 #include "printsphere/tls_io.hpp"
+#include "printsphere/cloud_lan.hpp"
 #include "printsphere/utf8.hpp"
 #include "printsphere/bambu_cloud_client.hpp"
 
@@ -2681,6 +2682,8 @@ bool BambuCloudClient::ensure_mqtt_client_started() {
 
   mqtt_client_id_ = "printsphere-cloud-" + std::to_string(static_cast<unsigned int>(esp_random()));
   mqtt_bound_serial_ = serial;
+  mqtt_bound_owner_ = {credentials_.email, {}, credentials_.region};
+  mqtt_last_lan_host_.clear();
   mqtt_report_topic_ = desired_report_topic;
   mqtt_request_topic_ = desired_request_topic;
 
@@ -2801,6 +2804,15 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
         runtime.chamber_light_supported || printer_model_has_chamber_light(runtime.model);
     const std::string resolved_serial =
         mqtt_bound_serial_;
+    const std::string lan_host=cloud_lan_host(print);
+    if(!resolved_serial.empty() && !lan_host.empty() && lan_host!=mqtt_last_lan_host_) {
+      auto hint=std::make_shared<LanDiscovery>();
+      hint->profile.serial=resolved_serial;
+      hint->profile.host=lan_host;
+      hint->owner=mqtt_bound_owner_;
+      lan_discovery_.publish(std::move(hint));
+      mqtt_last_lan_host_=lan_host;
+    }
     if (!resolved_serial.empty()) {
       copy_text(&runtime.resolved_serial, resolved_serial);
     }
@@ -2854,6 +2866,7 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.stage, stage_text);
     }
 
+    const auto previous_job_name = runtime.job_name;
     const std::string subtask_name = trim_job_name_cloud(
         json_string(print, "subtask_name",
                     json_string(print, "gcode_file", text_string(runtime.job_name))));
@@ -2861,11 +2874,8 @@ void BambuCloudClient::handle_report_payload(const char* payload, size_t length)
       copy_text(&runtime.job_name, subtask_name);
     }
 
-    const bool active_lifecycle =
-        lifecycle == PrintLifecycleState::kPreparing || lifecycle == PrintLifecycleState::kPrinting;
-    const bool lifecycle_reset =
-        has_status_update && active_lifecycle && lifecycle != previous_lifecycle;
-    if (lifecycle_reset) {
+    if (has_status_update && should_reset_cloud_job_metrics(
+            previous_lifecycle, lifecycle, previous_job_name.data(), runtime.job_name.data())) {
       runtime.progress_percent = 0.0f;
       runtime.progress_is_download_related = false;
       runtime.remaining_seconds = 0;
@@ -3348,8 +3358,23 @@ void BambuCloudClient::task_loop() {
   bool last_preview_active_print = false;
   bool preview_refresh_pending = true;
   uint32_t cloud_initial_sync_failures = 0;
+  int64_t lan_write_retry_us=0;
+  std::shared_ptr<const LanDiscovery> pending_lan_discovery;
   TickType_t cloud_mqtt_restart_not_before_tick = 0;
   while (true) {
+    if (auto hint = lan_discovery_.take()) {
+      pending_lan_discovery = std::move(hint);
+      lan_write_retry_us = 0;
+    }
+    if (config_store_ && pending_lan_discovery && esp_timer_get_time() >= lan_write_retry_us) {
+      const auto& hint = pending_lan_discovery;
+      const auto result = config_store_->sync_cloud_printer_profiles({hint->profile}, hint->owner);
+      if (result == ESP_OK || result == ESP_ERR_INVALID_STATE) {
+        pending_lan_discovery.reset();
+      } else {
+        lan_write_retry_us = esp_timer_get_time() + 10000000LL;
+      }
+    }
     if (live_runtime_dirty_.exchange(false)) {
       publish_combined_snapshot();
     }
@@ -4033,6 +4058,7 @@ bool BambuCloudClient::fetch_bindings() {
   std::string best_serial;
   const cJSON* best_device = nullptr;
   std::vector<CloudDeviceInfo> all_devices;
+  std::vector<PrinterProfile> discovered;
   if (cJSON_IsArray(devices)) {
     const int count = cJSON_GetArraySize(devices);
     for (int i = 0; i < count; ++i) {
@@ -4051,6 +4077,13 @@ bool BambuCloudClient::fetch_bindings() {
           json_string(item, "dev_product_name",
               json_string(item, "device_name", to_string(info.model))));
       all_devices.push_back(std::move(info));
+      PrinterProfile profile;
+      profile.serial=candidate;
+      profile.display_name=all_devices.back().display_name;
+      if(all_devices.back().model!=PrinterModel::kUnknown)
+        profile.model=to_string(all_devices.back().model);
+      profile.access_code=cloud_lan_access_code(item);
+      discovered.push_back(std::move(profile));
 
       if (!requested_serial_.empty() && candidate == requested_serial_) {
         best_serial = candidate;
@@ -4063,15 +4096,6 @@ bool BambuCloudClient::fetch_bindings() {
     }
   }
   if (config_store_ != nullptr) {
-    std::vector<PrinterProfile> discovered;
-    discovered.reserve(all_devices.size());
-    for (const auto& device : all_devices) {
-      PrinterProfile profile;
-      profile.serial = device.serial;
-      profile.display_name = device.display_name;
-      if (device.model != PrinterModel::kUnknown) profile.model = to_string(device.model);
-      discovered.push_back(std::move(profile));
-    }
     const esp_err_t err = config_store_->sync_cloud_printer_profiles(discovered, credentials_);
     if (err != ESP_OK) {
       ESP_LOGW(kTag, "Cloud printer profile sync failed: %s", esp_err_to_name(err));

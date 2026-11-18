@@ -36,6 +36,12 @@ int main() {
     assert(policy::progress_percent("mc_percent", value) == value);
   assert(policy::progress_percent("progress_fraction", .25f) == 25.f);
   assert(policy::progress_percent("mc_percent", std::numeric_limits<float>::quiet_NaN()) == 0.f);
+  using Lifecycle = PrintLifecycleState;
+  assert(!should_reset_cloud_job_metrics(Lifecycle::kPaused, Lifecycle::kPrinting, "case", "case"));
+  assert(!should_reset_cloud_job_metrics(Lifecycle::kPaused, Lifecycle::kPrinting, "", "case"));
+  assert(should_reset_cloud_job_metrics(Lifecycle::kPaused, Lifecycle::kPrinting, "case", "lid"));
+  assert(should_reset_cloud_job_metrics(Lifecycle::kFinished, Lifecycle::kPrinting, "case", "case"));
+  assert(should_reset_cloud_job_metrics(Lifecycle::kPreparing, Lifecycle::kPrinting, "case", "case"));
   assert(!policy::same_printer("A", "B"));
   assert(!policy::same_printer("A", ""));
   assert(policy::same_printer("A", "A"));

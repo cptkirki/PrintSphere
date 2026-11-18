@@ -114,6 +114,8 @@ int main() {
   first.serial = "FIRST";
   first.display_name = "Cloud name";
   first.model = "P1S";
+  first.host = "192.0.2.100";
+  first.access_code = "cloud-code";
   second.serial = "SECOND";
   second.display_name = "Second printer";
   second.model = "A1";
@@ -126,6 +128,45 @@ int main() {
   assert(discovered[0].cloud_bound && discovered[1].cloud_bound);
   assert(discovered[1].serial == "SECOND" && discovered[1].index == 1);
   assert(discovered[1].host.empty() && discovered[1].access_code.empty());
+  // Cloud bindings provide the code first, MQTT supplies the IP later.
+  second.access_code = "test1234";
+  assert(config.sync_cloud_printer_profiles({second}, a) == ESP_OK);
+  discovered = config.load_printer_profiles();
+  assert(discovered[1].host.empty());
+  assert(discovered[1].access_code == second.access_code && discovered[1].access_code_from_cloud);
+  PrinterProfile lan_hint;
+  lan_hint.serial = "SECOND";
+  lan_hint.host = "192.0.2.20";
+  assert(config.sync_cloud_printer_profiles({lan_hint}, a) == ESP_OK);
+  discovered = config.load_printer_profiles();
+  assert(discovered[1].host == lan_hint.host && discovered[1].host_from_cloud);
+  assert(discovered[1].access_code == second.access_code); // partial IP report retains the code
+  ConfigStore after_discovery;
+  assert(after_discovery.initialize() == ESP_OK);
+  assert(after_discovery.load_printer_profiles()[1].host_from_cloud);
+  assert(after_discovery.load_printer_profiles()[1].access_code_from_cloud);
+  lan_hint.host = "192.0.2.21"; // DHCP changes refresh automatic IPs
+  fail_commit = true;
+  assert(config.sync_cloud_printer_profiles({lan_hint}, a) != ESP_OK);
+  assert(config.load_printer_profiles()[1].host == "192.0.2.20");
+  assert(config.sync_cloud_printer_profiles({lan_hint}, a) == ESP_OK);
+  assert(config.load_printer_profiles()[1].host == lan_hint.host);
+  second.access_code = "rotated-code";
+  assert(config.sync_cloud_printer_profiles({second}, a) == ESP_OK);
+  assert(config.load_printer_profiles()[1].access_code == second.access_code);
+  auto edited = config.load_printer_profiles()[1];
+  edited.display_name = "Custom second printer";
+  assert(config.save_printer_profile(edited) == ESP_OK);
+  assert(config.load_printer_profiles()[1].host_from_cloud); // renaming retains auto discovery
+  edited.host = "192.0.2.22";
+  edited.access_code = "manual-code";
+  assert(config.save_printer_profile(edited) == ESP_OK);
+  lan_hint.host = "192.0.2.23";
+  lan_hint.access_code = "replacement-code";
+  assert(config.sync_cloud_printer_profiles({lan_hint}, a) == ESP_OK);
+  discovered = config.load_printer_profiles();
+  assert(discovered[1].host == edited.host && discovered[1].access_code == edited.access_code);
+  assert(!discovered[1].host_from_cloud && !discovered[1].access_code_from_cloud);
   assert(config.load_active_printer_profile().serial == "FIRST");
   assert(config.save_active_printer_index(1) == ESP_OK);
   const auto before_repeat = commit_count;
@@ -142,6 +183,8 @@ int main() {
   assert(config.load_active_printer_profile().serial == "SECOND");
   assert(config.save_cloud_credentials(b) == ESP_OK);
   assert(config.sync_cloud_printer_profiles({third}, a) == ESP_ERR_INVALID_STATE);
+  assert(config.sync_cloud_printer_profiles({lan_hint}, a) == ESP_ERR_INVALID_STATE);
+  assert(config.load_printer_profiles()[1].host == edited.host);
   assert(config.load_printer_profile_count() == 2);
   std::vector<PrinterProfile> too_many;
   for (int i = 0; i < 16; ++i) {
@@ -152,5 +195,13 @@ int main() {
   assert(config.sync_cloud_printer_profiles(too_many, b) == ESP_ERR_NO_MEM);
   assert(config.load_printer_profile_count() == 2); // capacity errors don't partially import
   assert(rebooted.load_active_printer_profile().serial == "SECOND");
+  committed.clear();
+  pending.clear();
+  assert(config.save_cloud_credentials(a) == ESP_OK);
+  second.host = "192.0.2.50";
+  assert(config.sync_cloud_printer_profiles({second}, a) == ESP_OK);
+  auto initial_import = config.load_active_printer_profile();
+  assert(initial_import.host == second.host && initial_import.access_code == second.access_code);
+  assert(initial_import.host_from_cloud && initial_import.access_code_from_cloud);
   std::cout << "Config persistence/fault/account isolation/profile/reboot regressions passed\n";
 }

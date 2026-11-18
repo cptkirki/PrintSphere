@@ -1,16 +1,8 @@
 # PrintSphere 2.8C Release
 
-Diese Dateien sind die vorkonfektionierten Firmware-Artefakte fuer das Board
-`ESP32-S3-Touch-LCD-2.8C`.
+Firmware for the ESP32-S3-Touch-LCD-2.8C:
 
-Ordner:
+- `initial/printsphere_full.bin`: complete image for initial flashing.
+- `ota/printsphere_ota.bin`: firmware update for an existing device.
 
-- `initial/` = Komplett-Image fuer den ersten Flash
-- `ota/` = App-only Image fuer OTA-Updates
-- `beta/` = optionale Beta-/Debug-Pakete fuer das 2.8C-Board
-
-Packaging-Beispiel aus dem Projektroot:
-
-```powershell
-python tools/package_initial_flash.py --build-dir build-lcd_2_8c --release-root release/2.8c --version v1.6.1-2.8c
-```
+Select **2.8" LCD** in the web installer, or upload the matching OTA image in Web Config. [Web installer](https://cptkirki.github.io/PrintSphere/flash/) · [v1.7.9 release notes](../RELEASE_NOTES_v1.7.9.md)

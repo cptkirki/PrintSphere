@@ -1739,7 +1739,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
         (has_tray_now_update && new_tray_now != previous_tray_now) ||
         (has_tray_tar_update && new_tray_tar != previous_tray_tar);
     if (diag_has_state_fields && diag_has_state_change) {
-      ESP_LOGI(kTag, "[DIAG] local mqtt: gcode=%s stg_cur=%d stage_name=%s ams_status=0x%04X "
+      ESP_LOGD(kTag, "[DIAG] local mqtt: gcode=%s stg_cur=%d stage_name=%s ams_status=0x%04X "
                "ams_change=%d(latch=%d) hw_switch=%d tray_now=%d tray_tar=%d",
                gcode_state.empty() ? "(-)" : gcode_state.c_str(), stage_id,
                stage_name.empty() ? "(-)" : stage_name.c_str(),
@@ -1820,7 +1820,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
       // legacy tray_now encoding so all downstream ext-spool / AMS-tray logic works.
       const int snow_tray = extract_extruder_snow_tray_now(print, runtime.active_nozzle_index);
       if (snow_tray >= 0 && snow_tray != effective_tray_now) {
-        ESP_LOGI(kTag, "tray_now override from snow: ams.tray_now=%d -> snow=%d",
+        ESP_LOGD(kTag, "tray_now override from snow: ams.tray_now=%d -> snow=%d",
                  effective_tray_now, snow_tray);
         effective_tray_now = snow_tray;
       }
@@ -2002,7 +2002,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
               const uint32_t rgba = static_cast<uint32_t>(std::strtoul(color_str.c_str(), &end, 16));
               if (end != color_str.c_str()) ext.color_rgba = rgba;
             }
-            ESP_LOGI(kTag, "[DIAG] vir_slot[255]: fields=%d type=%s name=%s color=0x%08X",
+            ESP_LOGV(kTag, "[DIAG] vir_slot[255]: fields=%d type=%s name=%s color=0x%08X",
                      field_count,
                      ext.material_type.empty() ? "(-)" : ext.material_type.c_str(),
                      ext.material_name.empty() ? "(-)" : ext.material_name.c_str(),
